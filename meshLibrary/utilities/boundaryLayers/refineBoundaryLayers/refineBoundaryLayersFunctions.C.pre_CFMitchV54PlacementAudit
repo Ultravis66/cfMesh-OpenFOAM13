@@ -2254,74 +2254,42 @@ void refineBoundaryLayers::generateNewVertices()
 
     const scalar cfmitchHybridMinGrowthRatio(1.15);
 
-    // -------------------------------------------------------------
-    // CFMitch V5.4b -- canonical topology / height-only PRE pass.
-    //
-    // IMPORTANT ARCHITECTURAL CONTRACT:
-    //
-    //   nLayersAtBndFace_ owns boundary-layer topology.
-    //
-    // nLayersAtEdge is derived support geometry for that topology and
-    // must not independently reduce the number of intervals after the
-    // face-layer plan has been solved.
-    //
-    // Previous V5.4 behaviour reduced nLayersAtEdge when the requested
-    // h1 + growth ratio would not fit a hair at the preferred ratio
-    // floor.  That created split rows shorter than the still-canonical
-    // face topology, e.g.
-    //
-    //     face topology = 14
-    //     split row     = 8 layers / 9 points
-    //
-    // generateNewFaces() then legitimately failed because canonical
-    // face endpoints did not exist in the shortened split row.
-    //
-    // V5.4b therefore performs NO topology mutation here.
-    //
-    // Policy:
-    //
-    //   1. preserve canonical layer count
-    //   2. preserve requested h1 when geometrically possible
-    //   3. reduce growth ratio in POST
-    //   4. preferred ratio floor 1.15 is soft
-    //   5. if even r=1 cannot fit n*h1, downstream legacy placement
-    //      may compress h1 for that exceptional edge
-    //
-    // This PRE pass is classification/telemetry only.
-    // -------------------------------------------------------------
     if( cfmitchPlanner.plannerEnabled() && !specialMode_ )
     {
-        label nCanonicalAudited(0);
-        label nCanonicalRequestedFits(0);
-        label nCanonicalAboveFloorBackoff(0);
-        label nCanonicalBelowFloorBackoff(0);
-        label nCanonicalCannotPreserveH1(0);
-        label nCanonicalInvalid(0);
+        label nHybridAudited(0);
+        label nHybridRequestedFits(0);
+        label nHybridRatioOnly(0);
+        label nHybridLayerReduced(0);
+        label nHybridImpossible(0);
+        label nHybridInvalid(0);
+
+        label nReduce1(0);
+        label nReduce2(0);
+        label nReduce3To4(0);
+        label nReduce5Plus(0);
+
+        label minHybridLayers(labelMax);
+        label maxHybridLayers(-1);
 
         forAll(splitEdges_, seI)
         {
             const edge& e = splitEdges_[seI];
 
-            const scalar h1 =
-                firstLayerThickness[seI];
-
-            const scalar requestedRatio =
-                thicknessRatio[seI];
-
-            const label nLayers =
-                nLayersAtEdge[seI];
+            const scalar h1 = firstLayerThickness[seI];
+            const scalar requestedRatio = thicknessRatio[seI];
+            const label requestedLayers = nLayersAtEdge[seI];
 
             if
             (
                 h1 <= SMALL
-             || nLayers <= 0
+             || requestedLayers <= 0
              || e.start() < 0
              || e.end() < 0
              || e.start() >= label(points.size())
              || e.end() >= label(points.size())
             )
             {
-                ++nCanonicalInvalid;
+                ++nHybridInvalid;
                 continue;
             }
 
@@ -2330,23 +2298,23 @@ void refineBoundaryLayers::generateNewVertices()
 
             if( hairLength <= SMALL )
             {
-                ++nCanonicalInvalid;
+                ++nHybridInvalid;
                 continue;
             }
 
-            ++nCanonicalAudited;
+            ++nHybridAudited;
 
+            // Requested progression.
             scalar requestedSum(1.0);
             scalar requestedTerm(1.0);
 
-            for(label layerI=1; layerI<nLayers; ++layerI)
+            for(label layerI=1; layerI<requestedLayers; ++layerI)
             {
                 requestedTerm *= requestedRatio;
                 requestedSum += requestedTerm;
             }
 
-            const scalar requestedTotal =
-                h1 * requestedSum;
+            const scalar requestedTotal = h1 * requestedSum;
 
             const scalar fitTol =
                 scalar(1e-10)
@@ -2354,23 +2322,14 @@ void refineBoundaryLayers::generateNewVertices()
 
             if( requestedTotal <= hairLength + fitTol )
             {
-                ++nCanonicalRequestedFits;
+                ++nHybridRequestedFits;
                 continue;
             }
 
-            // Absolute geometric lower bound for preserved h1:
-            //
-            // r = 1  => total thickness = nLayers * h1.
-            const scalar minimumTotal =
-                scalar(nLayers) * h1;
-
-            if( minimumTotal > hairLength + fitTol )
-            {
-                ++nCanonicalCannotPreserveH1;
-                continue;
-            }
-
-            const scalar preferredFloor =
+            // Preferred minimum useful growth ratio.
+            // Never choose a floor above the user's requested ratio and
+            // never allow the policy floor below unity.
+            const scalar floorRatio =
                 Foam::max
                 (
                     scalar(1.0),
@@ -2381,41 +2340,117 @@ void refineBoundaryLayers::generateNewVertices()
                     )
                 );
 
+            // Does the full requested layer count fit at the preferred
+            // growth floor?  If yes, retain the count; final rEff will be
+            // solved after MPI reconciliation.
             scalar floorSum(1.0);
             scalar floorTerm(1.0);
 
-            for(label layerI=1; layerI<nLayers; ++layerI)
+            for(label layerI=1; layerI<requestedLayers; ++layerI)
             {
-                floorTerm *= preferredFloor;
+                floorTerm *= floorRatio;
                 floorSum += floorTerm;
             }
 
             if( h1 * floorSum <= hairLength + fitTol )
             {
-                ++nCanonicalAboveFloorBackoff;
+                ++nHybridRatioOnly;
+                continue;
+            }
+
+            // The requested layer count cannot fit without taking the
+            // growth ratio below the preferred floor.
+            //
+            // Find the LARGEST layer count that does fit at floorRatio.
+            label fittedLayers(requestedLayers);
+            bool foundFit(false);
+
+            while( fittedLayers > 0 )
+            {
+                scalar fitSum(1.0);
+                scalar fitTerm(1.0);
+
+                for(label layerI=1; layerI<fittedLayers; ++layerI)
+                {
+                    fitTerm *= floorRatio;
+                    fitSum += fitTerm;
+                }
+
+                if( h1 * fitSum <= hairLength + fitTol )
+                {
+                    foundFit = true;
+                    break;
+                }
+
+                --fittedLayers;
+            }
+
+            if( !foundFit || fittedLayers <= 0 )
+            {
+                // Even one h1 cell cannot fit this hair.  Do not invent
+                // another topology policy here.  Leave legacy behaviour
+                // and report it loudly.
+                ++nHybridImpossible;
+                continue;
+            }
+
+            if( fittedLayers < requestedLayers )
+            {
+                const label reduction =
+                    requestedLayers - fittedLayers;
+
+                nLayersAtEdge[seI] = fittedLayers;
+                nNodesAtEdge[seI] = fittedLayers + 1;
+
+                // Re-use the existing compatibility-smoothing trigger.
+                cappedEdge[seI] = true;
+
+                ++nHybridLayerReduced;
+
+                minHybridLayers =
+                    Foam::min(minHybridLayers, fittedLayers);
+
+                maxHybridLayers =
+                    Foam::max(maxHybridLayers, fittedLayers);
+
+                if( reduction == 1 )
+                    ++nReduce1;
+                else if( reduction == 2 )
+                    ++nReduce2;
+                else if( reduction <= 4 )
+                    ++nReduce3To4;
+                else
+                    ++nReduce5Plus;
             }
             else
             {
-                // Full canonical topology and h1 still fit, but only with
-                // r below the preferred 1.15 floor. POST will solve it.
-                ++nCanonicalBelowFloorBackoff;
+                // Should only be reachable through roundoff/pathological
+                // input, but keep the accounting explicit.
+                ++nHybridRatioOnly;
             }
         }
 
-        Info
-            << "CFMITCH V5.4b CANONICAL HEIGHT PRE:"
-            << " audited=" << nCanonicalAudited
-            << " requestedFits=" << nCanonicalRequestedFits
-            << " aboveFloorBackoff="
-            << nCanonicalAboveFloorBackoff
-            << " belowFloorBackoff="
-            << nCanonicalBelowFloorBackoff
-            << " cannotPreserveH1="
-            << nCanonicalCannotPreserveH1
-            << " invalid=" << nCanonicalInvalid
-            << " preferredMinRatio="
-            << cfmitchHybridMinGrowthRatio
-            << endl;
+        Info << "CFMITCH V5.4 HYBRID HEIGHT PRE:"
+             << " audited=" << nHybridAudited
+             << " requestedFits=" << nHybridRequestedFits
+             << " ratioOnly=" << nHybridRatioOnly
+             << " layerReduced=" << nHybridLayerReduced
+             << " impossible=" << nHybridImpossible
+             << " invalid=" << nHybridInvalid
+             << " preferredMinRatio="
+             << cfmitchHybridMinGrowthRatio
+             << " reduce1=" << nReduce1
+             << " reduce2=" << nReduce2
+             << " reduce3to4=" << nReduce3To4
+             << " reduce5plus=" << nReduce5Plus;
+
+        if( nHybridLayerReduced > 0 )
+        {
+            Info << " minResultLayers=" << minHybridLayers
+                 << " maxResultLayers=" << maxHybridLayers;
+        }
+
+        Info << endl;
     }
 
     // Split-edge layer-count compatibility smoothing.
@@ -2668,14 +2703,16 @@ void refineBoundaryLayers::generateNewVertices()
     }
 
     // -------------------------------------------------------------
-    // CFMitch V5.4b CANONICAL HEIGHT POLICY POST-MPI
+    // CFMitch V5.4 HYBRID HEIGHT POLICY POST-MPI
     //
-    // Layer topology remains owned by the canonical face-layer plan.
-    // Any pre-existing edge compatibility handling and processor-boundary
-    // reconciliation have now completed.
+    // Layer counts have now passed through:
     //
-    // Solve the final largest fitting growth ratio while preserving the
-    // effective first-layer height and canonical supporting layer count.
+    //   * local hybrid reduction
+    //   * split-edge compatibility smoothing
+    //   * processor-boundary reconciliation
+    //
+    // Now solve the final largest fitting growth ratio while preserving
+    // the reconciled effective first-layer height and final layer count.
     //
     // Preferred lower bound is cfmitchHybridMinGrowthRatio.  If a shared
     // edge or other reconciliation unexpectedly requires a lower value,
@@ -2855,7 +2892,7 @@ void refineBoundaryLayers::generateNewVertices()
                 ++nEffGe140;
         }
 
-        Info << "CFMITCH V5.4b CANONICAL HEIGHT POST:"
+        Info << "CFMITCH V5.4 HYBRID HEIGHT POST:"
              << " audited=" << nPostAudited
              << " unchanged=" << nPostUnchanged
              << " ratioReduced=" << nPostRatioReduced
@@ -3018,323 +3055,6 @@ void refineBoundaryLayers::generateNewVertices()
             }
 
             newVerticesForSplitEdge_(seI, nLayers) = e.end();
-        }
-    }
-
-    // -------------------------------------------------------------
-    // CFMitch V5.4 placement audit.
-    //
-    // Behaviour-neutral.  Measure the ACTUAL coordinates produced by
-    // split-edge subdivision after all h1/ratio/layer-count policy has
-    // completed.  This distinguishes planner intent from placed geometry.
-    // -------------------------------------------------------------
-    if( cfmitchPlanner.plannerEnabled() && !specialMode_ )
-    {
-        label nPlacementAudited(0);
-        label nPlacementInvalid(0);
-        label nPlacementZero(0);
-
-        label nH1Ge095(0);
-        label nH1075To095(0);
-        label nH1050To075(0);
-        label nH1025To050(0);
-        label nH1Lt025(0);
-
-        label nL1(0);
-        label nL2To3(0);
-        label nL4To6(0);
-        label nL7To9(0);
-        label nL10To13(0);
-        label nL14(0);
-        label nLGt14(0);
-
-        scalar minRequestedH1(GREAT);
-        scalar maxRequestedH1(-GREAT);
-        scalar minActualH1(GREAT);
-        scalar maxActualH1(-GREAT);
-        scalar minActualOverRequested(GREAT);
-        scalar maxActualOverRequested(-GREAT);
-
-        scalar minHair(GREAT);
-        scalar maxHair(-GREAT);
-
-        label nPrinted(0);
-
-        forAll(splitEdges_, seI)
-        {
-            const edge& e = splitEdges_[seI];
-
-            const label rowSize =
-                newVerticesForSplitEdge_.sizeOfRow(seI);
-
-            if
-            (
-                rowSize < 2
-             || e.start() < 0
-             || e.end() < 0
-             || e.start() >= label(points.size())
-             || e.end() >= label(points.size())
-            )
-            {
-                ++nPlacementInvalid;
-                continue;
-            }
-
-            const label firstPoint =
-                newVerticesForSplitEdge_(seI, 1);
-
-            if
-            (
-                firstPoint < 0
-             || firstPoint >= label(points.size())
-            )
-            {
-                ++nPlacementInvalid;
-                continue;
-            }
-
-            const scalar requestedH1 =
-                firstLayerThickness[seI];
-
-            if( requestedH1 <= SMALL )
-            {
-                ++nPlacementInvalid;
-                continue;
-            }
-
-            const scalar actualH1 =
-                mag
-                (
-                    points[firstPoint]
-                  - points[e.start()]
-                );
-
-            const scalar hairLength =
-                mag
-                (
-                    points[e.end()]
-                  - points[e.start()]
-                );
-
-            const label placedLayers = rowSize - 1;
-
-            const scalar h1Ratio =
-                actualH1 / requestedH1;
-
-            ++nPlacementAudited;
-
-            minRequestedH1 =
-                Foam::min(minRequestedH1, requestedH1);
-            maxRequestedH1 =
-                Foam::max(maxRequestedH1, requestedH1);
-
-            minActualH1 =
-                Foam::min(minActualH1, actualH1);
-            maxActualH1 =
-                Foam::max(maxActualH1, actualH1);
-
-            minActualOverRequested =
-                Foam::min(minActualOverRequested, h1Ratio);
-            maxActualOverRequested =
-                Foam::max(maxActualOverRequested, h1Ratio);
-
-            minHair =
-                Foam::min(minHair, hairLength);
-            maxHair =
-                Foam::max(maxHair, hairLength);
-
-            if( actualH1 <= SMALL )
-                ++nPlacementZero;
-
-            if( h1Ratio >= scalar(0.95) )
-                ++nH1Ge095;
-            else if( h1Ratio >= scalar(0.75) )
-                ++nH1075To095;
-            else if( h1Ratio >= scalar(0.50) )
-                ++nH1050To075;
-            else if( h1Ratio >= scalar(0.25) )
-                ++nH1025To050;
-            else
-                ++nH1Lt025;
-
-            if( placedLayers <= 1 )
-                ++nL1;
-            else if( placedLayers <= 3 )
-                ++nL2To3;
-            else if( placedLayers <= 6 )
-                ++nL4To6;
-            else if( placedLayers <= 9 )
-                ++nL7To9;
-            else if( placedLayers <= 13 )
-                ++nL10To13;
-            else if( placedLayers == 14 )
-                ++nL14;
-            else
-                ++nLGt14;
-
-            // Print a small deterministic sample of genuine BL columns.
-            if
-            (
-                nPrinted < 30
-             && placedLayers >= 7
-            )
-            {
-                ++nPrinted;
-
-                Info << "CFMITCH V5.4 H1DIAG:"
-                     << " se=" << seI
-                     << " requestedH1=" << requestedH1
-                     << " actualH1=" << actualH1
-                     << " actualOverRequested=" << h1Ratio
-                     << " ratio=" << thicknessRatio[seI]
-                     << " nLayers=" << nLayersAtEdge[seI]
-                     << " rowLayers=" << placedLayers
-                     << " hair=" << hairLength
-                     << endl;
-            }
-        }
-
-        Info << "CFMITCH V5.4 PLACEMENT AUDIT:"
-             << " audited=" << nPlacementAudited
-             << " invalid=" << nPlacementInvalid
-             << " zeroH1=" << nPlacementZero
-             << " h1_ge0.95=" << nH1Ge095
-             << " h1_0.75_0.95=" << nH1075To095
-             << " h1_0.50_0.75=" << nH1050To075
-             << " h1_0.25_0.50=" << nH1025To050
-             << " h1_lt0.25=" << nH1Lt025
-             << " layers1=" << nL1
-             << " layers2to3=" << nL2To3
-             << " layers4to6=" << nL4To6
-             << " layers7to9=" << nL7To9
-             << " layers10to13=" << nL10To13
-             << " layers14=" << nL14
-             << " layersGt14=" << nLGt14;
-
-        if( nPlacementAudited > 0 )
-        {
-            Info << " minRequestedH1=" << minRequestedH1
-                 << " maxRequestedH1=" << maxRequestedH1
-                 << " minActualH1=" << minActualH1
-                 << " maxActualH1=" << maxActualH1
-                 << " minActualOverRequested="
-                 << minActualOverRequested
-                 << " maxActualOverRequested="
-                 << maxActualOverRequested
-                 << " minHair=" << minHair
-                 << " maxHair=" << maxHair;
-        }
-
-        Info << endl;
-    }
-
-    // -------------------------------------------------------------
-    // CFMitch face-topology authority audit.
-    //
-    // Behaviour-neutral.
-    //
-    // nLayersAtBndFace_ is the layer-count field consumed downstream by
-    // generateNewFaces()/generateNewCellsPrism().  Report its distribution
-    // by patch after split-edge geometry has been generated.
-    // -------------------------------------------------------------
-    if( cfmitchPlanner.plannerEnabled() && !specialMode_ )
-    {
-        const meshSurfaceEngine& topoMse =
-            surfaceEngine();
-
-        const labelList& topoFacePatch =
-            topoMse.boundaryFacePatches();
-
-        const PtrList<boundaryPatch>& topoBoundaries =
-            mesh_.boundaries();
-
-        label g0(0), g1(0), g2(0), g3to6(0);
-        label g7to9(0), g10to13(0), g14(0), gGt14(0);
-        label gInvalid(0);
-
-        forAll(nLayersAtBndFace_, bfI)
-        {
-            const label n = nLayersAtBndFace_[bfI];
-
-            if( n <= 0 ) ++g0;
-            else if( n == 1 ) ++g1;
-            else if( n == 2 ) ++g2;
-            else if( n <= 6 ) ++g3to6;
-            else if( n <= 9 ) ++g7to9;
-            else if( n <= 13 ) ++g10to13;
-            else if( n == 14 ) ++g14;
-            else ++gGt14;
-
-            if
-            (
-                bfI < 0
-             || bfI >= label(topoFacePatch.size())
-             || topoFacePatch[bfI] < 0
-             || topoFacePatch[bfI] >= label(topoBoundaries.size())
-            )
-                ++gInvalid;
-        }
-
-        Info
-            << "CFMITCH FACE TOPOLOGY AUTHORITY:"
-            << " faces=" << nLayersAtBndFace_.size()
-            << " n0=" << g0
-            << " n1=" << g1
-            << " n2=" << g2
-            << " n3to6=" << g3to6
-            << " n7to9=" << g7to9
-            << " n10to13=" << g10to13
-            << " n14=" << g14
-            << " nGt14=" << gGt14
-            << " invalidPatchRefs=" << gInvalid
-            << endl;
-
-        forAll(topoBoundaries, patchI)
-        {
-            label p0(0), p1(0), p2(0), p3to6(0);
-            label p7to9(0), p10to13(0), p14(0), pGt14(0);
-            label total(0);
-
-            forAll(nLayersAtBndFace_, bfI)
-            {
-                if
-                (
-                    bfI >= label(topoFacePatch.size())
-                 || topoFacePatch[bfI] != patchI
-                )
-                    continue;
-
-                ++total;
-
-                const label n = nLayersAtBndFace_[bfI];
-
-                if( n <= 0 ) ++p0;
-                else if( n == 1 ) ++p1;
-                else if( n == 2 ) ++p2;
-                else if( n <= 6 ) ++p3to6;
-                else if( n <= 9 ) ++p7to9;
-                else if( n <= 13 ) ++p10to13;
-                else if( n == 14 ) ++p14;
-                else ++pGt14;
-            }
-
-            if( total > 0 )
-            {
-                Info
-                    << "CFMITCH FACE TOPOLOGY PATCH:"
-                    << " patch="
-                    << topoBoundaries[patchI].patchName()
-                    << " faces=" << total
-                    << " n0=" << p0
-                    << " n1=" << p1
-                    << " n2=" << p2
-                    << " n3to6=" << p3to6
-                    << " n7to9=" << p7to9
-                    << " n10to13=" << p10to13
-                    << " n14=" << p14
-                    << " nGt14=" << pGt14
-                    << endl;
-            }
         }
     }
 

@@ -2254,74 +2254,42 @@ void refineBoundaryLayers::generateNewVertices()
 
     const scalar cfmitchHybridMinGrowthRatio(1.15);
 
-    // -------------------------------------------------------------
-    // CFMitch V5.4b -- canonical topology / height-only PRE pass.
-    //
-    // IMPORTANT ARCHITECTURAL CONTRACT:
-    //
-    //   nLayersAtBndFace_ owns boundary-layer topology.
-    //
-    // nLayersAtEdge is derived support geometry for that topology and
-    // must not independently reduce the number of intervals after the
-    // face-layer plan has been solved.
-    //
-    // Previous V5.4 behaviour reduced nLayersAtEdge when the requested
-    // h1 + growth ratio would not fit a hair at the preferred ratio
-    // floor.  That created split rows shorter than the still-canonical
-    // face topology, e.g.
-    //
-    //     face topology = 14
-    //     split row     = 8 layers / 9 points
-    //
-    // generateNewFaces() then legitimately failed because canonical
-    // face endpoints did not exist in the shortened split row.
-    //
-    // V5.4b therefore performs NO topology mutation here.
-    //
-    // Policy:
-    //
-    //   1. preserve canonical layer count
-    //   2. preserve requested h1 when geometrically possible
-    //   3. reduce growth ratio in POST
-    //   4. preferred ratio floor 1.15 is soft
-    //   5. if even r=1 cannot fit n*h1, downstream legacy placement
-    //      may compress h1 for that exceptional edge
-    //
-    // This PRE pass is classification/telemetry only.
-    // -------------------------------------------------------------
     if( cfmitchPlanner.plannerEnabled() && !specialMode_ )
     {
-        label nCanonicalAudited(0);
-        label nCanonicalRequestedFits(0);
-        label nCanonicalAboveFloorBackoff(0);
-        label nCanonicalBelowFloorBackoff(0);
-        label nCanonicalCannotPreserveH1(0);
-        label nCanonicalInvalid(0);
+        label nHybridAudited(0);
+        label nHybridRequestedFits(0);
+        label nHybridRatioOnly(0);
+        label nHybridLayerReduced(0);
+        label nHybridImpossible(0);
+        label nHybridInvalid(0);
+
+        label nReduce1(0);
+        label nReduce2(0);
+        label nReduce3To4(0);
+        label nReduce5Plus(0);
+
+        label minHybridLayers(labelMax);
+        label maxHybridLayers(-1);
 
         forAll(splitEdges_, seI)
         {
             const edge& e = splitEdges_[seI];
 
-            const scalar h1 =
-                firstLayerThickness[seI];
-
-            const scalar requestedRatio =
-                thicknessRatio[seI];
-
-            const label nLayers =
-                nLayersAtEdge[seI];
+            const scalar h1 = firstLayerThickness[seI];
+            const scalar requestedRatio = thicknessRatio[seI];
+            const label requestedLayers = nLayersAtEdge[seI];
 
             if
             (
                 h1 <= SMALL
-             || nLayers <= 0
+             || requestedLayers <= 0
              || e.start() < 0
              || e.end() < 0
              || e.start() >= label(points.size())
              || e.end() >= label(points.size())
             )
             {
-                ++nCanonicalInvalid;
+                ++nHybridInvalid;
                 continue;
             }
 
@@ -2330,23 +2298,23 @@ void refineBoundaryLayers::generateNewVertices()
 
             if( hairLength <= SMALL )
             {
-                ++nCanonicalInvalid;
+                ++nHybridInvalid;
                 continue;
             }
 
-            ++nCanonicalAudited;
+            ++nHybridAudited;
 
+            // Requested progression.
             scalar requestedSum(1.0);
             scalar requestedTerm(1.0);
 
-            for(label layerI=1; layerI<nLayers; ++layerI)
+            for(label layerI=1; layerI<requestedLayers; ++layerI)
             {
                 requestedTerm *= requestedRatio;
                 requestedSum += requestedTerm;
             }
 
-            const scalar requestedTotal =
-                h1 * requestedSum;
+            const scalar requestedTotal = h1 * requestedSum;
 
             const scalar fitTol =
                 scalar(1e-10)
@@ -2354,23 +2322,14 @@ void refineBoundaryLayers::generateNewVertices()
 
             if( requestedTotal <= hairLength + fitTol )
             {
-                ++nCanonicalRequestedFits;
+                ++nHybridRequestedFits;
                 continue;
             }
 
-            // Absolute geometric lower bound for preserved h1:
-            //
-            // r = 1  => total thickness = nLayers * h1.
-            const scalar minimumTotal =
-                scalar(nLayers) * h1;
-
-            if( minimumTotal > hairLength + fitTol )
-            {
-                ++nCanonicalCannotPreserveH1;
-                continue;
-            }
-
-            const scalar preferredFloor =
+            // Preferred minimum useful growth ratio.
+            // Never choose a floor above the user's requested ratio and
+            // never allow the policy floor below unity.
+            const scalar floorRatio =
                 Foam::max
                 (
                     scalar(1.0),
@@ -2381,41 +2340,117 @@ void refineBoundaryLayers::generateNewVertices()
                     )
                 );
 
+            // Does the full requested layer count fit at the preferred
+            // growth floor?  If yes, retain the count; final rEff will be
+            // solved after MPI reconciliation.
             scalar floorSum(1.0);
             scalar floorTerm(1.0);
 
-            for(label layerI=1; layerI<nLayers; ++layerI)
+            for(label layerI=1; layerI<requestedLayers; ++layerI)
             {
-                floorTerm *= preferredFloor;
+                floorTerm *= floorRatio;
                 floorSum += floorTerm;
             }
 
             if( h1 * floorSum <= hairLength + fitTol )
             {
-                ++nCanonicalAboveFloorBackoff;
+                ++nHybridRatioOnly;
+                continue;
+            }
+
+            // The requested layer count cannot fit without taking the
+            // growth ratio below the preferred floor.
+            //
+            // Find the LARGEST layer count that does fit at floorRatio.
+            label fittedLayers(requestedLayers);
+            bool foundFit(false);
+
+            while( fittedLayers > 0 )
+            {
+                scalar fitSum(1.0);
+                scalar fitTerm(1.0);
+
+                for(label layerI=1; layerI<fittedLayers; ++layerI)
+                {
+                    fitTerm *= floorRatio;
+                    fitSum += fitTerm;
+                }
+
+                if( h1 * fitSum <= hairLength + fitTol )
+                {
+                    foundFit = true;
+                    break;
+                }
+
+                --fittedLayers;
+            }
+
+            if( !foundFit || fittedLayers <= 0 )
+            {
+                // Even one h1 cell cannot fit this hair.  Do not invent
+                // another topology policy here.  Leave legacy behaviour
+                // and report it loudly.
+                ++nHybridImpossible;
+                continue;
+            }
+
+            if( fittedLayers < requestedLayers )
+            {
+                const label reduction =
+                    requestedLayers - fittedLayers;
+
+                nLayersAtEdge[seI] = fittedLayers;
+                nNodesAtEdge[seI] = fittedLayers + 1;
+
+                // Re-use the existing compatibility-smoothing trigger.
+                cappedEdge[seI] = true;
+
+                ++nHybridLayerReduced;
+
+                minHybridLayers =
+                    Foam::min(minHybridLayers, fittedLayers);
+
+                maxHybridLayers =
+                    Foam::max(maxHybridLayers, fittedLayers);
+
+                if( reduction == 1 )
+                    ++nReduce1;
+                else if( reduction == 2 )
+                    ++nReduce2;
+                else if( reduction <= 4 )
+                    ++nReduce3To4;
+                else
+                    ++nReduce5Plus;
             }
             else
             {
-                // Full canonical topology and h1 still fit, but only with
-                // r below the preferred 1.15 floor. POST will solve it.
-                ++nCanonicalBelowFloorBackoff;
+                // Should only be reachable through roundoff/pathological
+                // input, but keep the accounting explicit.
+                ++nHybridRatioOnly;
             }
         }
 
-        Info
-            << "CFMITCH V5.4b CANONICAL HEIGHT PRE:"
-            << " audited=" << nCanonicalAudited
-            << " requestedFits=" << nCanonicalRequestedFits
-            << " aboveFloorBackoff="
-            << nCanonicalAboveFloorBackoff
-            << " belowFloorBackoff="
-            << nCanonicalBelowFloorBackoff
-            << " cannotPreserveH1="
-            << nCanonicalCannotPreserveH1
-            << " invalid=" << nCanonicalInvalid
-            << " preferredMinRatio="
-            << cfmitchHybridMinGrowthRatio
-            << endl;
+        Info << "CFMITCH V5.4 HYBRID HEIGHT PRE:"
+             << " audited=" << nHybridAudited
+             << " requestedFits=" << nHybridRequestedFits
+             << " ratioOnly=" << nHybridRatioOnly
+             << " layerReduced=" << nHybridLayerReduced
+             << " impossible=" << nHybridImpossible
+             << " invalid=" << nHybridInvalid
+             << " preferredMinRatio="
+             << cfmitchHybridMinGrowthRatio
+             << " reduce1=" << nReduce1
+             << " reduce2=" << nReduce2
+             << " reduce3to4=" << nReduce3To4
+             << " reduce5plus=" << nReduce5Plus;
+
+        if( nHybridLayerReduced > 0 )
+        {
+            Info << " minResultLayers=" << minHybridLayers
+                 << " maxResultLayers=" << maxHybridLayers;
+        }
+
+        Info << endl;
     }
 
     // Split-edge layer-count compatibility smoothing.
@@ -2668,14 +2703,16 @@ void refineBoundaryLayers::generateNewVertices()
     }
 
     // -------------------------------------------------------------
-    // CFMitch V5.4b CANONICAL HEIGHT POLICY POST-MPI
+    // CFMitch V5.4 HYBRID HEIGHT POLICY POST-MPI
     //
-    // Layer topology remains owned by the canonical face-layer plan.
-    // Any pre-existing edge compatibility handling and processor-boundary
-    // reconciliation have now completed.
+    // Layer counts have now passed through:
     //
-    // Solve the final largest fitting growth ratio while preserving the
-    // effective first-layer height and canonical supporting layer count.
+    //   * local hybrid reduction
+    //   * split-edge compatibility smoothing
+    //   * processor-boundary reconciliation
+    //
+    // Now solve the final largest fitting growth ratio while preserving
+    // the reconciled effective first-layer height and final layer count.
     //
     // Preferred lower bound is cfmitchHybridMinGrowthRatio.  If a shared
     // edge or other reconciliation unexpectedly requires a lower value,
@@ -2855,7 +2892,7 @@ void refineBoundaryLayers::generateNewVertices()
                 ++nEffGe140;
         }
 
-        Info << "CFMITCH V5.4b CANONICAL HEIGHT POST:"
+        Info << "CFMITCH V5.4 HYBRID HEIGHT POST:"
              << " audited=" << nPostAudited
              << " unchanged=" << nPostUnchanged
              << " ratioReduced=" << nPostRatioReduced
