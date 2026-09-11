@@ -27,6 +27,7 @@ Description
 
 #include "demandDrivenData.H"
 #include "boundaryLayerOptimisation.H"
+#include "boolList.H"
 #include "meshSurfacePartitioner.H"
 #include "meshSurfaceEngine.H"
 #include "helperFunctions.H"
@@ -64,27 +65,71 @@ void boundaryLayerOptimisation::calculateNormalVectors
     const vectorField& fNormals = mse.faceNormals();
 
     //- calculate point normals with respect to all patches at a point
+    //
+    // Bug 1.1 fix: deduplicate by bpI before parallel loop.
+    // The accumulated quantity depends only on bpI, not on hair edge identity.
+    // Multiple hair edges sharing the same bpI would cause the same face
+    // neighborhood to be summed multiple times (K-fold over-count at junctions).
+    // Fix: build unique bpI list, pre-insert outer std::map keys serially
+    // (std::map insertion mutates tree structure, unsafe under OMP even for
+    // disjoint keys), then fill one bpI per parallel iteration.
     pointPatchNormal.clear();
 
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 20)
-    # endif
+    boolList bpSelected(pointFaces.size(), false);
+    labelList uniqueBpIList(hairEdges_.size());
+    label nUniqueBpI = 0;
+    label nFilteredHairEdges = 0;
+    label nOutOfRangeBp = 0;
+    label nDuplicateHairBp = 0;
+
     forAll(hairEdges_, hairEdgeI)
     {
         if( !(hairEdgeType_[hairEdgeI] & eType) )
             continue;
 
+        ++nFilteredHairEdges;
+
         const label bpI = bp[hairEdges_[hairEdgeI][0]];
 
-        //- create an entry in a map
-        patchNormalType* patchNormalPtr(NULL);
-        # ifdef USE_OMP
-        # pragma omp critical
-            patchNormalPtr = &pointPatchNormal[bpI];
-        # else
-        patchNormalPtr = &pointPatchNormal[bpI];
-        # endif
-        patchNormalType& patchNormal = *patchNormalPtr;
+        if( bpI < 0 || bpI >= label(bpSelected.size()) )
+        {
+            ++nOutOfRangeBp;
+            continue;
+        }
+
+        if( bpSelected[bpI] )
+        {
+            ++nDuplicateHairBp;
+            continue;
+        }
+
+        bpSelected[bpI] = true;
+        uniqueBpIList[nUniqueBpI++] = bpI;
+    }
+
+    // Serial pre-insert -- populates all outer map nodes before parallel phase.
+    // Prevents concurrent operator[] from racing on std::map rebalancing.
+    for(label i=0; i<nUniqueBpI; ++i)
+        pointPatchNormal[uniqueBpIList[i]];
+
+    Info << "BL normal accumulation: eType=" << label(eType)
+         << " filteredHairEdges=" << nFilteredHairEdges
+         << " uniqueBpI=" << nUniqueBpI
+         << " duplicateHairBp=" << nDuplicateHairBp
+         << " outOfRangeBp=" << nOutOfRangeBp
+         << endl;
+
+    # ifdef USE_OMP
+    # pragma omp parallel for schedule(dynamic, 20)
+    # endif
+    for(label i=0; i<nUniqueBpI; ++i)
+    {
+        const label bpI = uniqueBpIList[i];
+
+        pointNormalsType::iterator ppnIt = pointPatchNormal.find(bpI);
+        if( ppnIt == pointPatchNormal.end() ) continue;
+
+        patchNormalType& patchNormal = ppnIt->second;
 
         //- sum normals of faces attached to a point
         forAllRow(pointFaces, bpI, pfI)
@@ -92,85 +137,20 @@ void boundaryLayerOptimisation::calculateNormalVectors
             const label bfI = pointFaces(bpI, pfI);
             const label patchI = facePatch[bfI];
 
-            if( patchNormal.find(patchI) == patchNormal.end() )
+            patchNormalType::iterator pIt = patchNormal.find(patchI);
+            if( pIt == patchNormal.end() )
             {
-                patchNormal[patchI].first = fNormals[bfI];
+                patchNormal[patchI].first  = fNormals[bfI];
                 patchNormal[patchI].second = mag(fNormals[bfI]);
             }
             else
             {
-                patchNormal[patchI].first += fNormals[bfI];
-                patchNormal[patchI].second += mag(fNormals[bfI]);
+                pIt->second.first  += fNormals[bfI];
+                pIt->second.second += mag(fNormals[bfI]);
             }
         }
     }
 
-    if( Pstream::parRun() )
-    {
-        //- gather information about face normals on other processors
-        const Map<label>& globalToLocal =
-            mse.globalToLocalBndPointAddressing();
-        const DynList<label>& neiProcs = mse.bpNeiProcs();
-        const VRWGraph& bpAtProcs = mse.bpAtProcs();
-
-        std::map<label, LongList<refLabelledPointScalar> > exchangeData;
-        forAll(neiProcs, i)
-            exchangeData[neiProcs[i]].clear();
-
-        forAllConstIter(Map<label>, globalToLocal, it)
-        {
-            const label bpI = it();
-
-            if( pointPatchNormal.find(bpI) != pointPatchNormal.end() )
-            {
-                const patchNormalType& patchNormal = pointPatchNormal[bpI];
-
-                forAllRow(bpAtProcs, bpI, i)
-                {
-                    const label neiProc = bpAtProcs(bpI, i);
-
-                    if( neiProc == Pstream::myProcNo() )
-                        continue;
-
-                    forAllConstIter(patchNormalType, patchNormal, pIt)
-                        exchangeData[neiProc].append
-                        (
-                            refLabelledPointScalar
-                            (
-                                it.key(),
-                                labelledPointScalar
-                                (
-                                    pIt->first,
-                                    pIt->second.first,
-                                    pIt->second.second
-                                )
-                            )
-                        );
-                }
-            }
-        }
-
-        LongList<refLabelledPointScalar> receivedData;
-        help::exchangeMap(exchangeData, receivedData);
-
-        forAll(receivedData, i)
-        {
-            const refLabelledPointScalar& rlps = receivedData[i];
-            const label bpI = globalToLocal[rlps.objectLabel()];
-
-            patchNormalType& patchNormal = pointPatchNormal[bpI];
-
-            const labelledPointScalar& lps = rlps.lps();
-            patchNormal[lps.pointLabel()].first += lps.coordinates();
-            patchNormal[lps.pointLabel()].second += lps.scalarValue();
-        }
-    }
-
-    //- finally, calculate normal vectors
-    # ifdef USE_OMP
-    # pragma omp parallel
-    # pragma omp single nowait
-    # endif
     forAllIter(pointNormalsType, pointPatchNormal, it)
     {
         # ifdef USE_OMP
@@ -374,12 +354,17 @@ void boundaryLayerOptimisation::calculateHairVectorsAtTheBoundary
                 }
 
                 if( beI < 0 )
-                    FatalErrorIn
+                {
+                    // Bug 2.1a: graceful degrade -- keep existing hair
+                    // vector rather than aborting on one anomalous edge.
+                    WarningIn
                     (
                         "boundaryLayerOptimisation::"
                         "calculateHairVectorsAtTheBoundary(vectorField&)"
                     ) << "Cannot find hair edge "
-                      << hairEdgeI << abort(FatalError);
+                      << hairEdgeI << ". Keeping existing vector." << endl;
+                    continue;
+                }
 
                 //- find the vector at the same angle from both feature edges
                 forAllRow(edgeFaces, beI, befI)
@@ -390,13 +375,18 @@ void boundaryLayerOptimisation::calculateHairVectorsAtTheBoundary
                     const label pos = bf.which(he.start());
 
                     if( pos < 0 )
-                        FatalErrorIn
+                    {
+                        // Bug 2.1b: graceful degrade -- skip this face
+                        // contribution rather than aborting the run.
+                        WarningIn
                         (
                             "boundaryLayerOptimisation::"
                             "calculateHairVectorsAtTheBoundary(vectorField&)"
                         ) << "Cannot find hair edge "
                           << hairEdgeI << " in face " << bf
-                          << abort(FatalError);
+                          << ". Skipping face contribution." << endl;
+                        continue;
+                    }
 
                     if( he.end() == bf.prevLabel(pos) )
                     {
@@ -422,12 +412,14 @@ void boundaryLayerOptimisation::calculateHairVectorsAtTheBoundary
             }
             else
             {
-                FatalErrorIn
+                // Bug 2.1c: graceful degrade -- unknown hair type.
+                // Keep existing hair vector rather than aborting.
+                WarningIn
                 (
                     "boundaryLayerOptimisation::"
                     "calculateHairVectorsAtTheBoundary(vectorField&)"
                 ) << "Invalid hair type " << label(hairType)
-                  << abort(FatalError);
+                  << ". Keeping existing vector." << endl;
             }
         }
     }
@@ -503,6 +495,8 @@ void boundaryLayerOptimisation::calculateHairVectorsAtTheBoundary
         forAll(receivedData, i)
         {
             const labelledPoint& lp = receivedData[i];
+            if( !globalToLocalEdge.found(lp.pointLabel()) ) continue;
+            if( !globalToLocalEdge.found(lp.pointLabel()) ) continue;
             const label edgeI = globalToLocalEdge[lp.pointLabel()];
             const edge& e = edges[edgeI];
 
@@ -658,12 +652,14 @@ void boundaryLayerOptimisation::optimiseHairNormalsAtTheBoundary()
                 }
                 else
                 {
-                    FatalErrorIn
+                    // Bug 2.2: graceful degrade -- unexpected hair type
+                    // during normal smoothing. Keep existing normal.
+                    WarningIn
                     (
                         "void boundaryLayerOptimisation::"
                         "optimiseHairNormalsAtTheBoundary(const label)"
                     ) << "Cannot smooth hair with type " << label(eType)
-                      << abort(FatalError);
+                      << ". Keeping existing normal." << endl;
                 }
             }
         }
@@ -743,7 +739,9 @@ void boundaryLayerOptimisation::optimiseHairNormalsAtTheBoundary()
             forAll(receivedData, i)
             {
                 const labelledPoint& lp = receivedData[i];
-                const label edgeI = globalToLocalEdge[lp.pointLabel()];
+                if( !globalToLocalEdge.found(lp.pointLabel()) ) continue;
+                if( !globalToLocalEdge.found(lp.pointLabel()) ) continue;
+            const label edgeI = globalToLocalEdge[lp.pointLabel()];
                 const edge& e = edges[edgeI];
 
                 bool found(false);
@@ -866,12 +864,16 @@ void boundaryLayerOptimisation::optimiseHairNormalsInside()
 
                 if( counter == 0 )
                 {
-                    FatalErrorIn
+                    // Bug 2.3: graceful degrade -- no inside-patch
+                    // contribution for this point. Keep existing vector.
+                    WarningIn
                     (
                         "void boundaryLayerOptimisation::"
                         "optimiseHairNormalsInside()"
                     ) << "No valid patches for boundary point "
-                      << bp[hairEdges_[hairEdgeI].start()] << abort(FatalError);
+                      << bp[hairEdges_[hairEdgeI].start()]
+                      << ". Keeping existing vector." << endl;
+                    continue;
                 }
 
                 hv /= (mag(hv) + VSMALL);
@@ -1091,7 +1093,8 @@ void boundaryLayerOptimisation::optimiseHairNormalsInside()
             forAll(receivedData, i)
             {
                 const labelledPoint& lp = receivedData[i];
-                const label edgeI = globalToLocalEdge[lp.pointLabel()];
+                if( !globalToLocalEdge.found(lp.pointLabel()) ) continue;
+            const label edgeI = globalToLocalEdge[lp.pointLabel()];
                 const edge& e = edges[edgeI];
 
                 bool found(false);

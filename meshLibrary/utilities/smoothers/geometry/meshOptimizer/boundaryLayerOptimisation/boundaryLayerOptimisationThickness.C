@@ -226,7 +226,13 @@ scalar boundaryLayerOptimisation::calculateThickness
     {
         retHeight = suggestedNeiHeight + relThicknessTol_ * magDv;
 
-        retThickness = (retHeight / currHeight) * currThickness;
+        // Bug 3.1: currHeight can be zero/near-zero for degenerate
+        // hair edges.  Do not divide by it; keeping the already-computed
+        // retThickness is safer than manufacturing a huge thickness spike.
+        if( currHeight > VSMALL )
+        {
+            retThickness = (retHeight / currHeight) * currThickness;
+        }
     }
 
     return retThickness;
@@ -299,6 +305,12 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
 
     vectorField hairDirections(hairEdges_.size());
     scalarField hairLength(hairEdges_.size());
+    scalarField initialHairLength(hairEdges_.size());
+
+    // Minimum thickness fraction and max iterations from meshDict knobs.
+    // Defaults preserve historical behavior: 1e-4 and 100.
+    const scalar minThicknessFraction = minThicknessFraction_;
+    const label maxThicknessIterations = maxThicknessIterations_;
 
     # ifdef USE_OMP
     # pragma omp parallel for schedule(dynamic, 50)
@@ -308,6 +320,7 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
         vector n = hairEdges_[hairEdgeI].vec(points);
 
         hairLength[hairEdgeI] = (Foam::mag(n) + VSMALL);
+        initialHairLength[hairEdgeI] = hairLength[hairEdgeI];
         hairDirections[hairEdgeI] = n / hairLength[hairEdgeI];
     }
 
@@ -402,6 +415,11 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
                     }
                 }
 
+                // Apply minimum thickness floor to prevent aspect-ratio collapse
+                const scalar minThickness =
+                    minThicknessFraction * initialHairLength[hairEdgeI];
+                maxThickness = Foam::max(maxThickness, minThickness);
+
                 if( hairLength[hairEdgeI] > maxThickness )
                 {
                     //- make the hair edge shorter
@@ -416,52 +434,7 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
                 }
             }
         }
-/*
-        # ifdef USE_OMP
-        # pragma omp parallel for schedule(dynamic, 50)
-        # endif
-        forAll(hairEdgesNearHairEdge_, hairEdgeI)
-        {
-            const scalar magN = hairLength[hairEdgeI];
-
-            if( magN < VSMALL )
-                FatalErrorIn
-                (
-                    "void boundaryLayerOptimisation::optimiseThicknessVariation"
-                    "(const direction, const label, const scalar, const scalar)"
-                ) << "Zero layer thickness at hair edge " << hairEdgeI
-                  << ". Exitting..." << exit(FatalError);
-
-            if( hairEdgeType_[hairEdgeI] & edgeType )
-            {
-                forAllRow(hairEdgesNearHairEdge_, hairEdgeI, nheI)
-                {
-                    const label hairEdgeJ =
-                        hairEdgesNearHairEdge_(hairEdgeI, nheI);
-
-                    if( !activeHairEdge[hairEdgeJ] )
-                        continue;
-
-                    const scalar maxThickness =
-                        calculateThickness
-                        (
-                            hairEdgeI,
-                            hairEdgeJ
-                        );
-
-                    if( hairLength[hairEdgeI] > maxThickness )
-                    {
-                        //- make the hair edge shorter
-                        hairLength[hairEdgeI] = maxThickness;
-
-                        changed = true;
-                        thinnedHairEdge_[hairEdgeI] = true;
-                        modifiedHairEdge[hairEdgeI] = true;
-                    }
-                }
-            }
-        }
-        */
+        // Old direct-neighbor loop removed -- superseded by cell-based thickness check above
 
         if( Pstream::parRun() )
         {
@@ -532,6 +505,8 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
             forAll(receivedData, i)
             {
                 const labelledScalar& lScalar = receivedData[i];
+                if( !globalToLocalEdge.found(lScalar.scalarLabel()) ) continue;
+                if( !globalToLocalEdge.found(lScalar.scalarLabel()) ) continue;
                 const label edgeI = globalToLocalEdge[lScalar.scalarLabel()];
                 const edge& e = edges[edgeI];
 
@@ -551,7 +526,10 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
                         {
                             if( lScalar.value() < hairLength[hairEdgeI] )
                             {
-                                hairLength[hairEdgeI] = lScalar.value();
+                                const scalar minThicknessP =
+                                    minThicknessFraction * initialHairLength[hairEdgeI];
+                                hairLength[hairEdgeI] =
+                                    Foam::max(lScalar.value(), minThicknessP);
                                 changed = true;
                                 thinnedHairEdge_[hairEdgeI] = true;
                                 modifiedHairEdge[hairEdgeI] = true;
@@ -592,7 +570,16 @@ void boundaryLayerOptimisation::optimiseThicknessVariation
 
         //- mark edges which may be changed
         activeHairEdge.transfer(influencedEdges);
-    } while( changed && (++nIter < 1000) );
+    } while( changed && (++nIter < maxThicknessIterations) );
+
+    if( nIter >= maxThicknessIterations )
+        WarningIn
+        (
+            "void boundaryLayerOptimisation::optimiseThicknessVariation"
+            "(const direction)"
+        ) << "Reached maximum thickness optimisation iterations: "
+          << maxThicknessIterations
+          << ". Some hair edges may not be fully optimised." << endl;
 }
 
 

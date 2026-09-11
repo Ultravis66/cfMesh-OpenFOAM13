@@ -52,6 +52,7 @@ namespace Foam
 // Forward declarations
 class polyMeshGen;
 class VRWGraph;
+class meshOctree;
 
 /*---------------------------------------------------------------------------*\
                         Class partTetMesh Declaration
@@ -102,6 +103,24 @@ class partTetMesh
 
         //- labels of points serving as buffer layers on other processors
         mutable labelLongList* pAtBufferLayersPtr_;
+
+        //- optional surface octree for boundary point re-projection
+        //- in updateOrigMesh. Null by default (no constraint).
+        const meshOctree* surfaceOctreePtr_;
+
+        //- point-patch membership indexed by boundary-point index
+        const VRWGraph* bndPointPatchesPtr_;
+
+        //- mapping: global mesh point label -> boundary point index
+        //- (-1 if interior). Size = mesh_.points().size().
+        const labelLongList* globalToBoundaryPointPtr_;
+
+        //- boundary points at feature curve corners (3+ patches, fully locked)
+        const labelHashSet* featureCornerPointsPtr_;
+
+        //- feature curve tangent vectors indexed by boundary point
+        //- zero vector = not a feature curve point
+        const vectorField* featureCurveTangentsPtr_;
 
     // Private member functions
 
@@ -266,6 +285,18 @@ public:
         void updateVerticesSMP(const List<LongList<labelledPoint> >&);
 
         //- updates the vertices of the original polyMeshGen
+        //- set optional surface constraint for boundary point re-projection
+        //- during updateOrigMesh. All three pointers must be non-null
+        //- to activate. Pass null to disable (default).
+        void setSurfaceConstraint
+        (
+            const meshOctree* octreePtr,
+            const VRWGraph* bndPointPatchesPtr,
+            const labelLongList* globalToBoundaryPointPtr,
+            const labelHashSet* featureCornerPointsPtr = NULL,
+            const vectorField* featureCurveTangentsPtr = NULL
+        );
+
         void updateOrigMesh(boolList* changedFacePtr = NULL);
 
         //- creates polyMeshGen from this partTetMesh

@@ -100,6 +100,40 @@ class refineBoundaryLayers
         //- matching the thickness of the n-1 ones
         bool specialMode_;
 
+        //- false if refineFace() encountered inconsistent split-edge
+        //- metadata during refinement (e.g. after two-pass restore on a
+        //- transition face). Refinement leaves such faces unrefined and
+        //- sets this flag so the caller can reject the result cleanly
+        //- rather than ship a partially-refined mesh.
+        mutable bool refinementValid_;
+
+        //- Boundary-layer architecture selector.
+        //- legacyEnhanced is the current production-compatible default.
+        word boundaryLayerArchitecture_;
+
+        //- Maximum allowed layer-count increase between compatible
+        //- neighbouring boundary faces in CFMitch.
+        label constraintPlannerMaxLayerStep_;
+
+        //- CFMitch V5.2a read-only prospective marching census.
+        //- Evaluates the exact child topology before generateNewCells()
+        //- commits it.  This switch never changes points, faces, layer
+        //- counts, or acceptance decisions.
+        bool cfmitchV52aFrontCensus_;
+
+        //- Export safe prospective wall-prefix depths as ceilings for
+        //- the next fresh boundary-layer construction.
+        bool cfmitchV52bApplyFrontCaps_;
+
+    //- CFMitch V5.7a experimental internal quad-fan escape.
+    //
+    //  Replaces a physically shared-base-invalid regular BL quad
+    //  with four triangular sibling faces around the existing
+    //  OpenFOAM face centre.  Disabled by default.
+    bool cfmitchV57QuadFanEscape_;
+    //- V10K: synchronize final layer counts across actual type1/type1 cross-patch seams.
+    bool cfmitchV10KCrossPatchLayerSync_;
+
         //- information about existing boundary layers at patches
         //- only available layers
         List<DynList<label> > layerAtPatch_;
@@ -111,8 +145,85 @@ class refineBoundaryLayers
         //- a boundary face
         labelList nLayersAtBndFace_;
 
-        //- boundary faces forced to single layer treatment
-        labelHashSet forceSingleLayerFaces_;
+        //- provenance map: for each cell generated during refineBoundaryLayers,
+        //- the boundary-local bfI that produced it. -1 for non-BL cells.
+        labelList cellToBaseBndFace_;
+
+        //- CFMitch quality-derived geometric layer ceilings.
+        //
+        // Missing key means no quality constraint.
+        // 0 means explicitly terminate the BL at this boundary face.
+        // Positive values are the maximum locally permitted layer count.
+        //
+        // Constraints are monotonic: repeated observations may only lower
+        // the stored ceiling.
+        Map<label> qualityMaxLayersAtFace_;
+
+        //- boundary faces with forced max-layer caps (bfI -> maxLayers).
+        //- Applied in analyseLayers() after all global/patch layer-count
+        //- logic so it always wins. Multiple calls only lower caps.
+        Map<label> forcedMaxLayersAtFace_;
+
+        //- provenance of the winning forced cap at each boundary face.
+        //- The set contains every source plan that requested the SAME
+        //- minimum cap. A stricter later cap replaces earlier providers;
+        //- a weaker request contributes nothing.
+        Map<labelHashSet> forcedMaxLayerProviderPlansAtFace_;
+
+        //- subset of forcedMaxLayersAtFace_ that actually reduced
+        //- nLayersAtBndFace_ during analyseLayers(), plus the winning
+        //- provider plans for those effective interventions.
+        labelHashSet actuallyCappedFaces_;
+        Map<labelHashSet> actuallyCappedProviderPlansAtFace_;
+
+        //- boundary faces with forced BL thickness scales (bfI -> scale).
+        //- scale in [0,1]: 1.0 = full thickness, 0.5 = half thickness.
+        //- Applied to firstLayerThickness[seI] for all split edges at bfI.
+        //- Multiple calls keep the minimum (most aggressive) scale.
+        Map<scalar> forcedThicknessScaleAtFace_;
+        //- Final upstream BL-height scale at simple BL/neutral contacts.
+        //- Key is a stable mesh-point label.
+        Map<scalar> neutralLayerScaleAtMeshPoint_;
+
+        // ============================================================
+        // CFMITCH V8A NEUTRAL SEAM LAYER BACKOFF
+        //
+        // Stable GLOBAL mesh-point labels of physical wall/base
+        // points at BL/neutral contacts.
+        //
+        // These are intentionally NOT boundary-point indices because
+        // bpI addressing changes after macro BL topology creation.
+        // ============================================================
+
+        labelHashSet neutralSeamBackoffMeshPoints_;
+        label neutralSeamBackoffMaxLayers_;
+
+
+        //- gap conflict arbitration data for local split-edge layer capping.
+        //- gapActionPoints_: mesh point labels of loser-side gap zone points.
+        //- gapLoserPatchNames_: loser-side patch names.
+        //- Caps are applied only where BOTH conditions are met (local + side).
+        labelHashSet gapActionPoints_;
+        wordList     gapLoserPatchNames_;
+        label        gapRing1MaxLayers_;   // default 1
+        label        gapRing2MaxLayers_;   // default 2
+
+        //- BL/termination edge cap: reduce layer count at inlet/outlet junctions.
+        //- blTerminationEdgePoints_: mesh point labels on BL/no-BL edges.
+        //- No patch-name check needed -- locality is sufficient.
+        labelHashSet blTerminationEdgePoints_;
+        label        blTerminationRing1MaxLayers_;  // default 3 (disabled)
+        label        blTerminationRing2MaxLayers_;  // default 3 (disabled)
+        labelHashSet blblAcuteCornerPoints_;
+        bool acuteCornerCapLayers_;
+
+        //- BL/BL junction points from boundaryLayers - used for wedge topology
+        labelHashSet blblJunctionPoints_;
+        boolList rampSeedPoints_; //- finite ramp seeds excluded from junction caps
+
+        //- Virtual topology face ring from boundaryLayers
+        //- -1=untouched, 0/1/2=ring. BL/BL ramp skips handled faces.
+        labelList vtFaceRing_;
 
         //- a list of edges which shall be refined
         LongList<edge> splitEdges_;
@@ -171,7 +282,7 @@ class refineBoundaryLayers
         void generateNewFaces();
 
         //- generate new cells for a prism with one boundary face
-        void generateNewCellsPrism
+        bool generateNewCellsPrism
         (
             const label cellI,
             DynList<DynList<DynList<label, 8>, 10>, 64>& cellsFromCell
@@ -342,6 +453,13 @@ public:
         ~refineBoundaryLayers();
 
     // Public member functions
+        //- true if refinement completed without inconsistent split-edge
+        //- metadata. Caller should reject the refined mesh if false.
+        bool refinementValid() const
+        {
+            return refinementValid_;
+        }
+
 
         // Settings
         //- set no refinement flag
@@ -398,9 +516,34 @@ public:
         //- layer smoother in order to leave the inside points intact
         void activateSpecialMode();
 
+        //- CFMitch quality-driven local layer ceilings.
+        //
+        // Used to transfer birth-time quality constraints from one
+        // construction attempt to a fresh reconstruction.  A cap of zero
+        // is intentional local BL termination.  Imported constraints are
+        // also merged into forcedMaxLayersAtFace_ so analyseLayers() applies
+        // them before the CFMitch layer compatibility solve.
+        void setQualityMaxLayersAtFaces
+        (
+            const Map<label>& caps
+        );
+
+        inline const Map<label>& qualityMaxLayersAtFaces() const
+        {
+            return qualityMaxLayersAtFace_;
+        }
+
     // Worker
         //- performs refinement based on the given settings
         void refineLayers();
+
+        //- True only when refineLayers() reached successful cell generation.
+        //- Kept separate from refinementValid(): a no-op/early return may
+        //- have coherent metadata but is not a completed refinement result.
+        inline bool refinementCompleted() const
+        {
+            return done_;
+        }
 
     // Post information
         //- provide the list of points in the boundary layer
@@ -409,12 +552,105 @@ public:
         //- create a subset containing points in the boundary layer
         void pointsInBndLayer(const word subsetName="pointsInBndLayer");
 
+        //- provenance map accessor (newCellI -> original bfI, -1 if not a BL cell)
+        const labelList& cellToBaseBndFace() const
+        { return cellToBaseBndFace_; }
+
+        // CFMitch V5.1d: read-only Q1 diagnostics. These labels are valid
+        // only before subsequent mesh compaction/renumbering or rollback.
+        const LongList<edge>& splitEdgesForDiagnostics() const
+        { return splitEdges_; }
+
+        const VRWGraph& splitEdgeVerticesForDiagnostics() const
+        { return newVerticesForSplitEdge_; }
+
+        const labelList& faceLayersForDiagnostics() const
+        { return nLayersAtBndFace_; }
+
+        //- actual max-layer interventions from the completed analysis
+        const labelHashSet& actuallyCappedFaces() const
+        {
+            return actuallyCappedFaces_;
+        }
+
+        const Map<labelHashSet>& actuallyCappedProviderPlansAtFace() const
+        {
+            return actuallyCappedProviderPlansAtFace_;
+        }
+
     // Static member functions
         //- read the settings from dictionary
         static void readSettings(const dictionary&, refineBoundaryLayers&);
 
         //- force single layer on mixed-displacement boundary faces
         void forceSingleLayerAtFaces(const labelHashSet& faces);
+
+        //- force tapered maximum layer caps around seed boundary faces
+        void forceMaxLayersAtFaces
+        (
+            const labelHashSet& faces,
+            const label ring0MaxLayers,
+            const label ring1MaxLayers,
+            const label ring2MaxLayers,
+            const scalar ring0ThicknessScale = 1.0,
+            const scalar ring1ThicknessScale = 1.0,
+            const scalar ring2ThicknessScale = 1.0,
+            const label sourcePlanId = -1
+        );
+
+        //- set BL/BL junction points for wedge topology emission
+        void setBlblJunctionPoints(const labelHashSet& pts);
+        void setBlblAcuteCornerPoints(const labelHashSet& pts);
+        void setRampSeedPoints(const boolList& pts);
+        void setVtFaceRing(const labelList& ring);
+        void setAcuteCornerCapLayers(const bool cap) { acuteCornerCapLayers_ = cap; }
+        void setNeutralLayerScaleAtMeshPoint
+        (
+            const Map<scalar>& scale
+        )
+        {
+            neutralLayerScaleAtMeshPoint_ = scale;
+        }
+
+        // ============================================================
+        // CFMITCH V8A NEUTRAL SEAM LAYER BACKOFF
+        // ============================================================
+
+        void setNeutralSeamBackoff
+        (
+            const labelHashSet& pts,
+            const label maxLayers
+        )
+        {
+            neutralSeamBackoffMeshPoints_ = pts;
+            neutralSeamBackoffMaxLayers_ = maxLayers;
+        }
+
+
+        //- set gap conflict arbitration data for local split-edge layer capping
+        void setGapActionPoints(const labelHashSet& pts)
+        {
+            gapActionPoints_ = pts;
+        }
+        void setGapLoserPatchNames(const wordList& names)
+        {
+            gapLoserPatchNames_ = names;
+        }
+        void setGapRingMaxLayers(const label ring1Max, const label ring2Max)
+        {
+            gapRing1MaxLayers_ = ring1Max;
+            gapRing2MaxLayers_ = ring2Max;
+        }
+        //- set BL/termination edge points for inlet/outlet layer-count cap
+        void setBlTerminationEdgePoints(const labelHashSet& pts)
+        {
+            blTerminationEdgePoints_ = pts;
+        }
+        void setBlTerminationRingMaxLayers(const label ring1Max, const label ring2Max)
+        {
+            blTerminationRing1MaxLayers_ = ring1Max;
+            blTerminationRing2MaxLayers_ = ring2Max;
+        }
 };
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //

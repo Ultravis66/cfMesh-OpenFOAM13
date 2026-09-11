@@ -39,6 +39,7 @@ Description
 #include <map>
 #include <string>
 #include <set>
+#include "OFstream.H"
 
 # ifdef USE_OMP
 #include <omp.h>
@@ -50,6 +51,43 @@ Description
 
 namespace Foam
 {
+namespace
+{
+    inline bool boundaryPointsCanShareBLRamp
+    (
+        const VRWGraph& pPatches,
+        const boolList& isBLPatch,
+        const label bpI,
+        const label nbpI
+    )
+    {
+        // Same patch -- always safe
+        forAllRow(pPatches, bpI, pi)
+        {
+            const label patchI = pPatches(bpI, pi);
+            forAllRow(pPatches, nbpI, qi)
+                if( patchI == pPatches(nbpI, qi) )
+                    return true;
+        }
+
+        // Different patches: allow only if both touch BL wall patches
+        bool bpHasBL(false), nbpHasBL(false);
+        forAllRow(pPatches, bpI, pi)
+        {
+            const label pI = pPatches(bpI, pi);
+            if( pI >= 0 && pI < label(isBLPatch.size()) && isBLPatch[pI] )
+            { bpHasBL = true; break; }
+        }
+        forAllRow(pPatches, nbpI, qi)
+        {
+            const label pI = pPatches(nbpI, qi);
+            if( pI >= 0 && pI < label(isBLPatch.size()) && isBLPatch[pI] )
+            { nbpHasBL = true; break; }
+        }
+        return bpHasBL && nbpHasBL;
+    }
+}
+
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -102,6 +140,19 @@ void boundaryLayers::findPatchesToBeTreatedTogether()
     {
         const label bpI = it.key();
 
+        // Diagnostic: log exact triple-junction corners (nFeat==3)
+        // These are blade/hub/periodic junctions missed by > 3 condition.
+        // Evaluate before changing to >= 3 to avoid over-grouping BL patches.
+        if( mPart.numberOfFeatureEdgesAtPoint(bpI) == 3 )
+        {
+            Info << "BL triple-corner bpI=" << bpI
+                 << " nPatches=" << pPatches.sizeOfRow(bpI)
+                 << " patches=(";
+            forAllRow(pPatches, bpI, ppI)
+                Info << pPatches(bpI, ppI)
+                     << (ppI+1<pPatches.sizeOfRow(bpI) ? "," : "");
+            Info << ")" << endl;
+        }
         if( mPart.numberOfFeatureEdgesAtPoint(bpI) > 3 )
         {
             labelHashSet commonPatches;
@@ -272,8 +323,16 @@ void boundaryLayers::findPatchesToBeTreatedTogether()
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label beI =
-                globalToLocal[receivedData[counter++].pointLabel()];
+            const label geI = receivedData[counter++].pointLabel();
+            if( !globalToLocal.found(geI) )
+            {
+                // Skip -- unknown edge label on this processor.
+                // Consume face-size + face-point entries to keep counter in sync.
+                const label fSize = receivedData[counter++].pointLabel();
+                counter += fSize;
+                continue;
+            }
+            const label beI = globalToLocal[geI];
 
             DynList<label> f(receivedData[counter++].pointLabel());
             forAll(f, pI)
@@ -497,6 +556,9 @@ void boundaryLayers::findPatchesToBeTreatedTogether()
     mesh_.write();
     # endif
 
+    // Populate blNeutralEdgePoints_ so periodic seam taper is available
+    // during createNewVertices() -> markConcaveEdgePoints().
+    detectBLNoBlTransitionEdges();
     geometryAnalysed_ = true;
 }
 
@@ -559,6 +621,38 @@ boundaryLayers::boundaryLayers
     meshPartitionerPtr_(NULL),
     patchWiseLayers_(true),
     terminateLayersAtConcaveEdges_(false),
+    blblFeatureAngleDeg_(40.0),
+    blSharpEdgeAngleDeg_(75.0),
+    blblCornerAcuteThreshold_(0.3),
+    layerScaleRing1_(0.25),
+    layerScaleRing2_(0.50),
+    layerScaleRing3_(0.75),
+    layerScaleRing4_(0.60),
+    layerScaleRing5_(0.80),
+    layerScaleRing6_(1.00),
+    acuteCornerRing0_(0.0),
+    acuteCornerRing1_(0.0),
+    acuteCornerRing2_(0.05),
+    acuteCornerRing3_(0.15),
+    acuteCornerRing4_(0.35),
+    acuteCornerRing5_(0.60),
+    acuteCornerRing6_(1.00),
+    virtualTopologyExclusion_(false),
+    virtualTopoRing0_(0.0),
+    virtualTopoRing1_(0.0),
+    virtualTopoRing2_(0.05),
+    gapFaceRingExclusion_(true),
+    tripleJunctionFaceRingExclusion_(false),
+    gapFaceRing0Scale_(0.02),
+    gapFaceRing1Scale_(0.05),
+    gapFaceRing2Scale_(0.20),
+    gapFaceRing3Scale_(0.50),
+    tripleJunctionProtectedRing0Scale_(1.0),
+    gapLoserPatches_(),
+    gapLoserPatchNames_(),
+    gapLoserRing1Suppress_(true),
+    gapLoserRing1MaxLayers_(1),
+    gapLoserRing2MaxLayers_(2),
     is2DMesh_(false),
     patchNames_(),
     patchTypes_(),
@@ -567,6 +661,26 @@ boundaryLayers::boundaryLayers
     newLabelForVertex_(),
     otherVrts_(),
     patchKey_(),
+    useHardBLBLCapCells_(false),
+    useHardBLBLCapVertexInsertion_(false),
+    useHardBLBLReducedCells_(false),
+    hardBLBLCapScale_(0.10),
+    flowTerminationTaperFloor_(0.25),
+    periodicNeutralTaperFloor_(0.0),
+    cfmitchHeightDiagnostics_(false),
+    cfmitchHeightSmoothing_(false),
+    cfmitchHeightMaxEdgeRatio_(1.5),
+    cfmitchHeightMaxMoveFraction_(0.05),
+    cfmitchHeightSmoothingIterations_(1),
+    cfmitchNeutralProjectionFloor_(0.0),
+    useContactLinePolicy_(false),
+    useContactLineHeightSmoother_(false),
+    writeContactLineHeightSmootherAtlas_(false),
+    contactLineSmootherMaxGrowth_(1.5),
+    contactLineSmootherMinCollapse_(0.35),
+    contactLineSmootherMaxMoveFraction_(0.50),
+    contactLineSmootherIterations_(2),
+    contactLineSmootherMinHeight_(1e-8),
     nPoints_(mesh.points().size()),
     geometryAnalysed_(false)
 {
@@ -586,6 +700,10 @@ boundaryLayers::boundaryLayers
 
     // Per-patch nLayers: 0 means no BL (termination patch)
     nLayersForPatch_.setSize(boundaries.size(), 0);
+    // Patch role: 0=BL, 1=TERMINATION, 2=NEUTRAL
+    // Default: all nLayers==0 patches start as TERMINATION
+    // User can override with terminationPatches / neutralPatches in meshDict
+    patchRole_.setSize(boundaries.size(), 2); // default NEUTRAL
     if( meshDict.isDict("boundaryLayers") )
     {
         const dictionary& bndLayers = meshDict.subDict("boundaryLayers");
@@ -593,6 +711,166 @@ boundaryLayers::boundaryLayers
         if( bndLayers.found("nLayers") )
             globalNLayers = readLabel(bndLayers.lookup("nLayers"));
         nLayersForPatch_ = globalNLayers;
+
+        // Ramp parameters - optional, defaults match hardcoded values
+        if( bndLayers.found("blblFeatureAngleDeg") )
+            blblFeatureAngleDeg_ =
+                readScalar(bndLayers.lookup("blblFeatureAngleDeg"));
+        if( bndLayers.found("useContactLinePolicy") )
+            useContactLinePolicy_ =
+                Switch(bndLayers.lookup("useContactLinePolicy"));
+        if( bndLayers.found("useContactLineHeightSmoother") )
+            useContactLineHeightSmoother_ =
+                Switch(bndLayers.lookup("useContactLineHeightSmoother"));
+        if( bndLayers.found("writeContactLineHeightSmootherAtlas") )
+            writeContactLineHeightSmootherAtlas_ =
+                Switch(bndLayers.lookup("writeContactLineHeightSmootherAtlas"));
+        if( bndLayers.found("contactLineSmootherMaxGrowth") )
+            contactLineSmootherMaxGrowth_ =
+                readScalar(bndLayers.lookup("contactLineSmootherMaxGrowth"));
+        if( bndLayers.found("contactLineSmootherMinCollapse") )
+            contactLineSmootherMinCollapse_ =
+                readScalar(bndLayers.lookup("contactLineSmootherMinCollapse"));
+        if( bndLayers.found("contactLineSmootherMaxMoveFraction") )
+            contactLineSmootherMaxMoveFraction_ =
+                readScalar(bndLayers.lookup("contactLineSmootherMaxMoveFraction"));
+        if( bndLayers.found("contactLineSmootherIterations") )
+            contactLineSmootherIterations_ =
+                readLabel(bndLayers.lookup("contactLineSmootherIterations"));
+        if( bndLayers.found("contactLineSmootherMinHeight") )
+            contactLineSmootherMinHeight_ =
+                readScalar(bndLayers.lookup("contactLineSmootherMinHeight"));
+
+        if( bndLayers.found("useHardBLBLCapCells") )
+            useHardBLBLCapCells_ =
+                Switch(bndLayers.lookup("useHardBLBLCapCells"));
+        if( bndLayers.found("useHardBLBLCapVertexInsertion") )
+            useHardBLBLCapVertexInsertion_ =
+                Switch(bndLayers.lookup("useHardBLBLCapVertexInsertion"));
+        if( bndLayers.found("useHardBLBLReducedCells") )
+            useHardBLBLReducedCells_ =
+                Switch(bndLayers.lookup("useHardBLBLReducedCells"));
+        //- Safety interlock: vertex insertion requires reduced cells
+        //- Without reduced topology, degenerate prisms cause thousands of negVol.
+        if( useHardBLBLCapVertexInsertion_ && !useHardBLBLReducedCells_ )
+        {
+            WarningInFunction
+                << "useHardBLBLCapVertexInsertion=true requires "
+                << "useHardBLBLReducedCells=true. "
+                << "Disabling cap vertex insertion to avoid "
+                << "collapsed-prism topology." << endl;
+            useHardBLBLCapVertexInsertion_ = false;
+        }
+        Info << "HardBLBL cap cells:"
+             << " candidates=" << Switch(useHardBLBLCapCells_)
+             << " vertexInsertion=" << Switch(useHardBLBLCapVertexInsertion_)
+             << " reducedCells=" << Switch(useHardBLBLReducedCells_)
+             << " scale=" << hardBLBLCapScale_
+             << endl;
+        if( bndLayers.found("hardBLBLCapScale") )
+            hardBLBLCapScale_ =
+                readScalar(bndLayers.lookup("hardBLBLCapScale"));
+        hardBLBLCapScale_ =
+            Foam::max(scalar(0), Foam::min(scalar(0.5), hardBLBLCapScale_));
+        if( useHardBLBLCapCells_ )
+            Info << "HardBLBL cap scale: " << hardBLBLCapScale_ << endl;
+        if( bndLayers.found("blSharpEdgeAngleDeg") )
+            blSharpEdgeAngleDeg_ =
+                readScalar(bndLayers.lookup("blSharpEdgeAngleDeg"));
+        if( bndLayers.found("blblCornerAcuteThreshold") )
+            blblCornerAcuteThreshold_ =
+                readScalar(bndLayers.lookup("blblCornerAcuteThreshold"));
+        if( bndLayers.found("layerScaleRing1") )
+            layerScaleRing1_ =
+                readScalar(bndLayers.lookup("layerScaleRing1"));
+        if( bndLayers.found("flowTerminationTaperFloor") )
+            flowTerminationTaperFloor_ =
+                readScalar(bndLayers.lookup("flowTerminationTaperFloor"));
+        // Clamp after layerScaleRing1_ is known
+        flowTerminationTaperFloor_ =
+            Foam::max(scalar(0), Foam::min(layerScaleRing1_, flowTerminationTaperFloor_));
+        if( bndLayers.found("periodicNeutralTaperFloor") )
+            periodicNeutralTaperFloor_ =
+                readScalar(bndLayers.lookup("periodicNeutralTaperFloor"));
+        periodicNeutralTaperFloor_ =
+            Foam::max(scalar(0), Foam::min(layerScaleRing1_, periodicNeutralTaperFloor_));
+        if( bndLayers.found("layerScaleRing2") )
+            layerScaleRing2_ =
+                readScalar(bndLayers.lookup("layerScaleRing2"));
+        if( bndLayers.found("layerScaleRing3") )
+            layerScaleRing3_ =
+                readScalar(bndLayers.lookup("layerScaleRing3"));
+        if( bndLayers.found("layerScaleRing4") )
+            layerScaleRing4_ =
+                readScalar(bndLayers.lookup("layerScaleRing4"));
+        if( bndLayers.found("layerScaleRing5") )
+            layerScaleRing5_ =
+                readScalar(bndLayers.lookup("layerScaleRing5"));
+        if( bndLayers.found("layerScaleRing6") )
+            layerScaleRing6_ =
+                readScalar(bndLayers.lookup("layerScaleRing6"));
+        if( bndLayers.found("acuteCornerRing0") )
+            acuteCornerRing0_ = readScalar(bndLayers.lookup("acuteCornerRing0"));
+        if( bndLayers.found("acuteCornerRing1") )
+            acuteCornerRing1_ = readScalar(bndLayers.lookup("acuteCornerRing1"));
+        if( bndLayers.found("acuteCornerRing2") )
+            acuteCornerRing2_ = readScalar(bndLayers.lookup("acuteCornerRing2"));
+        if( bndLayers.found("acuteCornerRing3") )
+            acuteCornerRing3_ = readScalar(bndLayers.lookup("acuteCornerRing3"));
+        if( bndLayers.found("acuteCornerRing4") )
+            acuteCornerRing4_ = readScalar(bndLayers.lookup("acuteCornerRing4"));
+        if( bndLayers.found("acuteCornerRing5") )
+            acuteCornerRing5_ = readScalar(bndLayers.lookup("acuteCornerRing5"));
+        if( bndLayers.found("acuteCornerRing6") )
+            acuteCornerRing6_ = readScalar(bndLayers.lookup("acuteCornerRing6"));
+
+        if( bndLayers.found("virtualTopologyExclusion") )
+            virtualTopologyExclusion_ =
+                Switch(bndLayers.lookup("virtualTopologyExclusion"));
+        if( bndLayers.found("virtualTopoRing0") )
+            virtualTopoRing0_ = readScalar(bndLayers.lookup("virtualTopoRing0"));
+        if( bndLayers.found("virtualTopoRing1") )
+            virtualTopoRing1_ = readScalar(bndLayers.lookup("virtualTopoRing1"));
+        if( bndLayers.found("virtualTopoRing2") )
+            virtualTopoRing2_ = readScalar(bndLayers.lookup("virtualTopoRing2"));
+        if( bndLayers.found("gapFaceRingExclusion") )
+            gapFaceRingExclusion_ = Switch(bndLayers.lookup("gapFaceRingExclusion"));
+        if( bndLayers.found("tripleJunctionFaceRingExclusion") )
+            tripleJunctionFaceRingExclusion_ =
+                Switch(bndLayers.lookup("tripleJunctionFaceRingExclusion"));
+        if( bndLayers.found("tripleJunctionSuppressPatches") )
+        {
+            const wordList suppressNames
+            (
+                bndLayers.lookup("tripleJunctionSuppressPatches")
+            );
+            const PtrList<boundaryPatch>& boundaries = mesh_.boundaries();
+            forAll(boundaries, pI)
+                forAll(suppressNames, sI)
+                    if( boundaries[pI].patchName() == suppressNames[sI] )
+                        tripleJunctionSuppressPatches_.insert(pI);
+
+            Info << "Triple-junction suppress patches: found "
+                 << tripleJunctionSuppressPatches_.size()
+                 << " patch indices from " << suppressNames << endl;
+        }
+        if( bndLayers.found("gapFaceRing0Scale") )
+            gapFaceRing0Scale_ = readScalar(bndLayers.lookup("gapFaceRing0Scale"));
+        if( bndLayers.found("gapFaceRing1Scale") )
+            gapFaceRing1Scale_ = readScalar(bndLayers.lookup("gapFaceRing1Scale"));
+        if( bndLayers.found("gapFaceRing2Scale") )
+            gapFaceRing2Scale_ = readScalar(bndLayers.lookup("gapFaceRing2Scale"));
+        if( bndLayers.found("gapFaceRing3Scale") )
+            gapFaceRing3Scale_ = readScalar(bndLayers.lookup("gapFaceRing3Scale"));
+        if( bndLayers.found("gapLoserRing1Suppress") )
+            gapLoserRing1Suppress_ = Switch(bndLayers.lookup("gapLoserRing1Suppress"));
+        if( bndLayers.found("gapLoserRing1MaxLayers") )
+            gapLoserRing1MaxLayers_ = readLabel(bndLayers.lookup("gapLoserRing1MaxLayers"));
+        if( bndLayers.found("gapLoserRing2MaxLayers") )
+            gapLoserRing2MaxLayers_ = readLabel(bndLayers.lookup("gapLoserRing2MaxLayers"));
+        if( bndLayers.found("tripleJunctionProtectedRing0Scale") )
+            tripleJunctionProtectedRing0Scale_ =
+                readScalar(bndLayers.lookup("tripleJunctionProtectedRing0Scale"));
 
         if( bndLayers.isDict("patchBoundaryLayers") )
         {
@@ -610,6 +888,44 @@ boundaryLayers::boundaryLayers
                 }
             }
         }
+
+        // Assign patch roles after all nLayers are set
+        // BL patches: nLayers > 0
+        // Termination patches: explicitly listed in terminationPatches
+        // Neutral patches: everything else (periodic, symmetry, etc)
+        wordList terminationPatchNames;
+        if( bndLayers.found("terminationPatches") )
+            terminationPatchNames = wordList(bndLayers.lookup("terminationPatches"));
+
+        forAll(boundaries, patchI)
+        {
+            if( nLayersForPatch_[patchI] > 0 )
+            {
+                patchRole_[patchI] = 0; // BL_PATCH
+            }
+            else
+            {
+                // Check if explicitly listed as termination
+                bool isTermination = false;
+                forAll(terminationPatchNames, tI)
+                    if( terminationPatchNames[tI] == boundaries[patchI].patchName() )
+                    { isTermination = true; break; }
+                patchRole_[patchI] = isTermination ? 1 : 2; // TERMINATION or NEUTRAL
+            }
+        }
+
+        // Report patch role assignment
+        label nBLR=0, nTermR=0, nNeutR=0;
+        forAll(boundaries, patchI)
+        {
+            if( patchRole_[patchI] == 0 ) ++nBLR;
+            else if( patchRole_[patchI] == 1 ) ++nTermR;
+            else ++nNeutR;
+        }
+        Info << "Patch role assignment: "
+             << nBLR << " BL, "
+             << nTermR << " termination, "
+             << nNeutR << " neutral" << endl;
     }
 }
 
@@ -647,6 +963,123 @@ void boundaryLayers::terminateLayersAtConcaveEdges()
     terminateLayersAtConcaveEdges_ = true;
 }
 
+void boundaryLayers::detectBLNoBlTransitionEdges() const
+{
+    const meshSurfaceEngine& mse = surfaceEngine();
+    const VRWGraph& edgeFaces = mse.edgeFaces();
+    const labelList& boundaryFacePatches = mse.boundaryFacePatches();
+    const edgeList& edges = mse.edges();
+    const labelList& bPoints = mse.boundaryPoints();
+
+    // Classify patches from patchRole_ -- single source of truth
+    boolList isBLPatch(patchNames_.size(), false);
+    forAll(patchNames_, patchI)
+        if( patchI < label(patchRole_.size()) && patchRole_[patchI] == 0 )
+            isBLPatch[patchI] = true;
+
+    // Build global-to-boundary-point reverse map once, O(N)
+    Map<label> globalToBP;
+    forAll(bPoints, bpI)
+        globalToBP.insert(bPoints[bpI], bpI);
+
+    blNoBlEdges_.clear();
+    blNoBlEdgePoints_.clear();
+    blNoBlPointPatch_.clear();
+    blNeutralEdgePoints_.clear();
+    blNeutralPointPatch_.clear();
+
+    forAll(edges, eI)
+    {
+        bool hasBL   = false;
+        bool hasNoBL = false;
+        label blPatchI = -1;
+
+        forAllRow(edgeFaces, eI, efI)
+        {
+            const label faceI  = edgeFaces(eI, efI);
+            const label patchI = boundaryFacePatches[faceI];
+            if( patchI < 0 || patchI >= label(isBLPatch.size()) )
+                continue;
+            if( patchRole_.size() > 0 && patchI < label(patchRole_.size()) )
+            {
+                if( patchRole_[patchI] == 0 )
+                {
+                    hasBL = true;
+                    blPatchI = patchI;
+                }
+                else if( patchRole_[patchI] == 1 )
+                {
+                    hasNoBL = true;
+                }
+                // patchRole_==2 (neutral) ignored here
+            }
+        }
+
+        if( !hasBL || !hasNoBL ) continue;
+
+        blNoBlEdges_.insert(eI);
+
+        const edge& e = edges[eI];
+        for( label ei = 0; ei < 2; ++ei )
+        {
+            const label gp = (ei == 0) ? e[0] : e[1];
+            Map<label>::const_iterator it = globalToBP.find(gp);
+            if( it == globalToBP.end() ) continue;
+            const label bpI = it();
+            blNoBlEdgePoints_.insert(bpI);
+            // Store BL-side patch for patch-constrained projection
+            // Only insert if not already stored (first BL patch wins)
+            if( !blNoBlPointPatch_.found(bpI) )
+                blNoBlPointPatch_.insert(bpI, blPatchI);
+        }
+    }
+
+    // Detect BL/neutral edge points: two-patch points where
+    // one patch is BL and the other is neutral (periodic/symmetry).
+    // These are NOT termination points but need special handling
+    // to prevent BL extrusion across the neutral boundary.
+    forAll(edges, eI)
+    {
+        if( edgeFaces.sizeOfRow(eI) != 2 ) continue;
+        const label fA = edgeFaces(eI, 0);
+        const label fB = edgeFaces(eI, 1);
+        if( fA < 0 || fA >= boundaryFacePatches.size() ) continue;
+        if( fB < 0 || fB >= boundaryFacePatches.size() ) continue;
+        const label pA = boundaryFacePatches[fA];
+        const label pB = boundaryFacePatches[fB];
+        if( pA < 0 || pA >= label(isBLPatch.size()) ) continue;
+        if( pB < 0 || pB >= label(isBLPatch.size()) ) continue;
+        if( pA == pB ) continue;
+        const bool blA = isBLPatch[pA];
+        const bool blB = isBLPatch[pB];
+        // One BL, one no-BL
+        if( !((blA && !blB) || (!blA && blB)) ) continue;
+        // Check role: neutral = patchRole 2
+        const label noBlPatch = blA ? pB : pA;
+        if( patchRole_.size() > 0
+         && noBlPatch < label(patchRole_.size())
+         && patchRole_[noBlPatch] != 2 ) continue; // not neutral
+        const edge& e = edges[eI];
+        for( label ei = 0; ei < 2; ++ei )
+        {
+            const label gp = (ei==0) ? e[0] : e[1];
+            Map<label>::const_iterator it = globalToBP.find(gp);
+            if( it == globalToBP.end() ) continue;
+            const label bpI = it();
+            blNeutralEdgePoints_.insert(bpI);
+            if( !blNeutralPointPatch_.found(bpI) )
+                blNeutralPointPatch_.insert(bpI, blA ? pA : pB);
+        }
+    }
+
+    Info << "BL/no-BL transition edge pre-detection: "
+         << blNoBlEdges_.size() << " transition edges, "
+         << blNoBlEdgePoints_.size() << " interface points" << endl;
+    Info << "BL/neutral edge points detected: "
+         << blNeutralEdgePoints_.size()
+         << " (blade/periodic-style junctions)" << endl;
+}
+
 void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
 {
     const meshSurfaceEngine& mse = surfaceEngine();
@@ -660,16 +1093,21 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
     const meshSurfacePartitioner& mPart = surfacePartitioner();
     const VRWGraph& pPatches = mPart.pointPatches();
 
-    // Classify patches: wall patches get BL, others are termination
-    // Classify patches: nLayers==0 => termination (no BL)
-    boolList isBLPatch(patchNames_.size(), true);
+    // Classify patches using patchRole_ -- the single source of truth.
+    // patchRole_: 0=BL, 1=TERMINATION, 2=NEUTRAL
+    // Previously derived from nLayersForPatch_==0 which treated neutral
+    // patches (periodic/symmetry) the same as termination (inlet/outlet).
+    // That caused over-suppression at blade/periodic junctions.
+    boolList isBLPatch(patchNames_.size(), false);
     boolList isTerminationPatch(patchNames_.size(), false);
     forAll(patchNames_, patchI)
     {
-        if( nLayersForPatch_[patchI] == 0 )
+        if( patchI < patchRole_.size() )
         {
-            isBLPatch[patchI] = false;
-            isTerminationPatch[patchI] = true;
+            isBLPatch[patchI]          = (patchRole_[patchI] == 0);
+            isTerminationPatch[patchI] = (patchRole_[patchI] == 1);
+            // patchRole_==2 (neutral) is neither BL nor termination
+            // -- no suppression triggered at periodic/symmetry junctions
         }
     }
 
@@ -693,8 +1131,114 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
 
     // Initialize scale fields
     layerScale_.setSize(bPoints.size(), 1.0);
+    blSuppressReason_.setSize(bPoints.size(), 0);
+    blRampRing_.setSize(bPoints.size(), 0);
+    blRampSeedReason_.setSize(bPoints.size(), 0);
     zeroDistPoints_.setSize(bPoints.size(), false);
+    rampSeedPoints_.setSize(bPoints.size(), false);
+    rampSeedPoints_ = false;
     boolList zeroPts(bPoints.size(), false);
+
+    // Periodic/neutral seam taper: applied after scale fields are initialized.
+    label nPeriodicNeutralTaper = 0;
+    if( periodicNeutralTaperFloor_ > scalar(0.01) )
+    {
+        forAllConstIter(labelHashSet, blNeutralEdgePoints_, iter)
+        {
+            const label bpI = iter.key();
+            if( bpI < 0 || bpI >= label(layerScale_.size()) ) continue;
+            layerScale_[bpI] = Foam::min(layerScale_[bpI], periodicNeutralTaperFloor_);
+            if( blSuppressReason_[bpI] == 0 ) blSuppressReason_[bpI] = 8;
+            ++nPeriodicNeutralTaper;
+        }
+    }
+    Info << "Periodic neutral taper: floor=" << periodicNeutralTaperFloor_
+         << " points=" << nPeriodicNeutralTaper << endl;
+
+    // Inject externally detected gap points (mesh point labels) into zeroPts.
+    if( gapPoints_.size() > 0 )
+    {
+        labelList meshToBnd(mesh_.points().size(), -1);
+        forAll(bPoints, bpI)
+            meshToBnd[bPoints[bpI]] = bpI;
+        label nGapSuppressed = 0;
+        forAllConstIter(labelHashSet, gapPoints_, it)
+        {
+            const label meshPtI = it.key();
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < label(bPoints.size()) )
+            {
+                zeroDistPoints_[bpI] = true;
+                zeroPts[bpI] = true;
+                layerScale_[bpI] = 0.0;
+                blSuppressReason_[bpI] = 1;
+                ++nGapSuppressed;
+            }
+        }
+        Info << "Gap detection: suppressed "
+             << nGapSuppressed
+             << " BL points in thin clearance regions" << endl;
+
+        // Gap taper rings: BFS outward from gap points to create smooth
+        // BL restart instead of hard zero cliff
+        const VRWGraph& ptPts = pointPoints;
+        const label nBP = bPoints.size();
+
+        // Ring 1: immediate neighbours -- strong suppression
+        boolList gapRing0(nBP, false);
+        forAllConstIter(labelHashSet, gapPoints_, it)
+        {
+            const label meshPtI = it.key();
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) gapRing0[bpI] = true;
+        }
+
+        boolList gapRing1(nBP, false);
+        forAll(gapRing0, bpI)
+        {
+            if( !gapRing0[bpI] ) continue;
+            forAllRow(ptPts, bpI, ppI)
+            {
+                const label nbpI = ptPts(bpI, ppI);
+                if( nbpI < 0 || nbpI >= nBP ) continue;
+                if( gapRing0[nbpI] ) continue;
+                gapRing1[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], 0.05);
+            }
+        }
+
+        // Ring 2: taper onset
+        boolList gapRing2(nBP, false);
+        forAll(gapRing1, bpI)
+        {
+            if( !gapRing1[bpI] ) continue;
+            forAllRow(ptPts, bpI, ppI)
+            {
+                const label nbpI = ptPts(bpI, ppI);
+                if( nbpI < 0 || nbpI >= nBP ) continue;
+                if( gapRing0[nbpI] || gapRing1[nbpI] ) continue;
+                gapRing2[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], 0.20);
+            }
+        }
+
+        // Ring 3: gentle restart (scale via meshDict gapFaceRing3Scale)
+        boolList gapRing3(nBP, false);
+        forAll(gapRing2, bpI)
+        {
+            if( !gapRing2[bpI] ) continue;
+            forAllRow(ptPts, bpI, ppI)
+            {
+                const label nbpI = ptPts(bpI, ppI);
+                if( nbpI < 0 || nbpI >= nBP ) continue;
+                if( gapRing0[nbpI] || gapRing1[nbpI] || gapRing2[nbpI] ) continue;
+                gapRing3[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], gapFaceRing3Scale_);
+            }
+        }
+    }
 
     // Mark exact transition edge points
     label nTransitionEdges = 0;
@@ -723,12 +1267,16 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
             {
                 zeroDistPoints_[bp0] = true;
                 layerScale_[bp0] = 0.02;
+                if( bp0 >= 0 && bp0 < blSuppressReason_.size() )
+                    blSuppressReason_[bp0] = 2;
                 zeroPts[bp0] = true;
             }
             if( bp1 >= 0 )
             {
                 zeroDistPoints_[bp1] = true;
                 layerScale_[bp1] = 0.02;
+                if( bp1 >= 0 && bp1 < blSuppressReason_.size() )
+                    blSuppressReason_[bp1] = 2;
                 zeroPts[bp1] = true;
             }
             ++nTransitionEdges;
@@ -744,7 +1292,7 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
     {
         if( !boundaryPointIsBL[bpI] ) continue;
         if( zeroPts[bpI] ) continue;
-        label nPatches = 0, nBLPatches = 0, nTermPatches = 0;
+        label nPatches = 0, nBLPatches = 0, nTermPatches = 0, nNeutPatches = 0;
         DynList<label> seenPatches;
         forAllRow(pPatches, bpI, pI)
         {
@@ -756,33 +1304,237 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
             if( patchI < label(nLayersForPatch_.size())
              && nLayersForPatch_[patchI] > 0 )
                 ++nBLPatches;
+            else if( patchRole_.size() > patchI && patchRole_[patchI] == 2 )
+                ++nNeutPatches;
             else
                 ++nTermPatches;
         }
         if( nPatches == 2 ) ++nPts2;
         else if( nPatches == 3 ) ++nPts3;
         else if( nPatches > 3 ) ++nPts4plus;
+        // BL + termination corners
         if( nPatches >= 3 && nBLPatches >= 2 && nTermPatches >= 1 )
         {
             zeroDistPoints_[bpI] = true;
             layerScale_[bpI] = 0.02;
+            blSuppressReason_[bpI] = 3;
             zeroPts[bpI] = true;
             ++nTriple;
+        }
+        // BL+BL+neutral corners (blade/shroud/periodic, blade/hub/periodic)
+        // Measure patch-normal spread to classify acute vs mild corners
+        else if( nPatches >= 3 && nBLPatches >= 2 && nNeutPatches >= 1 )
+        {
+            // Compute average normal per BL patch at this corner
+            const VRWGraph& ptFaces = mse.pointFaces();
+            const faceList::subList& bFaces = mse.boundaryFaces();
+            const labelList& bFacePatches = mse.boundaryFacePatches();
+
+            Map<vector> blPatchNormals;
+            forAllRow(ptFaces, bpI, pfI)
+            {
+                const label faceI = ptFaces(bpI, pfI);
+                const label patchI = bFacePatches[faceI];
+                if( patchI < 0 || patchI >= label(patchRole_.size()) ) continue;
+                if( patchRole_[patchI] != 0 ) continue; // BL patches only
+                const face& f = bFaces[faceI];
+                if( f.size() < 3 ) continue;
+                vector fn = vector::zero;
+                const point& fp0 = points[f[0]];
+                for(label fi=1; fi<f.size()-1; ++fi)
+                    fn += (points[f[fi]]-fp0)^(points[f[fi+1]]-fp0);
+                if( blPatchNormals.found(patchI) )
+                    blPatchNormals[patchI] += fn;
+                else
+                    blPatchNormals.insert(patchI, fn);
+            }
+
+            // Find minimum dot product between any two BL patch normals
+            scalar minDot = GREAT;
+            DynList<vector> blNorms;
+            forAllConstIter(Map<vector>, blPatchNormals, it)
+            {
+                const scalar magN = mag(it());
+                if( magN > VSMALL )
+                    blNorms.append(it() / magN);
+            }
+            for(label i=0; i<blNorms.size(); ++i)
+                for(label j=i+1; j<blNorms.size(); ++j)
+                    minDot = Foam::min(minDot, blNorms[i] & blNorms[j]);
+
+            // Acute corner: BL patch normals diverge strongly
+            // Threshold read from meshDict via blblCornerAcuteThreshold_
+            // Default 0.3 (~73 degrees). Lower = more conservative.
+            const bool isAcute = (minDot < blblCornerAcuteThreshold_ && minDot < GREAT);
+
+            layerScale_[bpI] = isAcute ? scalar(0.0) : scalar(0.15);
+            zeroDistPoints_[bpI] = true;  // topology contract: always protected
+            zeroPts[bpI] = true;           // seeds ring propagation
+            if( isAcute )
+            {
+                blblAcuteCornerPoints_.insert(bpI);
+                blSuppressReason_[bpI] = 3; // tripleJunction/acute
+            }
+            else
+            {
+                // Non-acute: member-field ramp seed -- excluded from blblJunctionPoints_
+                rampSeedPoints_[bpI] = true;
+                blSuppressReason_[bpI] = 4; // finite corner taper
+            }
+            blblCornerPoints_.insert(bpI);
+            ++nTriple;
+
+            # ifdef DEBUGLayer
+            Info << "BL+BL+neutral corner bpI=" << bpI
+                 << " minDot=" << minDot
+                 << " acute=" << isAcute
+                 << " layerScale=" << layerScale_[bpI] << endl;
+            # endif
         }
     }
     Info << "BL triple-junction stats: "
          << "nPts2=" << nPts2
          << " nPts3=" << nPts3
          << " nPts4plus=" << nPts4plus
-         << " suppressed=" << nTriple << endl;
+         << " suppressed=" << nTriple
+         << " blblCornerPts=" << blblCornerPoints_.size()
+         << " acuteCornerPts=" << blblAcuteCornerPoints_.size() << endl;
+
+    // Topology-aware scale assignment:
+    // Upgrade transition point suppression based on point topology class.
+    // Corner points (3+ patches) at BL/no-BL transitions are geometrically
+    // overconstrained -- full suppress regardless of angle.
+    // Two-patch edge points get full suppress only if patch angle is sharp.
+    {
+        const scalar cosSharp =
+            Foam::cos(blSharpEdgeAngleDeg_ * M_PI / 180.0);
+        Info << "BL sharp-edge suppression: angle=" << blSharpEdgeAngleDeg_
+             << " deg (cos=" << cosSharp << ")" << endl;
+        label nCornerSuppressed = 0;
+        label nEdgeSuppressed = 0;
+        // Diagnostic histogram of patch normal dot products
+        label nDotNeg = 0, nDot0to05 = 0, nDot05to07 = 0, nDot07plus = 0;
+        forAll(bPoints, bpI)
+        {
+            if( !zeroPts[bpI] ) continue;
+            if( layerScale_[bpI] <= 0.0 ) continue;
+            // Count unique patches at this point
+            DynList<label> ptPatchList;
+            label nBLPt = 0, nTermPt = 0, nNeutPt = 0;
+            forAllRow(pPatches, bpI, pI)
+            {
+                const label patchI = pPatches(bpI, pI);
+                if( patchI < 0 || patchI >= label(patchNames_.size()) ) continue;
+                if( ptPatchList.contains(patchI) ) continue;
+                ptPatchList.append(patchI);
+                const label role = patchRole_[patchI];
+                if( role == 0 ) ++nBLPt;
+                else if( role == 1 ) ++nTermPt;
+                else ++nNeutPt;
+            }
+            const label nPt = ptPatchList.size();
+            // Corner: 3+ patches with BL + explicit termination -- full suppress
+            // Neutral patches (periodic etc) do not trigger suppression
+            if( nPt >= 3 && nBLPt >= 1 && nTermPt >= 1 )
+            {
+                layerScale_[bpI] = 0.0;
+                blSuppressReason_[bpI] = 4;
+                ++nCornerSuppressed;
+
+                if( nCornerSuppressed <= 200 )
+                {
+                    const point& p = points[bPoints[bpI]];
+                    Info << "TERMDIAG corner bpI=" << bpI
+                         << " nPt=" << nPt
+                         << " nBL=" << nBLPt
+                         << " nTerm=" << nTermPt
+                         << " x=" << p.x()
+                         << " y=" << p.y()
+                         << " z=" << p.z()
+                         << endl;
+                }
+
+                continue;
+            }
+
+            // Two-patch edge: suppress only if BL meets explicit termination
+            // patch at sharp angle. Neutral patches never trigger suppression.
+            if( nPt == 2 && nBLPt >= 1 && nTermPt >= 1
+             && blNoBlEdgePoints_.found(bpI) )
+            {
+                // Compute normals for the two patches
+                const VRWGraph& ptFaces2 = mse.pointFaces();
+                DynList<vector> patchNormals;
+                forAll(ptPatchList, pi)
+                {
+                    vector n = vector::zero;
+                    label nf = 0;
+                    forAllRow(ptFaces2, bpI, pfI)
+                    {
+                        const label faceI = ptFaces2(bpI, pfI);
+                        if( boundaryFacePatches[faceI] != ptPatchList[pi] ) continue;
+                        const face& f = bFaces[faceI];
+                        vector fn = vector::zero;
+                        const point& fp0 = points[f[0]];
+                        for(label fi=1; fi<f.size()-1; ++fi)
+                            fn += (points[f[fi]]-fp0)^(points[f[fi+1]]-fp0);
+                        if( mag(fn) > VSMALL ) { n += fn/mag(fn); ++nf; }
+                    }
+                    if( nf > 0 ) n /= scalar(nf);
+                    if( mag(n) > VSMALL ) n /= mag(n);
+                    patchNormals.append(n);
+                }
+                if( patchNormals.size() == 2 )
+                {
+                    const scalar dotProd = patchNormals[0] & patchNormals[1];
+                    if( dotProd < 0 ) ++nDotNeg;
+                    else if( dotProd < 0.5 ) ++nDot0to05;
+                    else if( dotProd < 0.707 ) ++nDot05to07;
+                    else ++nDot07plus;
+                    if( dotProd < cosSharp )
+                    {
+                        layerScale_[bpI] = 0.0;
+                        blSuppressReason_[bpI] = 5;
+                        ++nEdgeSuppressed;
+                    }
+                }
+            }
+        }
+        Info << "Topology-aware BL suppression: "
+             << nCornerSuppressed << " corner points fully suppressed, "
+             << nEdgeSuppressed << " sharp edge points fully suppressed" << endl;
+        Info << "Normal dot-product histogram: "
+             << "dot<0: " << nDotNeg
+             << " 0-0.5: " << nDot0to05
+             << " 0.5-0.707: " << nDot05to07
+             << " >0.707: " << nDot07plus << endl;
+    }
+
+    // Build edge-based contact-line policy map before blblSharp block.
+    // Gated by useContactLinePolicy meshDict knob (default false).
+    const bool useContactLinePolicy = useContactLinePolicy_;
+    if( useContactLinePolicy )
+        buildBLContactPointPolicy();
+    else
+        blContactPointClass_.clear();
+
+    // Build HardBLBL cap cell candidate map (no geometry change yet).
+    // Gated by useHardBLBLCapCells_ (default false).
+    buildBLCapCellCandidates();
 
     // BL/BL sharp-junction suppression:
     // Points touching 2+ BL patches where normals diverge sharply
     // (blade+hub, blade+shroud) create degenerate layer cells.
     // Threshold: 40 degrees between patch normals.
     {
-        const scalar cosThresh = Foam::cos(40.0 * M_PI / 180.0);
+        blblJunctionPoints_.clear();
+        blblJunctionClass_.clear();
+        const scalar cosThresh = Foam::cos(blblFeatureAngleDeg_ * M_PI / 180.0);
         label nBLBL = 0;
+        label nBLBLHard = 0;
+        label nRampSeedExcluded = 0;
+        label nBLBLModerate = 0;
+        label nBLBLMild = 0;
         const VRWGraph& ptFaces = mse.pointFaces();
         forAll(bPoints, bpI)
         {
@@ -837,17 +1589,359 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
 
             if( sharpJunction )
             {
-                zeroDistPoints_[bpI] = true;
-                layerScale_[bpI] = 0.02;
-                zeroPts[bpI] = true;
+                //- Contact-line policy v2: atlas-driven when available,
+                //- fallback to per-point avg-normal blblSharp v1.
+                scalar taperFloor = scalar(0.0);
+                label junctionClass = 0;
+
+                Map<label>::const_iterator clsIt =
+                    blContactPointClass_.find(bpI);
+                const bool hasAtlasClass =
+                    useContactLinePolicy &&
+                    (clsIt != blContactPointClass_.end());
+
+                bool appliedAtlasPolicy = false;
+                if( hasAtlasClass )
+                {
+                    const label cls = clsIt();
+                    if( cls == 1 || cls == 2 ) // TripleJunction or HardBLBL
+                    {
+                        taperFloor = scalar(0.0);
+                        junctionClass = 0;
+                        ++nBLBLHard;
+                        appliedAtlasPolicy = true;
+                    }
+                    else if( cls == 3 ) // ModerateBLBL
+                    {
+                        taperFloor = layerScaleRing1_; // meshDict: layerScaleRing1
+                        junctionClass = 1;
+                        ++nBLBLModerate;
+                        appliedAtlasPolicy = true;
+                    }
+                    else if( cls == 4 ) // MildBLBL
+                    {
+                        taperFloor = layerScaleRing2_; // meshDict: layerScaleRing2
+                        junctionClass = 2;
+                        ++nBLBLMild;
+                        appliedAtlasPolicy = true;
+                    }
+                    // cls==5 SmoothBLBL: fallback -- do not force taper
+                    // cls==6 FlowBoundaryTermination: handled by blNoBLEdge
+                    // cls==7 PeriodicSeam: do not treat as blblSharp
+                }
+                if( !appliedAtlasPolicy )
+                {
+                    //- Fallback: per-point avg-normal blblSharp v1
+                    scalar minDot = scalar(1.0);
+                    for(label i=0; i<avgNormals.size()-1; ++i)
+                        for(label j=i+1; j<avgNormals.size(); ++j)
+                        {
+                            const scalar d = avgNormals[i] & avgNormals[j];
+                            if( d < minDot ) minDot = d;
+                        }
+                    const scalar cosHard = Foam::cos(scalar(75.0)*M_PI/180.0);
+                    const scalar cosMild = Foam::cos(scalar(60.0)*M_PI/180.0);
+                    if( minDot < cosHard )
+                    { taperFloor = scalar(0.0); junctionClass = 0; ++nBLBLHard; }
+                    else if( minDot < cosMild )
+                    { taperFloor = layerScaleRing1_; junctionClass = 1; ++nBLBLModerate; }
+                    else
+                    { taperFloor = layerScaleRing2_; junctionClass = 2; ++nBLBLMild; }
+                }
+                // rampSeedPoints_ are finite-height BL+BL+neutral corner seeds,
+                // not hard BLBL junctions. Preserve their explicit corner policy
+                // and do not let the generic blblSharp block overwrite layerScale_,
+                // zeroPts, zeroDistPoints_, or blSuppressReason_.
+                if( bpI < label(rampSeedPoints_.size()) && rampSeedPoints_[bpI] )
+                {
+                    layerScale_[bpI] = Foam::min(layerScale_[bpI], scalar(0.15));
+                    zeroDistPoints_[bpI] = true;
+                    zeroPts[bpI] = true;
+                    blSuppressReason_[bpI] = 4;
+                    ++nRampSeedExcluded;
+                    continue;
+                }
+
+                layerScale_[bpI] = taperFloor;
+                blSuppressReason_[bpI] = 6;
+                if( taperFloor < 0.01 )
+                {
+                    zeroDistPoints_[bpI] = true;
+                    zeroPts[bpI] = true;
+                }
+                else
+                {
+                    zeroDistPoints_[bpI] = false;
+                    zeroPts[bpI] = false;
+                }
                 ++nBLBL;
-                // TODO: two-pass candidate quality rollback (Phase 1 diagnostic)
+                blblJunctionPoints_.insert(bpI);
+                if( blblJunctionClass_.found(bpI) )
+                    blblJunctionClass_[bpI] = junctionClass;
+                else
+                    blblJunctionClass_.insert(bpI, junctionClass);
             }
         }
         Info << "BL/BL sharp-junction suppression: "
-             << nBLBL << " points suppressed" << endl;
+             << nBLBL << " points total"
+             << " rampSeedExcluded=" << nRampSeedExcluded
+             << " (hard=" << nBLBLHard
+             << " moderate=" << nBLBLModerate
+             << " mild=" << nBLBLMild << ")"
+             << " " << blblJunctionPoints_.size() << " junction pts captured"
+             << endl;
     }
 
+    // Detect generic layer-termination edges where at least one adjacent
+    // patch requests boundary layers and at least one adjacent patch requests
+    // zero layers. These edges are protected because unconstrained extrusion
+    // across mixed layer/no-layer patch junctions creates invalid cells.
+    // Fully general: no patch names, no face-count assumptions.
+    // Works for manifold, non-manifold, open, and multi-region edges.
+    {
+        blNoBlEdges_.clear();
+        blNoBlEdgePoints_.clear();
+        blNoBlPointPatch_.clear();
+
+        // Build global-to-boundary-point reverse map once, O(N)
+        Map<label> globalToBP;
+        forAll(bPoints, bpI)
+            globalToBP.insert(bPoints[bpI], bpI);
+
+        forAll(edges, eI)
+        {
+            // Collect all patch IDs adjacent to this edge.
+            // Only BL + explicit TERMINATION edges are suppression edges.
+            // Neutral patches (periodic/symmetry) do not trigger zero BL here.
+            bool hasBL   = false;
+            bool hasNoBL = false;
+            label blPatchI = -1;
+            label noBLPatchI = -1;
+
+            forAllRow(edgeFaces, eI, efI)
+            {
+                const label faceI  = edgeFaces(eI, efI);
+                const label patchI = boundaryFacePatches[faceI];
+                if( patchI < 0 || patchI >= label(patchRole_.size()) )
+                    continue;
+                if( patchRole_[patchI] == 0 )
+                {
+                    hasBL = true;
+                    blPatchI = patchI;
+                }
+                else if( patchRole_[patchI] == 1 )
+                {
+                    hasNoBL = true;
+                    noBLPatchI = patchI;
+                }
+            }
+            if( !hasBL || !hasNoBL ) continue;
+
+            blNoBlEdges_.insert(eI);
+
+            const edge& e = edges[eI];
+            for( label ei = 0; ei < 2; ++ei )
+            {
+                const label gp = (ei == 0) ? e[0] : e[1];
+                Map<label>::const_iterator it = globalToBP.find(gp);
+                if( it == globalToBP.end() ) continue;
+                const label bpI = it();
+                if( blNoBlEdgePoints_.insert(bpI) )
+                {
+                    // Use patchRole_==1 (termination) not hardcoded names.
+                    // flowTerminationTaperFloor_ is separate from layerScaleRing1_
+                    // so ModerateBLBL and FlowBoundaryTermination tune independently.
+                    const bool explicitTermination =
+                        (noBLPatchI >= 0
+                      && noBLPatchI < label(patchRole_.size())
+                      && patchRole_[noBLPatchI] == 1);
+                    const scalar blNoBLTaper =
+                        explicitTermination ? flowTerminationTaperFloor_ : scalar(0.0);
+                    // Most-restrictive-wins: preserve structural zero anchors.
+                    // Gap(1), TripleJunction(3), blblSharp(6), and rampSeedPoints_
+                    // are structural topology contracts.
+                    // Generic corner(4)/sharpEdge(5) may reopen, but not ramp seeds.
+                    const scalar oldScale = layerScale_[bpI];
+                    const label priorReason =
+                        (blSuppressReason_.size() > bpI) ? blSuppressReason_[bpI] : 0;
+                    const bool priorZero =
+                        (oldScale < scalar(0.01))
+                     || zeroDistPoints_[bpI]
+                     || zeroPts[bpI];
+                    const bool isRampSeed =
+                        (bpI >= 0
+                      && bpI < label(rampSeedPoints_.size())
+                      && rampSeedPoints_[bpI]);
+                    const bool preserveStructuralZero =
+                        priorZero
+                     && (   priorReason == 1   // gap
+                         || priorReason == 3   // tripleJunction
+                         || priorReason == 6   // blblSharp
+                         || isRampSeed);       // finite ramp seed topology contract
+                    scalar finalScale = Foam::min(oldScale, blNoBLTaper);
+                    if( priorZero && !preserveStructuralZero )
+                        finalScale = blNoBLTaper;
+                    layerScale_[bpI] = finalScale;
+                    if( finalScale < scalar(0.01) || preserveStructuralZero )
+                    {
+                        zeroDistPoints_[bpI] = true;
+                        zeroPts[bpI] = true;
+                    }
+                    else
+                    {
+                        zeroDistPoints_[bpI] = false;
+                        zeroPts[bpI] = false;
+                    }
+                    if( !preserveStructuralZero )
+                        blSuppressReason_[bpI] = 7;
+                }
+                // Store BL-side patch for patch-constrained projection
+                if( !blNoBlPointPatch_.found(bpI) )
+                    blNoBlPointPatch_.insert(bpI, blPatchI);
+            }
+        }
+
+        Info << "BL/no-BL transition edge detection: "
+             << blNoBlEdges_.size() << " transition edges, "
+             << blNoBlEdgePoints_.size() << " interface points locked" << endl;
+    }
+
+    // BL dropout reason atlas CSV dump.
+    // Emits one row per suppressed/thin boundary point.
+    // reasonCode: 0=none 1=gap 2=transEdge 3=tripleJunction 4=corner
+    //             5=sharpEdge 6=blblSharp 7=blNoBLEdge
+    {
+        const meshSurfaceEngine& mseAtlas = surfaceEngine();
+        const labelList& bPtsAtlas = mseAtlas.boundaryPoints();
+        const pointField& ptsAtlas = mseAtlas.mesh().points();
+        meshSurfacePartitioner mPartAtlas(mseAtlas);
+        const VRWGraph& pPatchesAtlas = mPartAtlas.pointPatches();
+        const PtrList<boundaryPatch>& bndAtlas = mesh_.boundaries();
+        OFstream atlasOs("blDropoutReasonAtlas_pre_ramp.csv");
+        atlasOs << "bpI,meshPointI,x,y,z,layerScale,"
+                << "reasonCode,reasonName,"
+                << "rampRing,rampSeedReason,rampSeedName,"
+                << "patches" << nl;
+        const char* reasonNames[] = {
+            "none","gap","transEdge","tripleJunction",
+            "corner","sharpEdge","blblSharp","blNoBLEdge",
+            "periodicNeutral"
+        };
+        label nDumped = 0;
+        forAll(bPtsAtlas, bpI)
+        {
+            const scalar ls =
+                (layerScale_.size() > bpI) ? layerScale_[bpI] : scalar(1.0);
+            const label rc =
+                (blSuppressReason_.size() > bpI) ? blSuppressReason_[bpI] : 0;
+            if( rc == 0 && ls >= 0.99 ) continue;
+            const label meshPtI = bPtsAtlas[bpI];
+            const point& pt =
+                (meshPtI >= 0 && meshPtI < label(ptsAtlas.size())) ?
+                ptsAtlas[meshPtI] : point(Zero);
+            word patchStr("unknown");
+            if( pPatchesAtlas.sizeOfRow(bpI) > 0 )
+            {
+                patchStr = "";
+                labelHashSet seenP;
+                forAllRow(pPatchesAtlas, bpI, pI)
+                {
+                    const label patchI = pPatchesAtlas(bpI, pI);
+                    if( patchI < 0 || patchI >= label(bndAtlas.size()) ) continue;
+                    if( seenP.found(patchI) ) continue;
+                    seenP.insert(patchI);
+                    if( patchStr.size() > 0 ) patchStr += "+";
+                    patchStr += bndAtlas[patchI].patchName();
+                }
+                if( patchStr.size() == 0 ) patchStr = "unknown";
+            }
+            const label rcClamped = (rc >= 0 && rc <= 8) ? rc : 0;
+            const label rampRing =
+                (blRampRing_.size() > bpI) ? blRampRing_[bpI] : 0;
+            const label rampSeedRc =
+                (blRampSeedReason_.size() > bpI) ? blRampSeedReason_[bpI] : 0;
+            const label rampSeedClamped =
+                (rampSeedRc >= 0 && rampSeedRc <= 7) ? rampSeedRc : 0;
+            atlasOs << bpI << ","
+                    << meshPtI << ","
+                    << pt.x() << ","
+                    << pt.y() << ","
+                    << pt.z() << ","
+                    << ls << ","
+                    << rcClamped << ","
+                    << reasonNames[rcClamped] << ","
+                    << rampRing << ","
+                    << rampSeedClamped << ","
+                    << reasonNames[rampSeedClamped] << ","
+                    << patchStr << nl;
+            ++nDumped;
+        }
+        Info << "BL dropout reason atlas (pre-ramp): wrote " << nDumped
+             << " points to blDropoutReasonAtlas_pre_ramp.csv" << endl;
+    }
+
+
+    // Topology-role VTK diagnostic dump
+    // Roles: 0=SINGLE_PATCH 1=TWO_PATCH_EDGE 2=MULTI_PATCH_CORNER
+    //        3=BL_NOBL_TRANSITION 4=BLBL_JUNCTION 5=ACUTE_CORNER
+    {
+        const meshSurfaceEngine& mseDiag = surfaceEngine();
+        const labelList& bPtsDiag = mseDiag.boundaryPoints();
+        const pointField& ptsDiag = mseDiag.mesh().points();
+        meshSurfacePartitioner mPartDiag(mseDiag);
+        const labelHashSet& cornersDiag = mPartDiag.corners();
+        const labelHashSet& edgePtsDiag = mPartDiag.edgePoints();
+        OFstream vtkFile("boundaryPointRoles.vtk");
+        vtkFile << "# vtk DataFile Version 3.0\n";
+        vtkFile << "Boundary point topology roles\n";
+        vtkFile << "ASCII\n";
+        vtkFile << "DATASET POLYDATA\n";
+        vtkFile << "POINTS " << bPtsDiag.size() << " float\n";
+        forAll(bPtsDiag, bpI)
+        {
+            const point& p = ptsDiag[bPtsDiag[bpI]];
+            vtkFile << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
+        }
+        vtkFile << "\nVERTICES " << bPtsDiag.size()
+                << " " << 2*bPtsDiag.size() << '\n';
+        forAll(bPtsDiag, bpI)
+            vtkFile << "1 " << bpI << '\n';
+        vtkFile << "\nPOINT_DATA " << bPtsDiag.size() << '\n';
+        vtkFile << "SCALARS role int 1\n";
+        vtkFile << "LOOKUP_TABLE default\n";
+        label nSingle=0, nEdge=0, nCorner=0, nBlNoBl=0, nBlBl=0, nAcute=0;
+        forAll(bPtsDiag, bpI)
+        {
+            int role = 0;
+            if( blblAcuteCornerPoints_.found(bpI) )      role = 5;
+            else if( blblJunctionPoints_.found(bpI) )    role = 4;
+            else if( blNoBlEdgePoints_.found(bpI) )      role = 3;
+            else if( cornersDiag.found(bpI) )            role = 2;
+            else if( edgePtsDiag.found(bpI) )            role = 1;
+            vtkFile << role << '\n';
+            switch(role)
+            {
+                case 0: ++nSingle; break;
+                case 1: ++nEdge;   break;
+                case 2: ++nCorner; break;
+                case 3: ++nBlNoBl; break;
+                case 4: ++nBlBl;   break;
+                case 5: ++nAcute;  break;
+            }
+        }
+        Info << "[Diag] boundaryPointRoles.vtk written" << endl;
+        Info << "[Diag] Role counts:"
+             << " SINGLE_PATCH=" << nSingle
+             << " TWO_PATCH_EDGE=" << nEdge
+             << " MULTI_PATCH_CORNER=" << nCorner
+             << " BL_NOBL=" << nBlNoBl
+             << " BLBL_JUNCTION=" << nBlBl
+             << " ACUTE_CORNER=" << nAcute
+             << endl;
+    }
+
+    label nGapRampBlocked = 0;
+    label nHardRampBlocked = 0;
     // Ring 1: neighbors of zero points on BL patches -> 0.25
     boolList ring1(bPoints.size(), false);
     forAll(bPoints, bpI)
@@ -859,8 +1953,34 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
             if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
             if( zeroPts[nbpI] ) continue;
             if( !boundaryPointIsBL[nbpI] ) continue;
-            ring1[nbpI] = true;
-            layerScale_[nbpI] = Foam::min(layerScale_[nbpI], scalar(0.25));
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            if( !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI) ) continue;
+            //- Seed-aware ring containment ring1:
+            //- Gap seeds: max 2 rings (local geometry)
+            //- Hard blblSharp seeds: max 3 rings
+            {
+                //- GPT fix: preserve inherited seed reason through ramp chain.
+                //- If bpI is already a ramp point, use its inherited seed.
+                //- Otherwise use bpI direct suppression reason.
+                const label seedRsn =
+                    (blRampRing_[bpI] > 0 && blRampSeedReason_[bpI] > 0) ?
+                    blRampSeedReason_[bpI] : blSuppressReason_[bpI];
+                const bool isGapSeed = (seedRsn == 1);
+                const bool isHardSeed = (seedRsn == 6);
+                if( isGapSeed && 1 > 2 ) { ++nGapRampBlocked; }
+                else if( isHardSeed && 1 > 3 ) { ++nHardRampBlocked; }
+                else
+                {
+                    ring1[nbpI] = true;
+                    layerScale_[nbpI] = Foam::min(layerScale_[nbpI], layerScaleRing1_);
+                    if( blRampRing_[nbpI] == 0 )
+                    {
+                        blRampRing_[nbpI] = 1;
+                        blRampSeedReason_[nbpI] = seedRsn;
+                    }
+                }
+            }
         }
     }
 
@@ -875,12 +1995,38 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
             if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
             if( zeroPts[nbpI] || ring1[nbpI] ) continue;
             if( !boundaryPointIsBL[nbpI] ) continue;
-            ring2[nbpI] = true;
-            layerScale_[nbpI] = Foam::min(layerScale_[nbpI], scalar(0.50));
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            if( !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI) ) continue;
+            //- Seed-aware ring containment ring2:
+            //- Gap seeds: max 2 rings (local geometry)
+            //- Hard blblSharp seeds: max 3 rings
+            {
+                //- GPT fix: preserve inherited seed reason through ramp chain.
+                //- If bpI is already a ramp point, use its inherited seed.
+                //- Otherwise use bpI direct suppression reason.
+                const label seedRsn =
+                    (blRampRing_[bpI] > 0 && blRampSeedReason_[bpI] > 0) ?
+                    blRampSeedReason_[bpI] : blSuppressReason_[bpI];
+                const bool isGapSeed = (seedRsn == 1);
+                const bool isHardSeed = (seedRsn == 6);
+                if( isGapSeed && 2 > 2 ) { ++nGapRampBlocked; }
+                else if( isHardSeed && 2 > 3 ) { ++nHardRampBlocked; }
+                else
+                {
+                    ring2[nbpI] = true;
+                    layerScale_[nbpI] = Foam::min(layerScale_[nbpI], layerScaleRing2_);
+                    if( blRampRing_[nbpI] == 0 )
+                    {
+                        blRampRing_[nbpI] = 2;
+                        blRampSeedReason_[nbpI] = seedRsn;
+                    }
+                }
+            }
         }
     }
 
-    // Ring 3: neighbors of ring2 on BL patches -> 0.3
+    // Ring 3: neighbors of ring2 on BL patches -> 0.75
     boolList ring3(bPoints.size(), false);
     forAll(bPoints, bpI)
     {
@@ -891,12 +2037,38 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
             if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
             if( zeroPts[nbpI] || ring1[nbpI] || ring2[nbpI] ) continue;
             if( !boundaryPointIsBL[nbpI] ) continue;
-            ring3[nbpI] = true;
-            layerScale_[nbpI] = Foam::min(layerScale_[nbpI], scalar(0.75));
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            if( !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI) ) continue;
+            //- Seed-aware ring containment ring3:
+            //- Gap seeds: max 2 rings (local geometry)
+            //- Hard blblSharp seeds: max 3 rings
+            {
+                //- GPT fix: preserve inherited seed reason through ramp chain.
+                //- If bpI is already a ramp point, use its inherited seed.
+                //- Otherwise use bpI direct suppression reason.
+                const label seedRsn =
+                    (blRampRing_[bpI] > 0 && blRampSeedReason_[bpI] > 0) ?
+                    blRampSeedReason_[bpI] : blSuppressReason_[bpI];
+                const bool isGapSeed = (seedRsn == 1);
+                const bool isHardSeed = (seedRsn == 6);
+                if( isGapSeed && 3 > 2 ) { ++nGapRampBlocked; }
+                else if( isHardSeed && 3 > 3 ) { ++nHardRampBlocked; }
+                else
+                {
+                    ring3[nbpI] = true;
+                    layerScale_[nbpI] = Foam::min(layerScale_[nbpI], layerScaleRing3_);
+                    if( blRampRing_[nbpI] == 0 )
+                    {
+                        blRampRing_[nbpI] = 3;
+                        blRampSeedReason_[nbpI] = seedRsn;
+                    }
+                }
+            }
         }
     }
 
-    // Ring 4: neighbors of ring3 on BL patches -> 0.6
+    // Ring 4: neighbors of ring3 on BL patches -> 0.90
     boolList ring4(bPoints.size(), false);
     forAll(bPoints, bpI)
     {
@@ -907,12 +2079,122 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
             if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
             if( zeroPts[nbpI] || ring1[nbpI] || ring2[nbpI] || ring3[nbpI] ) continue;
             if( !boundaryPointIsBL[nbpI] ) continue;
-            ring4[nbpI] = true;
-            layerScale_[nbpI] = Foam::min(layerScale_[nbpI], scalar(1.0));
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            if( !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI) ) continue;
+            //- Seed-aware ring containment ring4:
+            //- Gap seeds: max 2 rings (local geometry)
+            //- Hard blblSharp seeds: max 3 rings
+            {
+                //- GPT fix: preserve inherited seed reason through ramp chain.
+                //- If bpI is already a ramp point, use its inherited seed.
+                //- Otherwise use bpI direct suppression reason.
+                const label seedRsn =
+                    (blRampRing_[bpI] > 0 && blRampSeedReason_[bpI] > 0) ?
+                    blRampSeedReason_[bpI] : blSuppressReason_[bpI];
+                const bool isGapSeed = (seedRsn == 1);
+                const bool isHardSeed = (seedRsn == 6);
+                if( isGapSeed && 4 > 2 ) { ++nGapRampBlocked; }
+                else if( isHardSeed && 4 > 3 ) { ++nHardRampBlocked; }
+                else
+                {
+                    ring4[nbpI] = true;
+                    layerScale_[nbpI] = Foam::min(layerScale_[nbpI], layerScaleRing4_);
+                    if( blRampRing_[nbpI] == 0 )
+                    {
+                        blRampRing_[nbpI] = 4;
+                        blRampSeedReason_[nbpI] = seedRsn;
+                    }
+                }
+            }
         }
     }
 
-    label nZero = 0, nRing1 = 0, nRing2 = 0, nRing3 = 0, nRing4 = 0;
+    boolList ring5(bPoints.size(), false);
+    forAll(bPoints, bpI)
+    {
+        if( !ring4[bpI] ) continue;
+        forAllRow(pointPoints, bpI, ppI)
+        {
+            const label nbpI = pointPoints(bpI, ppI);
+            if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+            if( zeroPts[nbpI] || ring1[nbpI] || ring2[nbpI] || ring3[nbpI] || ring4[nbpI] ) continue;
+            if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            if( !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI) ) continue;
+            //- Seed-aware ring containment ring5:
+            //- Gap seeds: max 2 rings (local geometry)
+            //- Hard blblSharp seeds: max 3 rings
+            {
+                //- GPT fix: preserve inherited seed reason through ramp chain.
+                //- If bpI is already a ramp point, use its inherited seed.
+                //- Otherwise use bpI direct suppression reason.
+                const label seedRsn =
+                    (blRampRing_[bpI] > 0 && blRampSeedReason_[bpI] > 0) ?
+                    blRampSeedReason_[bpI] : blSuppressReason_[bpI];
+                const bool isGapSeed = (seedRsn == 1);
+                const bool isHardSeed = (seedRsn == 6);
+                if( isGapSeed && 5 > 2 ) { ++nGapRampBlocked; }
+                else if( isHardSeed && 5 > 3 ) { ++nHardRampBlocked; }
+                else
+                {
+                    ring5[nbpI] = true;
+                    layerScale_[nbpI] = Foam::min(layerScale_[nbpI], layerScaleRing5_);
+                    if( blRampRing_[nbpI] == 0 )
+                    {
+                        blRampRing_[nbpI] = 5;
+                        blRampSeedReason_[nbpI] = seedRsn;
+                    }
+                }
+            }
+        }
+    }
+    boolList ring6(bPoints.size(), false);
+    forAll(bPoints, bpI)
+    {
+        if( !ring5[bpI] ) continue;
+        forAllRow(pointPoints, bpI, ppI)
+        {
+            const label nbpI = pointPoints(bpI, ppI);
+            if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+            if( zeroPts[nbpI] || ring1[nbpI] || ring2[nbpI] || ring3[nbpI] || ring4[nbpI] || ring5[nbpI] ) continue;
+            if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            if( !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI) ) continue;
+            //- Seed-aware ring containment ring6:
+            //- Gap seeds: max 2 rings (local geometry)
+            //- Hard blblSharp seeds: max 3 rings
+            {
+                //- GPT fix: preserve inherited seed reason through ramp chain.
+                //- If bpI is already a ramp point, use its inherited seed.
+                //- Otherwise use bpI direct suppression reason.
+                const label seedRsn =
+                    (blRampRing_[bpI] > 0 && blRampSeedReason_[bpI] > 0) ?
+                    blRampSeedReason_[bpI] : blSuppressReason_[bpI];
+                const bool isGapSeed = (seedRsn == 1);
+                const bool isHardSeed = (seedRsn == 6);
+                if( isGapSeed && 6 > 2 ) { ++nGapRampBlocked; }
+                else if( isHardSeed && 6 > 3 ) { ++nHardRampBlocked; }
+                else
+                {
+                    ring6[nbpI] = true;
+                    layerScale_[nbpI] = Foam::min(layerScale_[nbpI], layerScaleRing6_);
+                    if( blRampRing_[nbpI] == 0 )
+                    {
+                        blRampRing_[nbpI] = 6;
+                        blRampSeedReason_[nbpI] = seedRsn;
+                    }
+                }
+            }
+        }
+    }
+    Info << "BL seed-aware ramp containment:"
+         << " gapBlocked=" << nGapRampBlocked
+         << " hardBLBLBlocked=" << nHardRampBlocked
+         << endl;
+    label nZero = 0, nRing1 = 0, nRing2 = 0, nRing3 = 0, nRing4 = 0, nRing5 = 0, nRing6 = 0;
     forAll(bPoints, bpI)
     {
         if( zeroPts[bpI] ) ++nZero;
@@ -920,15 +2202,1015 @@ void boundaryLayers::markConcaveEdgePoints(boolList& skipPoint) const
         else if( ring2[bpI] ) ++nRing2;
         else if( ring3[bpI] ) ++nRing3;
         else if( ring4[bpI] ) ++nRing4;
+        else if( ring5[bpI] ) ++nRing5;
+        else if( ring6[bpI] ) ++nRing6;
     }
     Info << "BL layerScale ramp: zero=" << nZero
          << " ring1=" << nRing1
          << " ring2=" << nRing2
          << " ring3=" << nRing3
          << " ring4=" << nRing4
+         << " ring5=" << nRing5
+         << " ring6=" << nRing6
          << endl;
+    // Acute corner local taper
+    // Seeded from blblAcuteCornerPoints_ -- stronger suppression than general ramp
+    // Propagates along BL wall patches only
+    if( blblAcuteCornerPoints_.size() > 0 )
+    {
+        // Apply ring0 scale to exact acute corner points
+        forAllConstIter(labelHashSet, blblAcuteCornerPoints_, it)
+        {
+            const label bpI = it.key();
+            if( bpI >= 0 && bpI < label(bPoints.size()) )
+                layerScale_[bpI] = Foam::min(layerScale_[bpI], acuteCornerRing0_);
+        }
+
+        // Build acute corner seed set for ring propagation
+        boolList acuteZero(bPoints.size(), false);
+        forAllConstIter(labelHashSet, blblAcuteCornerPoints_, it)
+        {
+            const label bpI = it.key();
+            if( bpI >= 0 && bpI < label(bPoints.size()) )
+                acuteZero[bpI] = true;
+        }
+
+        // Ring 1 from acute corners
+        boolList acuteRing1(bPoints.size(), false);
+        forAll(bPoints, bpI)
+        {
+            if( !acuteZero[bpI] ) continue;
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label nbpI = pointPoints(bpI, ppI);
+                if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+                if( acuteZero[nbpI] ) continue;
+                if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            const bool crossPatch =
+                !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI);
+                if( crossPatch ) continue;
+                acuteRing1[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], acuteCornerRing1_);
+            }
+        }
+
+        // Ring 2
+        boolList acuteRing2(bPoints.size(), false);
+        forAll(bPoints, bpI)
+        {
+            if( !acuteRing1[bpI] ) continue;
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label nbpI = pointPoints(bpI, ppI);
+                if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+                if( acuteZero[nbpI] || acuteRing1[nbpI] ) continue;
+                if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            const bool crossPatch =
+                !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI);
+                if( crossPatch ) continue;
+                acuteRing2[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], acuteCornerRing2_);
+            }
+        }
+
+        // Ring 3
+        boolList acuteRing3(bPoints.size(), false);
+        forAll(bPoints, bpI)
+        {
+            if( !acuteRing2[bpI] ) continue;
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label nbpI = pointPoints(bpI, ppI);
+                if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+                if( acuteZero[nbpI] || acuteRing1[nbpI] || acuteRing2[nbpI] ) continue;
+                if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            const bool crossPatch =
+                !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI);
+                if( crossPatch ) continue;
+                acuteRing3[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], acuteCornerRing3_);
+            }
+        }
+
+        // Ring 4
+        boolList acuteRing4(bPoints.size(), false);
+        forAll(bPoints, bpI)
+        {
+            if( !acuteRing3[bpI] ) continue;
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label nbpI = pointPoints(bpI, ppI);
+                if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+                if( acuteZero[nbpI] || acuteRing1[nbpI] || acuteRing2[nbpI] || acuteRing3[nbpI] ) continue;
+                if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            const bool crossPatch =
+                !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI);
+                if( crossPatch ) continue;
+                acuteRing4[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], acuteCornerRing4_);
+            }
+        }
+
+        // Ring 5
+        boolList acuteRing5(bPoints.size(), false);
+        forAll(bPoints, bpI)
+        {
+            if( !acuteRing4[bpI] ) continue;
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label nbpI = pointPoints(bpI, ppI);
+                if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+                if( acuteZero[nbpI] || acuteRing1[nbpI] || acuteRing2[nbpI] || acuteRing3[nbpI] || acuteRing4[nbpI] ) continue;
+                if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            const bool crossPatch =
+                !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI);
+                if( crossPatch ) continue;
+                acuteRing5[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], acuteCornerRing5_);
+            }
+        }
+
+        // Ring 6
+        boolList acuteRing6(bPoints.size(), false);
+        forAll(bPoints, bpI)
+        {
+            if( !acuteRing5[bpI] ) continue;
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label nbpI = pointPoints(bpI, ppI);
+                if( nbpI < 0 || nbpI >= label(bPoints.size()) ) continue;
+                if( acuteZero[nbpI] || acuteRing1[nbpI] || acuteRing2[nbpI] || acuteRing3[nbpI] || acuteRing4[nbpI] || acuteRing5[nbpI] ) continue;
+                if( !boundaryPointIsBL[nbpI] ) continue;
+            // Cross-patch: allow propagation but cap scale at 5% to prevent
+            // bleed while avoiding abrupt BL termination / high skew.
+            const bool crossPatch =
+                !boundaryPointsCanShareBLRamp(pPatches, isBLPatch, bpI, nbpI);
+                if( crossPatch ) continue;
+                acuteRing6[nbpI] = true;
+                layerScale_[nbpI] = Foam::min(layerScale_[nbpI], acuteCornerRing6_);
+            }
+        }
+
+        label nAR0=0, nAR1=0, nAR2=0, nAR3=0, nAR4=0, nAR5=0, nAR6=0;
+        forAll(bPoints, bpI)
+        {
+            if( acuteZero[bpI] ) ++nAR0;
+            else if( acuteRing1[bpI] ) ++nAR1;
+            else if( acuteRing2[bpI] ) ++nAR2;
+            else if( acuteRing3[bpI] ) ++nAR3;
+            else if( acuteRing4[bpI] ) ++nAR4;
+            else if( acuteRing5[bpI] ) ++nAR5;
+            else if( acuteRing6[bpI] ) ++nAR6;
+        }
+        Info << "Acute corner taper: ring0=" << nAR0
+             << " ring1=" << nAR1
+             << " ring2=" << nAR2
+             << " ring3=" << nAR3
+             << " ring4=" << nAR4
+             << " ring5=" << nAR5
+             << " ring6=" << nAR6
+             << endl;
+    }
+
+    // Virtual topology: zero/taper layerScale_ at acute triple-junctions.
+    // blblAcuteCornerPoints_ and layerScale_ fully built above.
+    // Must run before return -- vertex creation reads layerScale_.
+    applyVirtualTopologyExclusion();
+
+    // Gap face-ring: taper layerScale_ around gap contact points
+    applyGapFaceRingExclusion();
+
     Info << "terminateLayersAtConcaveEdges: marked "
          << nTransitionEdges << " BL-transition edges." << endl;
+}
+
+void boundaryLayers::applyVirtualTopologyExclusion() const
+{
+    if( !virtualTopologyExclusion_ )
+        return;
+
+    if( blblAcuteCornerPoints_.size() == 0 )
+        return;
+
+    const meshSurfaceEngine& mse = surfaceEngine();
+
+    const labelList& bPoints = mse.boundaryPoints();
+    const faceList::subList& bFaces = mse.boundaryFaces();
+    const VRWGraph& pointFaces = mse.pointFaces();
+
+    const label nBP = bPoints.size();
+    const label nBF = bFaces.size();
+
+    if( layerScale_.size() != nBP )
+        return;
+
+    // Reverse map: mesh point label -> boundary point label.
+    labelList meshToBnd(mesh_.points().size(), -1);
+    forAll(bPoints, bpI)
+        meshToBnd[bPoints[bpI]] = bpI;
+
+    // faceRing: -1=untouched, 0=seed, 1=ring1, 2=ring2
+    labelList faceRing(nBF, -1);
+
+    // Ring 0: all boundary faces touching any acute corner seed point.
+    forAllConstIter(labelHashSet, blblAcuteCornerPoints_, it)
+    {
+        const label bpI = it.key();
+        if( bpI < 0 || bpI >= nBP ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            faceRing[bfI] = 0;
+        }
+    }
+
+    // Build ring0 point set.
+    boolList ring0pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 0 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring0pt[bpI] = true;
+        }
+    }
+
+    // Ring 1: all faces touching ring0 points.
+    forAll(ring0pt, bpI)
+    {
+        if( !ring0pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 1;
+        }
+    }
+
+    // Build ring1 point set.
+    boolList ring1pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 1 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring1pt[bpI] = true;
+        }
+    }
+
+    // Ring 2: all faces touching ring1 points.
+    forAll(ring1pt, bpI)
+    {
+        if( !ring1pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 2;
+        }
+    }
+
+    // Apply layerScale_ -- smallest ring wins for shared points.
+    forAll(faceRing, bfI)
+    {
+        const label ring = faceRing[bfI];
+        if( ring < 0 ) continue;
+        scalar scale = 1.0;
+        if(      ring == 0 ) scale = virtualTopoRing0_;
+        else if( ring == 1 ) scale = virtualTopoRing1_;
+        else if( ring == 2 ) scale = virtualTopoRing2_;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+            layerScale_[bpI] = Foam::min(layerScale_[bpI], scale);
+        }
+    }
+
+    // Export face ring for refineBoundaryLayers -- BL/BL ramp skips VT-handled faces
+    vtFaceRing_ = faceRing;
+
+    // Diagnostics
+    label nF0=0, nF1=0, nF2=0;
+    labelList ptRing(nBP, -1);
+    forAll(faceRing, bfI)
+    {
+        const label ring = faceRing[bfI];
+        if(      ring == 0 ) ++nF0;
+        else if( ring == 1 ) ++nF1;
+        else if( ring == 2 ) ++nF2;
+        if( ring < 0 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+            if( ptRing[bpI] < 0 || ring < ptRing[bpI] ) ptRing[bpI] = ring;
+        }
+    }
+    label nP0=0, nP1=0, nP2=0;
+    forAll(ptRing, bpI)
+    {
+        if(      ptRing[bpI] == 0 ) ++nP0;
+        else if( ptRing[bpI] == 1 ) ++nP1;
+        else if( ptRing[bpI] == 2 ) ++nP2;
+    }
+
+    Info << "VirtualTopology face-ring exclusion:"
+         << " faces(r0=" << nF0 << " r1=" << nF1 << " r2=" << nF2 << ")"
+         << " pts(r0=" << nP0 << " r1=" << nP1 << " r2=" << nP2 << ")"
+         << " scale=(" << virtualTopoRing0_
+         << " " << virtualTopoRing1_
+         << " " << virtualTopoRing2_ << ")"
+         << endl;
+}
+
+void boundaryLayers::applyGapFaceRingExclusion() const
+{
+    const bool useTriple =
+        tripleJunctionFaceRingExclusion_ && tripleJunctionPoints_.size() > 0;
+    if( !gapFaceRingExclusion_ && !useTriple )
+        return;
+    if( gapPoints_.size() == 0 && !useTriple )
+        return;
+
+    const meshSurfaceEngine& mse = surfaceEngine();
+    const labelList& bPoints     = mse.boundaryPoints();
+    const faceList::subList& bFaces = mse.boundaryFaces();
+    const VRWGraph& pointFaces   = mse.pointFaces();
+    const labelList& facePatch   = mse.boundaryFacePatches();
+
+    const label nBP = bPoints.size();
+    const label nBF = bFaces.size();
+
+    if( layerScale_.size() != nBP ) return;
+
+    // Reverse map: mesh point -> boundary point
+    labelList meshToBnd(mesh_.points().size(), -1);
+    forAll(bPoints, bpI)
+        meshToBnd[bPoints[bpI]] = bpI;
+
+    // faceRing: -1=untouched, 0=seed, 1=ring1, 2=ring2
+    labelList faceRing(nBF, -1);
+
+    // Ring 0: boundary faces touching gap points and/or triple-junction points
+    auto seedRing0 = [&](const labelHashSet& seedPts)
+    {
+        forAllConstIter(labelHashSet, seedPts, it)
+        {
+            const label meshPtI = it.key();
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+            forAllRow(pointFaces, bpI, pfI)
+            {
+                const label bfI = pointFaces(bpI, pfI);
+                if( bfI < 0 || bfI >= nBF ) continue;
+                faceRing[bfI] = 0;
+            }
+        }
+    };
+    if( gapFaceRingExclusion_ )
+        seedRing0(gapPoints_);
+    if( useTriple )
+    {
+        // Patch-restricted seeding: only suppress faces on the designated
+        // suppress-side patches (hub/shroud). Blade and periodic faces
+        // adjacent to the triple junction must NOT be suppressed --
+        // they need BL for correct turbomachinery flow resolution.
+        if( tripleJunctionSuppressPatches_.size() > 0 )
+        {
+            forAllConstIter(labelHashSet, tripleJunctionPoints_, it)
+            {
+                const label meshPtI = it.key();
+                if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+                const label bpI = meshToBnd[meshPtI];
+                if( bpI < 0 || bpI >= nBP ) continue;
+                forAllRow(pointFaces, bpI, pfI)
+                {
+                    const label bfI = pointFaces(bpI, pfI);
+                    if( bfI < 0 || bfI >= nBF ) continue;
+                    // Only suppress faces on the suppress-side patches
+                    if( !tripleJunctionSuppressPatches_.found(facePatch[bfI]) )
+                        continue;
+                    faceRing[bfI] = 0;
+                }
+            }
+        }
+        else
+        {
+            Info << "Triple-junction face-ring exclusion: "
+                 << "no suppress patch filter defined -- skipping" << endl;
+        }
+    }
+
+    // Build protected-side taper mask: blade/periodic faces at triple
+    // junctions NOT on suppress-side patches. Taper only -- no topology suppression.
+    boolList protectedTripleRing0Face(nBF, false);
+    if( useTriple && tripleJunctionSuppressPatches_.size() > 0 )
+    {
+        forAllConstIter(labelHashSet, tripleJunctionPoints_, it)
+        {
+            const label meshPtI = it.key();
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+            forAllRow(pointFaces, bpI, pfI)
+            {
+                const label bfI = pointFaces(bpI, pfI);
+                if( bfI < 0 || bfI >= nBF ) continue;
+                // Only taper faces NOT on suppress-side patches
+                if( tripleJunctionSuppressPatches_.found(facePatch[bfI]) )
+                    continue;
+                // Don't override an existing hard suppress
+                if( faceRing[bfI] == 0 )
+                    continue;
+                protectedTripleRing0Face[bfI] = true;
+            }
+        }
+    }
+
+    // Build ring0 point set
+    boolList ring0pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 0 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring0pt[bpI] = true;
+        }
+    }
+
+    // Ring 1
+    forAll(ring0pt, bpI)
+    {
+        if( !ring0pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 1;
+        }
+    }
+
+    // Build ring1 point set
+    boolList ring1pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 1 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring1pt[bpI] = true;
+        }
+    }
+
+    // Ring 2
+    forAll(ring1pt, bpI)
+    {
+        if( !ring1pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 2;
+        }
+    }
+
+    // Ring 3 face tracking
+    boolList ring2pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 2 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring2pt[bpI] = true;
+        }
+    }
+
+    forAll(ring2pt, bpI)
+    {
+        if( !ring2pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 3;
+        }
+    }
+
+    // Populate face-level suppression mask.
+    // Ring0: always suppress topology (gap too tight for any BL).
+    // Ring1 on loser-side patches: suppress topology to give winner-side BL room.
+    // createNewFacesAndCells will skip suppressed faces entirely.
+    suppressLayerAtBndFace_.setSize(nBF, false);
+    const bool applyLoserRing1 =
+        gapLoserRing1Suppress_ && gapLoserPatches_.size() > 0;
+    label nLoserRing1Suppressed = 0;
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] == 0 )
+        {
+            suppressLayerAtBndFace_[bfI] = true;
+        }
+        else if( faceRing[bfI] == 1 && applyLoserRing1 )
+        {
+            // Only suppress ring1 on the loser side of the gap conflict.
+            // Winner side keeps BL topology through the transition.
+            if( gapLoserPatches_.found(facePatch[bfI]) )
+            {
+                suppressLayerAtBndFace_[bfI] = true;
+                ++nLoserRing1Suppressed;
+            }
+        }
+    }
+    if( nLoserRing1Suppressed > 0 )
+        Info << "Gap conflict arbitration: ring1 topology suppressed on loser side: "
+             << nLoserRing1Suppressed << " faces" << endl;
+
+    // Gap layer-count cap metadata is passed to refineBoundaryLayers via
+    // gapPoints_ (mesh point labels) + gapLoserPatchNames() + ring max knobs.
+    // refineBoundaryLayers applies the cap locally at split-edge generation time
+    // using stable mesh-point-label + patch-name identification (Option B).
+    if( gapLoserPatches_.size() > 0 )
+        Info << "Gap layer-count caps: loser-side patches="
+             << gapLoserPatches_.size()
+             << " gap action points=" << gapPoints_.size()
+             << " (ring1max=" << gapLoserRing1MaxLayers_
+             << " ring2max=" << gapLoserRing2MaxLayers_ << ")" << endl;
+
+    // Apply layerScale_ -- scales configurable via meshDict
+    forAll(faceRing, bfI)
+    {
+        const label ring = faceRing[bfI];
+        if( ring < 0 ) continue;
+        scalar scale = 1.0;
+        if(      ring == 0 ) scale = gapFaceRing0Scale_;
+        else if( ring == 1 ) scale = gapFaceRing1Scale_;
+        else if( ring == 2 ) scale = gapFaceRing2Scale_;
+        else if( ring == 3 ) scale = gapFaceRing3Scale_;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+            layerScale_[bpI] = Foam::min(layerScale_[bpI], scale);
+        }
+    }
+
+    // Apply protected-side triple-junction taper.
+    // These faces are not topology-suppressed; only local BL height is reduced.
+    label nProtectedTripleR0 = 0;
+    forAll(protectedTripleRing0Face, bfI)
+    {
+        if( !protectedTripleRing0Face[bfI] )
+            continue;
+
+        ++nProtectedTripleR0;
+
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+
+            layerScale_[bpI] =
+                Foam::min(layerScale_[bpI], tripleJunctionProtectedRing0Scale_);
+        }
+    }
+
+    // Diagnostics
+    label nF0=0, nF1=0, nF2=0, nF3=0;
+    forAll(faceRing, bfI)
+    {
+        if(      faceRing[bfI] == 0 ) ++nF0;
+        else if( faceRing[bfI] == 1 ) ++nF1;
+        else if( faceRing[bfI] == 2 ) ++nF2;
+        else if( faceRing[bfI] == 3 ) ++nF3;
+    }
+    Info << "Gap face-ring exclusion:"
+         << " faces(r0=" << nF0 << " r1=" << nF1
+         << " r2=" << nF2 << " r3=" << nF3 << ")"
+         << " scale=(" << gapFaceRing0Scale_
+         << " " << gapFaceRing1Scale_
+         << " " << gapFaceRing2Scale_
+         << " " << gapFaceRing3Scale_ << ")" << endl;
+
+    if( nProtectedTripleR0 > 0 )
+        Info << "Triple-junction protected-side taper:"
+             << " faces=" << nProtectedTripleR0
+             << " scale=" << tripleJunctionProtectedRing0Scale_
+             << endl;
+    // Write edge-based contact line atlas (diagnostic only)
+    writeBLContactLineAtlas();
+
+    // FINAL BL dropout reason atlas -- after ALL layerScale changes.
+    // Includes ramp provenance (blRampRing_, blRampSeedReason_).
+    {
+        const meshSurfaceEngine& mseF = surfaceEngine();
+        const labelList& bPtsF = mseF.boundaryPoints();
+        const pointField& ptsF = mseF.mesh().points();
+        meshSurfacePartitioner mPartF(mseF);
+        const VRWGraph& pPatchesF = mPartF.pointPatches();
+        const PtrList<boundaryPatch>& bndF = mesh_.boundaries();
+        OFstream atlasOsF("blDropoutReasonAtlas.csv");
+        atlasOsF << "bpI,meshPointI,x,y,z,layerScale,"
+                 << "reasonCode,reasonName,"
+                 << "rampRing,rampSeedReason,rampSeedName,"
+                 << "patches" << nl;
+        const char* rnF[] = {
+            "none","gap","transEdge","tripleJunction",
+            "corner","sharpEdge","blblSharp","blNoBLEdge",
+            "periodicNeutral"
+        };
+        label nDumpedF = 0;
+        forAll(bPtsF, bpI)
+        {
+            const scalar ls =
+                (layerScale_.size() > bpI) ? layerScale_[bpI] : scalar(1.0);
+            const label rc =
+                (blSuppressReason_.size() > bpI) ? blSuppressReason_[bpI] : 0;
+            const label rr =
+                (blRampRing_.size() > bpI) ? blRampRing_[bpI] : 0;
+            if( rc == 0 && ls >= 0.99 && rr == 0 ) continue;
+            const label mpI = bPtsF[bpI];
+            const point& pt =
+                (mpI >= 0 && mpI < label(ptsF.size())) ?
+                ptsF[mpI] : point(Zero);
+            word pStr("unknown");
+            if( pPatchesF.sizeOfRow(bpI) > 0 )
+            {
+                pStr = "";
+                labelHashSet seenPF;
+                forAllRow(pPatchesF, bpI, pI)
+                {
+                    const label patchI = pPatchesF(bpI, pI);
+                    if( patchI < 0 || patchI >= label(bndF.size()) ) continue;
+                    if( seenPF.found(patchI) ) continue;
+                    seenPF.insert(patchI);
+                    if( pStr.size() > 0 ) pStr += "+";
+                    pStr += bndF[patchI].patchName();
+                }
+                if( pStr.size() == 0 ) pStr = "unknown";
+            }
+            const label rcC = (rc >= 0 && rc <= 8) ? rc : 0;
+            const label rsc =
+                (blRampSeedReason_.size() > bpI) ? blRampSeedReason_[bpI] : 0;
+            const label rscC = (rsc >= 0 && rsc <= 7) ? rsc : 0;
+            atlasOsF << bpI << ","
+                     << mpI << ","
+                     << pt.x() << ","
+                     << pt.y() << ","
+                     << pt.z() << ","
+                     << ls << ","
+                     << rcC << ","
+                     << rnF[rcC] << ","
+                     << rr << ","
+                     << rscC << ","
+                     << rnF[rscC] << ","
+                     << pStr << nl;
+            ++nDumpedF;
+        }
+        Info << "BL dropout reason atlas (final): wrote " << nDumpedF
+             << " points to blDropoutReasonAtlas.csv" << endl;
+    }
+}
+
+void boundaryLayers::reportBLTransitionSeeds() const
+{
+    Info << "BL transition seed summary:" << nl
+         << "  gap points:                    " << gapPoints_.size() << nl
+         << "  triple-junction points:        " << tripleJunctionPoints_.size() << nl
+         << "  tripleJunctionFaceRingExclusion: "
+         << (tripleJunctionFaceRingExclusion_ ? "true" : "false")
+         << endl;
+}
+
+void boundaryLayers::buildBLTransitionPlan() const
+{
+    // Diagnostic only -- computes and reports ring face counts by patch.
+    // No topology mutation.
+    if( gapPoints_.size() == 0 && tripleJunctionPoints_.size() == 0 )
+    {
+        Info << "BL transition planner: no seeds, skipping" << endl;
+        return;
+    }
+
+    const meshSurfaceEngine& mse = surfaceEngine();
+    const labelList& bPoints        = mse.boundaryPoints();
+    const faceList::subList& bFaces = mse.boundaryFaces();
+    const VRWGraph& pointFaces      = mse.pointFaces();
+    const labelList& facePatch      = mse.boundaryFacePatches();
+
+    const label nBP = bPoints.size();
+    const label nBF = bFaces.size();
+
+    labelList meshToBnd(mesh_.points().size(), -1);
+    forAll(bPoints, bpI)
+        meshToBnd[bPoints[bpI]] = bpI;
+
+    labelList faceRing(nBF, -1);
+
+    auto seedRing0 = [&](const labelHashSet& seedPts)
+    {
+        forAllConstIter(labelHashSet, seedPts, it)
+        {
+            const label meshPtI = it.key();
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI < 0 || bpI >= nBP ) continue;
+            forAllRow(pointFaces, bpI, pfI)
+            {
+                const label bfI = pointFaces(bpI, pfI);
+                if( bfI < 0 || bfI >= nBF ) continue;
+                faceRing[bfI] = 0;
+            }
+        }
+    };
+    seedRing0(gapPoints_);
+    seedRing0(tripleJunctionPoints_);
+
+    // Ring 1
+    boolList ring0pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 0 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring0pt[bpI] = true;
+        }
+    }
+    forAll(ring0pt, bpI)
+    {
+        if( !ring0pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 1;
+        }
+    }
+
+    // Ring 2
+    boolList ring1pt(nBP, false);
+    forAll(faceRing, bfI)
+    {
+        if( faceRing[bfI] != 1 ) continue;
+        const face& f = bFaces[bfI];
+        forAll(f, pI)
+        {
+            const label meshPtI = f[pI];
+            if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+            const label bpI = meshToBnd[meshPtI];
+            if( bpI >= 0 && bpI < nBP ) ring1pt[bpI] = true;
+        }
+    }
+    forAll(ring1pt, bpI)
+    {
+        if( !ring1pt[bpI] ) continue;
+        forAllRow(pointFaces, bpI, pfI)
+        {
+            const label bfI = pointFaces(bpI, pfI);
+            if( bfI < 0 || bfI >= nBF ) continue;
+            if( faceRing[bfI] >= 0 ) continue;
+            faceRing[bfI] = 2;
+        }
+    }
+
+    // Count by ring and patch
+    const PtrList<boundaryPatch>& boundaries = mesh_.boundaries();
+    const label nPatches = boundaries.size();
+    List<label> patchR0(nPatches, 0);
+    List<label> patchR1(nPatches, 0);
+    List<label> patchR2(nPatches, 0);
+    label nF0=0, nF1=0, nF2=0;
+
+    forAll(faceRing, bfI)
+    {
+        const label ring = faceRing[bfI];
+        const label pI   = facePatch[bfI];
+        if( ring == 0 )
+        {
+            ++nF0;
+            if( pI >= 0 && pI < nPatches ) ++patchR0[pI];
+        }
+        else if( ring == 1 )
+        {
+            ++nF1;
+            if( pI >= 0 && pI < nPatches ) ++patchR1[pI];
+        }
+        else if( ring == 2 )
+        {
+            ++nF2;
+            if( pI >= 0 && pI < nPatches ) ++patchR2[pI];
+        }
+    }
+
+    Info << "BL transition planner (diagnostic -- no mutation):" << nl
+         << "  ring0 suppress faces: " << nF0 << nl
+         << "  ring1 cap-to-1 faces: " << nF1 << nl
+         << "  ring2 cap-to-2 faces: " << nF2 << nl
+         << "  per-patch breakdown:" << endl;
+    forAll(boundaries, pI)
+    {
+        if( patchR0[pI] + patchR1[pI] + patchR2[pI] == 0 ) continue;
+        Info << "    " << boundaries[pI].patchName()
+             << ": r0=" << patchR0[pI]
+             << " r1=" << patchR1[pI]
+             << " r2=" << patchR2[pI] << nl;
+    }
+    Info << "  (tripleJunctionFaceRingExclusion="
+         << (tripleJunctionFaceRingExclusion_ ? "true" : "false")
+         << " -- topology unchanged)" << endl;
+}
+
+void boundaryLayers::reportBLPlanningPerPatch() const
+{
+    const meshSurfaceEngine& mse = surfaceEngine();
+
+    const labelList& bPoints        = mse.boundaryPoints();
+    const faceList::subList& bFaces = mse.boundaryFaces();
+    const labelList& facePatch      = mse.boundaryFacePatches();
+
+    const label nBP = bPoints.size();
+
+    // Reverse map mesh point -> boundary point
+    labelList meshToBnd(mesh_.points().size(), -1);
+    forAll(bPoints, bpI)
+    {
+        const label meshPtI = bPoints[bpI];
+        if( meshPtI >= 0 && meshPtI < label(meshToBnd.size()) )
+            meshToBnd[meshPtI] = bpI;
+    }
+
+    // Build gap and triple-junction boundary-point sets.
+    // Use gapZonePoints_ (symmetric, both sides) for transition classification
+    // so the full geometric danger zone is visible to the transition detector.
+    // Fall back to gapPoints_ if no zone points available (legacy behavior).
+    boolList isGapPoint(nBP, false);
+    const labelHashSet& zoneSet =
+        gapZonePoints_.size() > 0 ? gapZonePoints_ : gapPoints_;
+    forAllConstIter(labelHashSet, zoneSet, it)
+    {
+        const label meshPtI = it.key();
+        if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+
+        const label bpI = meshToBnd[meshPtI];
+        if( bpI >= 0 && bpI < nBP )
+            isGapPoint[bpI] = true;
+    }
+
+    boolList isTriplePoint(nBP, false);
+    forAllConstIter(labelHashSet, tripleJunctionPoints_, it)
+    {
+        const label meshPtI = it.key();
+        if( meshPtI < 0 || meshPtI >= label(meshToBnd.size()) ) continue;
+
+        const label bpI = meshToBnd[meshPtI];
+        if( bpI >= 0 && bpI < nBP )
+            isTriplePoint[bpI] = true;
+    }
+
+    const PtrList<boundaryPatch>& boundaries = mesh_.boundaries();
+    const label nPatches = boundaries.size();
+
+    List<label> nPtTotal(nPatches, 0);
+    List<label> nMultiPatchPts(nPatches, 0);
+    List<label> nScale0(nPatches, 0);
+    List<label> nScale002(nPatches, 0);
+    List<label> nScale005(nPatches, 0);
+    List<label> nScaleLt1(nPatches, 0);
+    List<label> nGapSup(nPatches, 0);
+    List<label> nTripleSup(nPatches, 0);
+
+    List<label> nFaceTotal(nPatches, 0);
+    List<label> nFaceSup(nPatches, 0);
+
+    // Multi-patch ownership is exactly what we are debugging.
+    // Count each boundary point against every patch it belongs to, not
+    // only pPatches(bpI,0), otherwise blade/hub/periodic junctions are hidden.
+    const meshSurfacePartitioner mPart(mse);
+    const VRWGraph& pPatches = mPart.pointPatches();
+
+    forAll(bPoints, bpI)
+    {
+        const scalar sc =
+            layerScale_.size() > bpI ? layerScale_[bpI] : scalar(1.0);
+
+        const bool isMultiPatch = pPatches.sizeOfRow(bpI) > 1;
+
+        forAllRow(pPatches, bpI, ppi)
+        {
+            const label pI = pPatches(bpI, ppi);
+            if( pI < 0 || pI >= nPatches ) continue;
+
+            ++nPtTotal[pI];
+
+            if( isMultiPatch )
+                ++nMultiPatchPts[pI];
+
+            if( sc <= 0.0 )       ++nScale0[pI];
+            if( sc <= scalar(0.02) ) ++nScale002[pI];
+            if( sc <= scalar(0.05) ) ++nScale005[pI];
+            if( sc <  scalar(1.0) )  ++nScaleLt1[pI];
+
+            if( isGapPoint[bpI] )
+                ++nGapSup[pI];
+
+            if( isTriplePoint[bpI] )
+                ++nTripleSup[pI];
+        }
+    }
+
+    forAll(bFaces, bfI)
+    {
+        if( bfI < 0 || bfI >= label(facePatch.size()) ) continue;
+
+        const label pI = facePatch[bfI];
+        if( pI < 0 || pI >= nPatches ) continue;
+
+        ++nFaceTotal[pI];
+
+        if( suppressLayerAtBndFace_.size() > bfI
+         && suppressLayerAtBndFace_[bfI] )
+        {
+            ++nFaceSup[pI];
+        }
+    }
+
+    Info << "BL planning per-patch audit:" << nl;
+
+    forAll(boundaries, pI)
+    {
+        if( nPtTotal[pI] == 0 && nFaceTotal[pI] == 0 )
+            continue;
+
+        const label nLayers =
+            pI < label(nLayersForPatch_.size()) ? nLayersForPatch_[pI] : -1;
+
+        Info << "  " << boundaries[pI].patchName() << ":" << nl
+             << "    nLayers=" << nLayers
+             << " points total=" << nPtTotal[pI]
+             << " multiPatchPts=" << nMultiPatchPts[pI]
+             << " scale0=" << nScale0[pI]
+             << " scale<=0.02=" << nScale002[pI]
+             << " scale<=0.05=" << nScale005[pI]
+             << " scale<1=" << nScaleLt1[pI]
+             << " gapPts=" << nGapSup[pI]
+             << " triplePts=" << nTripleSup[pI] << nl
+             << "    faces total=" << nFaceTotal[pI]
+             << " faceSup=" << nFaceSup[pI] << nl;
+    }
 }
 
 void boundaryLayers::activate2DMode()
@@ -1021,8 +3303,102 @@ void boundaryLayers::addLayerForAllPatches()
             if( !treatedPatch_[i] )
                 treatedPatches[counter++] = i;
 
+        //- per-patch BL planning audit before vertex creation
+        reportBLPlanningPerPatch();
+
+        //- suppress faces whose multi-patch singular points would produce
+        //- zero-thickness extrusion before constructing the BL vertex graph
+        suppressFailedSingularityExtrusions(treatedPatches);
+
+        //- audit again after singularity suppression
+        reportBLPlanningPerPatch();
+
         //- create bnd layer vertices
         createNewVertices(treatedPatches);
+
+        //- ---- BLVERTEX_AUDIT (report-only): top-vertex existence per patch ----
+        //- Column 2 of requested -> topVertexExists -> cellExists.
+        //- regularComplete: every base point has newLabelForVertex_>=0 (valid).
+        //- otherDependent : >=1 point lacked a regular top but had otherVrts_ state.
+        //- missing        : >=1 point had neither, or an out-of-range label.
+        //- coincident     : all regular tops exist but are exactly coincident (newP==p).
+        {
+            const meshSurfaceEngine& mseVA = surfaceEngine();
+            const faceList::subList& bFacesVA = mseVA.boundaryFaces();
+            const labelList& fPatchVA = mseVA.boundaryFacePatches();
+            const pointFieldPMG& ptsVA = mesh_.points();
+            const PtrList<boundaryPatch>& bndVA = mesh_.boundaries();
+            const label nPVA = bndVA.size();
+            labelList vaTot(nPVA,0), vaRegular(nPVA,0), vaOther(nPVA,0),
+                      vaMissing(nPVA,0), vaCoincident(nPVA,0);
+            forAll(bFacesVA, bfI)
+            {
+                const label pat = fPatchVA[bfI];
+                if( pat < 0 || pat >= nPVA ) continue;
+                ++vaTot[pat];
+                const face& f = bFacesVA[bfI];
+                bool allHaveSomeTop = true;
+                bool allHaveRegularTop = true;
+                bool usesOther = false;
+                bool allCoincident = true;
+                forAll(f, fpI)
+                {
+                    const label pointI = f[fpI];
+                    label topI = -1;
+                    if( pointI >= 0 && pointI < label(newLabelForVertex_.size()) )
+                        topI = newLabelForVertex_[pointI];
+                    const bool hasOther =
+                        ( otherVrts_.find(pointI) != otherVrts_.end() );
+                    if( topI < 0 )
+                    {
+                        allHaveRegularTop = false;
+                        if( hasOther )
+                        {
+                            usesOther = true;
+                            allCoincident = false;
+                        }
+                        else
+                        {
+                            allHaveSomeTop = false;
+                            allCoincident = false;
+                            break;
+                        }
+                    }
+                    else if( topI < label(ptsVA.size()) )
+                    {
+                        const scalar mv = mag(ptsVA[topI] - ptsVA[pointI]);
+                        if( mv > 100.0*VSMALL ) allCoincident = false;
+                    }
+                    else
+                    {
+                        //- mapping exists but target label is out of range: invalid
+                        allHaveSomeTop = false;
+                        allHaveRegularTop = false;
+                        allCoincident = false;
+                        break;
+                    }
+                }
+                if( !allHaveSomeTop ) { ++vaMissing[pat]; }
+                else if( allHaveRegularTop )
+                {
+                    ++vaRegular[pat];
+                    if( allCoincident ) ++vaCoincident[pat];
+                }
+                else if( usesOther ) { ++vaOther[pat]; }
+                else { ++vaMissing[pat]; }
+            }
+            Info << "BLVERTEX_AUDIT (top-vertex existence, post-createNewVertices)" << endl;
+            forAll(bndVA, p)
+            {
+                Info << "  " << bndVA[p].patchName()
+                     << ": totalFaces=" << vaTot[p]
+                     << " regularCompleteFaces=" << vaRegular[p]
+                     << " otherDependentFaces=" << vaOther[p]
+                     << " missingTopFaces=" << vaMissing[p]
+                     << " coincidentFaces=" << vaCoincident[p] << endl;
+            }
+        }
+        //- ---- end BLVERTEX_AUDIT ----
 
         //- create bnd layer cells
         createLayerCells(treatedPatches);

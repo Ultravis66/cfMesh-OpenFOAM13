@@ -27,6 +27,7 @@ Description
 
 #include "meshSurfaceEngineModifier.H"
 #include "polyMeshGenModifier.H"
+#include "polyMeshGenAddressing.H"
 #include "demandDrivenData.H"
 
 #include "labelledPoint.H"
@@ -64,6 +65,226 @@ meshSurfaceEngineModifier::~meshSurfaceEngineModifier()
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+scalar meshSurfaceEngineModifier::rawCellVolumeWithPoint
+(
+    const label cellI,
+    const label movedGlobalPtI,
+    const point& candidate,
+    const bool substituteCandidate
+) const
+{
+    const polyMeshGen& mesh = surfaceEngine_.mesh_;
+
+    const pointFieldPMG& points = mesh.points();
+    const faceListPMG& faces = mesh.faces();
+    const cellListPMG& cells = mesh.cells();
+    const labelList& owner = mesh.owner();
+
+    const cell& c = cells[cellI];
+
+    List<point> localFCentres(c.size());
+    List<vector> localFAreas(c.size());
+
+    vector cEst = vector::zero;
+
+    forAll(c, cfI)
+    {
+        const label faceI = c[cfI];
+        const face& f = faces[faceI];
+
+        auto pt =
+        [&]
+        (
+            const label ptI
+        ) -> point
+        {
+            if
+            (
+                substituteCandidate &&
+                ptI == movedGlobalPtI
+            )
+            {
+                return candidate;
+            }
+
+            return point(points[ptI]);
+        };
+
+        point fCtr;
+        vector fArea;
+
+        const label nPoints = f.size();
+
+        if( nPoints == 3 )
+        {
+            const point p0 = pt(f[0]);
+            const point p1 = pt(f[1]);
+            const point p2 = pt(f[2]);
+
+            fCtr = (1.0/3.0)*(p0 + p1 + p2);
+            fArea = 0.5*((p1 - p0)^(p2 - p0));
+        }
+        else
+        {
+            vector sumN = vector::zero;
+            scalar sumA = 0.0;
+            vector sumAc = vector::zero;
+
+            point fCentre = pt(f[0]);
+
+            for(label pi=1; pi<nPoints; ++pi)
+            {
+                fCentre += pt(f[pi]);
+            }
+
+            fCentre /= nPoints;
+
+            for(label pi=0; pi<nPoints; ++pi)
+            {
+                const point curPoint = pt(f[pi]);
+                const point nextPoint = pt(f.nextLabel(pi));
+
+                const vector fc3 =
+                    curPoint + nextPoint + fCentre;
+
+                const vector n =
+                    (nextPoint - curPoint)^
+                    (fCentre - curPoint);
+
+                const scalar a = mag(n);
+
+                sumN += n;
+                sumA += a;
+                sumAc += a*fc3;
+            }
+
+            fCtr =
+                (1.0/3.0)*sumAc/(sumA + VSMALL);
+
+            fArea = 0.5*sumN;
+        }
+
+        localFCentres[cfI] = fCtr;
+        localFAreas[cfI] = fArea;
+
+        cEst += fCtr;
+    }
+
+    cEst /= scalar(c.size());
+
+    scalar cellVol = 0.0;
+
+    forAll(c, cfI)
+    {
+        const label faceI = c[cfI];
+
+        scalar pyr3Vol =
+            localFAreas[cfI] &
+            (localFCentres[cfI] - cEst);
+
+        if( owner[faceI] != cellI )
+        {
+            pyr3Vol *= -1.0;
+        }
+
+        cellVol += pyr3Vol;
+    }
+
+    return cellVol/3.0;
+}
+
+
+bool meshSurfaceEngineModifier::candidatePreservesPositiveCellVolumes
+(
+    const label bpI,
+    const point& candidate,
+    bool& touchesExistingBad,
+    scalar& minPositiveRatio
+) const
+{
+    touchesExistingBad = false;
+    minPositiveRatio = GREAT;
+
+    const polyMeshGen& mesh = surfaceEngine_.mesh_;
+    const labelList& boundaryPoints =
+        surfaceEngine_.boundaryPoints();
+
+    if( bpI < 0 || bpI >= boundaryPoints.size() )
+    {
+        return false;
+    }
+
+    const label globalPtI = boundaryPoints[bpI];
+
+    const VRWGraph& pointCells =
+        mesh.addressingData().pointCells();
+
+    if
+    (
+        globalPtI < 0 ||
+        globalPtI >= pointCells.size() ||
+        pointCells.sizeOfRow(globalPtI) == 0
+    )
+    {
+        return false;
+    }
+
+    forAllRow(pointCells, globalPtI, pcI)
+    {
+        const label cellI =
+            pointCells(globalPtI, pcI);
+
+        const scalar oldVol =
+            rawCellVolumeWithPoint
+            (
+                cellI,
+                globalPtI,
+                candidate,
+                false
+            );
+
+        const scalar newVol =
+            rawCellVolumeWithPoint
+            (
+                cellI,
+                globalPtI,
+                candidate,
+                true
+            );
+
+        if( oldVol < VSMALL )
+        {
+            touchesExistingBad = true;
+        }
+
+        if
+        (
+            oldVol >= VSMALL &&
+            newVol < VSMALL
+        )
+        {
+            return false;
+        }
+
+        if
+        (
+            oldVol >= VSMALL &&
+            newVol >= VSMALL
+        )
+        {
+            minPositiveRatio =
+                Foam::min
+                (
+                    minPositiveRatio,
+                    newVol/(oldVol + VSMALL)
+                );
+        }
+    }
+
+    return true;
+}
+
+
 void meshSurfaceEngineModifier::moveBoundaryVertexNoUpdate
 (
     const label bpI,
@@ -95,6 +316,11 @@ void meshSurfaceEngineModifier::moveBoundaryVertex
 
             {
                 const face& bf = bFaces[bfI];
+                if( bf.empty() )
+                {
+                    faceCentres[bfI] = vector::zero;
+                    continue;
+                }
                 vector c = vector::zero;
                 forAll(bf, pI) c += points[bf[pI]];
                 faceCentres[bfI] = c / bf.size();
@@ -114,6 +340,11 @@ void meshSurfaceEngineModifier::moveBoundaryVertex
 
             {
                 const face& bf = bFaces[bfI];
+                if( bf.size() < 3 )
+                {
+                    faceNormals[bfI] = vector::zero;
+                    continue;
+                }
                 vector n = vector::zero;
                 const point& p0 = points[bf[0]];
                 for(label pI=1; pI<bf.size()-1; ++pI)
@@ -123,7 +354,7 @@ void meshSurfaceEngineModifier::moveBoundaryVertex
         }
     }
 
-    if( surfaceEngine_.pointNormalsPtr_ )
+    if( surfaceEngine_.pointNormalsPtr_ && surfaceEngine_.faceNormalsPtr_ )
     {
         const vectorField& faceNormals = *surfaceEngine_.faceNormalsPtr_;
         const VRWGraph& pFaces = surfaceEngine_.pointFaces();
@@ -236,6 +467,9 @@ void meshSurfaceEngineModifier::syncVerticesAtParallelBoundaries
     forAll(receivedData, i)
     {
         const labelledPoint& lp = receivedData[i];
+        if( !globalToLocal.found(lp.pointLabel()) )
+            continue;
+        if( !globalToLocal.found(lp.pointLabel()) ) continue;
         const label bpI = globalToLocal[lp.pointLabel()];
         const point newP = points[bPoints[bpI]] + lp.coordinates();
         moveBoundaryVertexNoUpdate(bpI, newP);
@@ -253,9 +487,7 @@ void meshSurfaceEngineModifier::updateGeometry
     const labelList& bp = surfaceEngine_.bp();
 
     boolList updateFaces(bFaces.size(), false);
-    # ifdef USE_OMP
-    # pragma omp parallel for if( updateBndNodes.size() > 1000 )
-    # endif
+    // Serial: multiple bpI share faces -- updateFaces[...]=true races
     forAll(updateBndNodes, i)
     {
         const label bpI = updateBndNodes[i];
@@ -274,8 +506,13 @@ void meshSurfaceEngineModifier::updateGeometry
         forAll(updateFaces, bfI)
         {
             if( updateFaces[bfI] )
-                {
+            {
                 const face& bf = bFaces[bfI];
+                if( bf.empty() )
+                {
+                    faceCentres[bfI] = vector::zero;
+                    continue;
+                }
                 vector c = vector::zero;
                 forAll(bf, pI) c += points[bf[pI]];
                 faceCentres[bfI] = c / bf.size();
@@ -294,8 +531,13 @@ void meshSurfaceEngineModifier::updateGeometry
         forAll(updateFaces, bfI)
         {
             if( updateFaces[bfI] )
-                {
+            {
                 const face& bf = bFaces[bfI];
+                if( bf.size() < 3 )
+                {
+                    faceNormals[bfI] = vector::zero;
+                    continue;
+                }
                 vector n = vector::zero;
                 const point& p0 = points[bf[0]];
                 for(label pI=1; pI<bf.size()-1; ++pI)
@@ -310,9 +552,7 @@ void meshSurfaceEngineModifier::updateGeometry
         const vectorField& faceNormals = surfaceEngine_.faceNormals();
 
         boolList updateBndPoint(pFaces.size(), false);
-        # ifdef USE_OMP
-        # pragma omp parallel for schedule(dynamic, 50)
-        # endif
+        // Serial: multiple bpI share face points -- updateBndPoint[...]=true races
         forAll(updateBndNodes, i)
         {
             const label bpI = updateBndNodes[i];
@@ -322,7 +562,11 @@ void meshSurfaceEngineModifier::updateGeometry
                 const face& bf = bFaces[pFaces(bpI, pfI)];
 
                 forAll(bf, pI)
-                    updateBndPoint[bp[bf[pI]]] = true;
+                {
+                    const label bpJ = bp[bf[pI]];
+                    if( bpJ >= 0 )
+                        updateBndPoint[bpJ] = true;
+                }
             }
         }
 
@@ -387,7 +631,12 @@ void meshSurfaceEngineModifier::updateGeometry
             help::exchangeMap(exchangeNodeLabels, receivedNodes);
 
             forAll(receivedNodes, i)
+            {
+                if( !globalToLocal.found(receivedNodes[i]) )
+                    continue;
+                if( !globalToLocal.found(receivedNodes[i]) ) continue;
                 updateBndPoint[globalToLocal[receivedNodes[i]]] = true;
+            }
 
 
             //- start updating point normals
@@ -425,6 +674,9 @@ void meshSurfaceEngineModifier::updateGeometry
 
             forAll(receivedData, i)
             {
+                if( !globalToLocal.found(receivedData[i].pointLabel()) )
+                    continue;
+                if( !globalToLocal.found(receivedData[i].pointLabel()) ) continue;
                 const label bpI = globalToLocal[receivedData[i].pointLabel()];
                 pn[bpI] += receivedData[i].coordinates();
             }
@@ -452,6 +704,69 @@ void meshSurfaceEngineModifier::updateGeometry
             }
         }
     }
+    // Keep polyMeshGenAddressing geometry coherent with point motion.
+    //
+    // meshSurfaceEngine owns a separate set of geometry caches, updated
+    // above.  polyMeshGenAddressing may also already contain cached
+    // face centres/areas and cell centres/volumes.  If that demand-driven
+    // object exists, update every FULL-MESH face incident to each moved
+    // global mesh point.  Do not instantiate addressing solely for this
+    // update.
+    polyMeshGen& mesh = surfaceEngine_.mesh_;
+
+    if( mesh.hasAddressingData() )
+    {
+        const polyMeshGenAddressing& addressing =
+            mesh.addressingData();
+
+        const VRWGraph& meshPointFaces =
+            addressing.pointFaces();
+
+        const labelList& bPoints =
+            surfaceEngine_.boundaryPoints();
+
+        boolList changedFace(mesh.faces().size(), false);
+
+        forAll(updateBndNodes, i)
+        {
+            const label bpI = updateBndNodes[i];
+
+            if( bpI < 0 || bpI >= bPoints.size() )
+                continue;
+
+            const label globalPtI = bPoints[bpI];
+
+            if
+            (
+                globalPtI < 0 ||
+                globalPtI >= meshPointFaces.size()
+            )
+            {
+                continue;
+            }
+
+            forAllRow(meshPointFaces, globalPtI, pfI)
+            {
+                const label faceI =
+                    meshPointFaces(globalPtI, pfI);
+
+                if
+                (
+                    faceI >= 0 &&
+                    faceI < changedFace.size()
+                )
+                {
+                    changedFace[faceI] = true;
+                }
+            }
+        }
+
+        const_cast<polyMeshGenAddressing&>
+        (
+            addressing
+        ).updateGeometry(changedFace);
+    }
+
 }
 
 void meshSurfaceEngineModifier::updateGeometry()

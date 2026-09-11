@@ -31,6 +31,7 @@ Description
 #include "VRWGraphList.H"
 #include "polyMeshGenAddressing.H"
 #include "helperFunctions.H"
+#include "meshOctree.H"
 
 #include <map>
 
@@ -62,7 +63,12 @@ partTetMesh::partTetMesh(polyMeshGen& mesh, const labelLongList& lockedPoints)
     globalToLocalPointAddressingPtr_(NULL),
     neiProcsPtr_(NULL),
     pAtParallelBoundariesPtr_(NULL),
-    pAtBufferLayersPtr_(NULL)
+    pAtBufferLayersPtr_(NULL),
+    surfaceOctreePtr_(NULL),
+    bndPointPatchesPtr_(NULL),
+    globalToBoundaryPointPtr_(NULL),
+    featureCornerPointsPtr_(NULL),
+    featureCurveTangentsPtr_(NULL)
 {
     List<direction> useCell(mesh.cells().size(), direction(1));
 
@@ -93,7 +99,12 @@ partTetMesh::partTetMesh
     globalToLocalPointAddressingPtr_(NULL),
     neiProcsPtr_(NULL),
     pAtParallelBoundariesPtr_(NULL),
-    pAtBufferLayersPtr_(NULL)
+    pAtBufferLayersPtr_(NULL),
+    surfaceOctreePtr_(NULL),
+    bndPointPatchesPtr_(NULL),
+    globalToBoundaryPointPtr_(NULL),
+    featureCornerPointsPtr_(NULL),
+    featureCurveTangentsPtr_(NULL)
 {
     const faceListPMG& faces = mesh.faces();
     const cellListPMG& cells = mesh.cells();
@@ -181,6 +192,7 @@ partTetMesh::partTetMesh
 
             forAll(receivedData, i)
             {
+                if( !globalToLocal.found(receivedData[i]) ) continue;
                 const label pointI = globalToLocal[receivedData[i]];
 
                 forAllRow(pointCells, pointI, pcI)
@@ -221,7 +233,12 @@ partTetMesh::partTetMesh
     globalToLocalPointAddressingPtr_(NULL),
     neiProcsPtr_(NULL),
     pAtParallelBoundariesPtr_(NULL),
-    pAtBufferLayersPtr_(NULL)
+    pAtBufferLayersPtr_(NULL),
+    surfaceOctreePtr_(NULL),
+    bndPointPatchesPtr_(NULL),
+    globalToBoundaryPointPtr_(NULL),
+    featureCornerPointsPtr_(NULL),
+    featureCurveTangentsPtr_(NULL)
 {
     const faceListPMG& faces = mesh.faces();
     const cellListPMG& cells = mesh.cells();
@@ -308,6 +325,7 @@ partTetMesh::partTetMesh
 
             forAll(receivedData, i)
             {
+                if( !globalToLocal.found(receivedData[i]) ) continue;
                 const label pointI = globalToLocal[receivedData[i]];
 
                 forAllRow(pointCells, pointI, pcI)
@@ -337,6 +355,22 @@ partTetMesh::~partTetMesh()
     deleteDemandDrivenData(neiProcsPtr_);
     deleteDemandDrivenData(pAtParallelBoundariesPtr_);
     deleteDemandDrivenData(pAtBufferLayersPtr_);
+}
+
+void partTetMesh::setSurfaceConstraint
+(
+    const meshOctree* octreePtr,
+    const VRWGraph* bndPointPatchesPtr,
+    const labelLongList* globalToBoundaryPointPtr,
+    const labelHashSet* featureCornerPointsPtr,
+    const vectorField* featureCurveTangentsPtr
+)
+{
+    surfaceOctreePtr_ = octreePtr;
+    bndPointPatchesPtr_ = bndPointPatchesPtr;
+    globalToBoundaryPointPtr_ = globalToBoundaryPointPtr;
+    featureCornerPointsPtr_ = featureCornerPointsPtr;
+    featureCurveTangentsPtr_ = featureCurveTangentsPtr;
 }
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -465,21 +499,32 @@ void partTetMesh::updateVerticesSMP(const List<LongList<labelledPoint> >& np)
         const LongList<labelledPoint>& newPoints = np[0];
         # endif
 
+        // Point writes: each pointI is unique per thread list -- safe
         forAll(newPoints, i)
+            points_[newPoints[i].pointLabel()] = newPoints[i].coordinates();
+
+        // Serial: updateType |= races on shared tet centre nodes.
+        // One thread scans all thread lists to build updateType safely.
+        # ifdef USE_OMP
+        # pragma omp barrier
+        # pragma omp single
+        # endif
         {
-            const labelledPoint& lp = newPoints[i];
-            const label pointI = lp.pointLabel();
-
-            points_[pointI] = lp.coordinates();
-
-            forAllRow(pointTets_, pointI, ptI)
+            forAll(np, threadI)
             {
-                const partTet& pt = tets_[pointTets_(pointI, ptI)];
-
-                if( smoothVertex_[pt[3]] & CELLCENTRE )
-                    updateType[pt[3]] |= CELLCENTRE;
-                if( smoothVertex_[pt[2]] & FACECENTRE )
-                    updateType[pt[2]] |= FACECENTRE;
+                const LongList<labelledPoint>& tpts = np[threadI];
+                forAll(tpts, i)
+                {
+                    const label pointI = tpts[i].pointLabel();
+                    forAllRow(pointTets_, pointI, ptI)
+                    {
+                        const partTet& pt = tets_[pointTets_(pointI, ptI)];
+                        if( smoothVertex_[pt[3]] & CELLCENTRE )
+                            updateType[pt[3]] |= CELLCENTRE;
+                        if( smoothVertex_[pt[2]] & FACECENTRE )
+                            updateType[pt[2]] |= FACECENTRE;
+                    }
+                }
             }
         }
 
@@ -538,16 +583,135 @@ void partTetMesh::updateOrigMesh(boolList* changedFacePtr)
 
     boolList changedNode(pts.size(), false);
 
-    # ifdef USE_OMP
-    # pragma omp parallel for if( pts.size() > 1000 ) \
-    schedule(guided, 10)
-    # endif
-    forAll(nodeLabelInOrigMesh_, pI)
-        if( nodeLabelInOrigMesh_[pI] != -1 )
+    if( surfaceOctreePtr_ && bndPointPatchesPtr_ && globalToBoundaryPointPtr_ )
+    {
+        // Two-phase constrained write-back:
+        // Phase 1 (serial): query octree for drifted boundary points,
+        //   compute limited target positions. Serial to avoid OMP races
+        //   on mutable octree caches.
+        // Phase 2 (parallel): apply precomputed targets and mark changed nodes.
+        const label nNodes = nodeLabelInOrigMesh_.size();
+        LongList<point> targetPoints(nNodes);
+        const scalar constraintTolSq = sqr(scalar(1e-5));
+        const scalar stepFraction = 0.01;
+
+        // Phase 1: serial octree queries
+        label nConstrained = 0;
+        label nLockedCorners = 0;
+        label nFeatureProjected = 0;
+        const pointFieldPMG& origPts = origMesh_.points();
+
+        forAll(nodeLabelInOrigMesh_, pI)
         {
-            changedNode[nodeLabelInOrigMesh_[pI]] = true;
-            pts[nodeLabelInOrigMesh_[pI]] = points_[pI];
+            const label globalPointI = nodeLabelInOrigMesh_[pI];
+            point newP = points_[pI];
+
+            if( globalPointI != -1
+             && (smoothVertex_[pI] & BOUNDARY)
+             && globalPointI < globalToBoundaryPointPtr_->size() )
+            {
+                const label bpI = (*globalToBoundaryPointPtr_)[globalPointI];
+
+                if( bpI >= 0
+                 && bpI < label(bndPointPatchesPtr_->size()) )
+                {
+                    if( featureCornerPointsPtr_
+                     && featureCornerPointsPtr_->found(bpI) )
+                    {
+                        // 0D constraint: keep feature corners fixed.
+                        newP = origPts[globalPointI];
+                        ++nLockedCorners;
+                    }
+                    else
+                    {
+                        bool tangentFiltered = false;
+
+                        if( featureCurveTangentsPtr_
+                         && bpI < label(featureCurveTangentsPtr_->size()) )
+                        {
+                            const vector& t = (*featureCurveTangentsPtr_)[bpI];
+
+                            if( magSqr(t) > VSMALL )
+                            {
+                                // 1D constraint: preserve only optimizer motion
+                                // along the local feature-curve tangent.
+                                const point oldP = origPts[globalPointI];
+                                const vector disp = newP - oldP;
+                                newP = oldP + (disp & t) * t;
+                                tangentFiltered = true;
+                                ++nFeatureProjected;
+                            }
+                        }
+
+                        if( !tangentFiltered
+                         && bndPointPatchesPtr_->sizeOfRow(bpI) == 1 )
+                        {
+                            // 2D constraint: existing limited projection back
+                            // toward the owning patch surface.
+                            const label patchI = (*bndPointPatchesPtr_)(bpI, 0);
+                            point projectedP;
+                            scalar dSq;
+                            label nearestTri;
+                            surfaceOctreePtr_->findNearestSurfacePointInRegion
+                            (
+                                projectedP,
+                                dSq,
+                                nearestTri,
+                                patchI,
+                                newP
+                            );
+
+                            if( dSq > constraintTolSq )
+                            {
+                                newP = newP + stepFraction * (projectedP - newP);
+                                ++nConstrained;
+                            }
+                        }
+                    }
+                }
+            }
+
+            targetPoints[pI] = newP;
         }
+
+        if( nLockedCorners > 0 )
+            Info << "Feature-curve locking: locked "
+                 << nLockedCorners << " corner points" << endl;
+
+        if( nFeatureProjected > 0 )
+            Info << "Feature-curve locking: tangent-filtered "
+                 << nFeatureProjected << " edge points" << endl;
+
+        if( nConstrained > 0 )
+            Info << "Surface-constrained updateOrigMesh: corrected "
+                 << nConstrained << " boundary points" << endl;
+
+        // Phase 2: parallel write-back using precomputed targets
+        # ifdef USE_OMP
+        # pragma omp parallel for if( nNodes > 1000 )         schedule(guided, 10)
+        # endif
+        forAll(nodeLabelInOrigMesh_, pI)
+        {
+            const label globalPointI = nodeLabelInOrigMesh_[pI];
+            if( globalPointI == -1 )
+                continue;
+            changedNode[globalPointI] = true;
+            pts[globalPointI] = targetPoints[pI];
+        }
+    }
+    else
+    {
+        # ifdef USE_OMP
+        # pragma omp parallel for if( pts.size() > 1000 ) \
+        schedule(guided, 10)
+        # endif
+        forAll(nodeLabelInOrigMesh_, pI)
+            if( nodeLabelInOrigMesh_[pI] != -1 )
+            {
+                changedNode[nodeLabelInOrigMesh_[pI]] = true;
+                pts[nodeLabelInOrigMesh_[pI]] = points_[pI];
+            }
+    }
 
     if( changedFacePtr )
     {

@@ -77,6 +77,9 @@ public:
             const short procNo = ALLPROCS
         );
 
+    //- Copy construct
+    inline meshOctreeCubeBasic(const meshOctreeCubeBasic&) = default;
+
     // Destructor
 
         ~meshOctreeCubeBasic()

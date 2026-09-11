@@ -36,6 +36,7 @@ Description
 #include <omp.h>
 # endif
 
+
 #ifdef DEBUGExtrudeLayer
 #include "polyMeshGenChecks.H"
 #endif
@@ -109,9 +110,8 @@ void extrudeLayer::createDuplicateFrontFaces(const LongList<labelPair>& front)
     extrudedFaces_.setSize(counter);
     pairOrientation_.setSize(counter);
 
-    # ifdef USE_OMP
-    # pragma omp parallel for if( faceInFront.size() > 100 ) schedule(guided)
-    # endif
+    // Serial: faces[], extrudedFaces_[], pairOrientation_[] write races --
+    // multiple faceI can map to same fOwn/fNei; transfer() especially unsafe
     forAll(faceInFront, faceI)
     {
         if( faceInFront[faceI] < 0 )
@@ -175,9 +175,8 @@ void extrudeLayer::createDuplicateFrontFaces(const LongList<labelPair>& front)
     }
 
     //- renumber the cells
-    # ifdef USE_OMP
-    # pragma omp parallel for if( faceInFront.size() > 100 ) schedule(guided)
-    # endif
+    // Serial: multiple faces share owner/neighbour cells --
+    // concurrent writes to c[fI] corrupt cell-face connectivity
     forAll(faceInFront, faceI)
     {
         if( faceInFront[faceI] < 0 )
@@ -219,9 +218,8 @@ void extrudeLayer::createNewVertices()
     //- find the points in the marked front
     List<direction> frontPoints(points.size(), NONE);
 
-    # ifdef USE_OMP
-    # pragma omp parallel for if( points.size() > 1000 ) schedule(guided)
-    # endif
+    // Serial: multiple extruded faces share points --
+    // frontPoints[f[pI]] |= FRONTVERTEX races on shared point indices
     forAll(extrudedFaces_, efI)
     {
         const face& f = faces[extrudedFaces_[efI].first()];
@@ -270,6 +268,7 @@ void extrudeLayer::createNewVertices()
         # endif
         forAll(receivedData, i)
         {
+            if( !globalToLocal.found(receivedData[i]) ) continue;
             frontPoints[globalToLocal[receivedData[i]]] =
                 FRONTVERTEX+FRONTVERTEXPROCBND;
         }
@@ -283,12 +282,16 @@ void extrudeLayer::createNewVertices()
 
     if( Pstream::parRun() )
     {
+        # ifdef DEBUGExtrudeLayer
         Pout << "Creating new points at processor boundaries" << endl;
+        # endif
         for(label procI=0;procI<Pstream::nProcs();++procI)
         {
             if( Pstream::myProcNo() == procI )
             {
+        # ifdef DEBUGExtrudeLayer
                Pout << "Front points are " << frontPoints << endl;
+        # endif
             }
 
             returnReduce(1, sumOp<label>());
@@ -343,7 +346,11 @@ void extrudeLayer::createNewVertices()
             if( Pstream::myProcNo() == procI )
             {
                forAllConstIter(dualEdgesMap, procPointsDual, it)
+            {
+        # ifdef DEBUGExtrudeLayer
                     Pout << "Point " << it->first << " local dual edges " << it->second << endl;
+        # endif
+            }
             }
 
             returnReduce(1, sumOp<label>());
@@ -352,7 +359,9 @@ void extrudeLayer::createNewVertices()
         //- fill-in with data at processor boundaries. Store edges
         //- on the processor with the lower label not to duplicate the data
         returnReduce(1, sumOp<label>());
+        # ifdef DEBUGExtrudeLayer
         Pout << "Adding data from processor boundaries" << endl;
+        # endif
         forAll(procBoundaries, patchI)
         {
             if( procBoundaries[patchI].owner() )
@@ -421,7 +430,9 @@ void extrudeLayer::createNewVertices()
 
         //- exchange this information with neighbouring processors
         returnReduce(1, sumOp<label>());
+        # ifdef DEBUGExtrudeLayer
         Pout << "Exchanging data with other processors" << endl;
+        # endif
 
         std::map<label, labelLongList> exchangeData;
         forAll(pProcs, i)
@@ -462,11 +473,13 @@ void extrudeLayer::createNewVertices()
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label pointI = globalToLocal[receivedData[counter++]];
+            const label gpI_ext = receivedData[counter++];
+            const label nDualEdges = receivedData[counter++];
+            if( !globalToLocal.found(gpI_ext) )
+            { counter += nDualEdges*2; continue; }
+            const label pointI = globalToLocal[gpI_ext];
 
             DynList<edge>& dualEdges = procPointsDual[pointI];
-
-            const label nDualEdges = receivedData[counter++];
             for(label eI=0;eI<nDualEdges;++eI)
             {
                 edge e;
@@ -482,7 +495,11 @@ void extrudeLayer::createNewVertices()
             if( Pstream::myProcNo() == procI )
             {
                forAllConstIter(dualEdgesMap, procPointsDual, it)
+            {
+        # ifdef DEBUGExtrudeLayer
                     Pout << "Point " << it->first << " dual edges " << it->second << endl;
+        # endif
+            }
             }
 
             returnReduce(1, sumOp<label>());
@@ -490,7 +507,9 @@ void extrudeLayer::createNewVertices()
 
         //- Finally, find groups of faces and create new vertices
         returnReduce(1, sumOp<label>());
+        # ifdef DEBUGExtrudeLayer
         Pout << "Finding groups of edges at vertex" << endl;
+        # endif
         forAllConstIter(dualEdgesMap, procPointsDual, dIter)
         {
             const label pointI = dIter->first;
@@ -561,9 +580,13 @@ void extrudeLayer::createNewVertices()
                 }
             }
 
+        # ifdef DEBUGExtrudeLayer
             Info << "Edge groups for point " << pointI << " are " << edgeGroup << endl;
+        # endif
+        # ifdef DEBUGExtrudeLayer
             Info << "Face groups at point " << pointI << " are " << faceGroups
                 << " point faces " << pointFaces[pointI] << endl;
+        # endif
 
             //- stop in case there is only one group
             //- of faces attached to this point
@@ -605,7 +628,9 @@ void extrudeLayer::createNewVertices()
             }
         }
 
+        # ifdef DEBUGExtrudeLayer
         Pout << "Finishing creating new vertices at paralle boundaries" << endl;
+        # endif
         returnReduce(1, sumOp<label>());
     }
 
@@ -821,6 +846,7 @@ void extrudeLayer::movePoints()
         forAll(receivedData, i)
         {
             const labelledPointScalar& lps = receivedData[i];
+            if( !globalToLocal.found(lps.pointLabel()) ) continue;
             const label pointI = globalToLocal[lps.pointLabel()];
 
             normals[pointI] += lps.coordinates();
@@ -837,8 +863,14 @@ void extrudeLayer::movePoints()
         )
         {
             vector n = it->second;
-            if( mag(n) > VSMALL )
-                n /= mag(n);
+            const scalar magN = mag(n);
+            // Guard: skip if no valid displacement found
+            if( magN <= VSMALL || distances[it->first] >= VGREAT/2.0 )
+            {
+                displacements[it->first-nOrigPoints_] = vector::zero;
+                continue;
+            }
+            n /= magN;
             displacements[it->first-nOrigPoints_] = n * distances[it->first];
         }
     }
@@ -894,8 +926,13 @@ void extrudeLayer::movePoints()
             }
 
             const scalar d = mag(normal);
-            if( d > VSMALL )
-                normal /= d;
+            // Guard: if no valid extrusion face found, skip this point
+            if( thickness >= VGREAT/2.0 || d <= VSMALL )
+            {
+                displacements[pI] = vector::zero;
+                continue;
+            }
+            normal /= d;
 
             displacements[pI] = normal * thickness;
         }
@@ -1167,6 +1204,62 @@ void extrudeLayer::createLayerCells()
             //- origFacePointI and origFaceNextI
             DynList<label> fe;
             adc.facesSharingEdge(origFacePointI, origFaceNextI, fe);
+
+            if( fe.size() == 0 || pos < 0 )
+            {
+                // Cannot construct valid corner-cell side face at
+                // multi-patch singularity. This is a candidate location for
+                // a future pyramid/polyhedral cap transition cell.
+                # ifdef DEBUGLayer
+                {
+                    const pointFieldPMG& pts = mesh_.points();
+                    bool validRing = origFacePoints.size() >= 3;
+                    for(label i=0; i<origFacePoints.size() && validRing; ++i)
+                    {
+                        if( origFacePoints[i] < 0 || origFacePoints[i] >= label(pts.size()) )
+                            validRing = false;
+                        for(label j=i+1; j<origFacePoints.size(); ++j)
+                            if( origFacePoints[i] == origFacePoints[j] )
+                                validRing = false;
+                    }
+                    vector baseArea(vector::zero);
+                    point baseCtr(point::zero);
+                    if( validRing )
+                    {
+                        forAll(origFacePoints, opI)
+                            baseCtr += pts[origFacePoints[opI]];
+                        baseCtr /= scalar(origFacePoints.size());
+                        forAll(origFacePoints, opI)
+                        {
+                            const point& a = pts[origFacePoints[opI]];
+                            const point& b =
+                                pts[origFacePoints[(opI+1)%origFacePoints.size()]];
+                            baseArea += (a - baseCtr) ^ (b - baseCtr);
+                        }
+                    }
+                    const scalar areaMag = mag(baseArea);
+                    const bool validApex =
+                        pointI >= 0 && pointI < label(pts.size());
+
+                    const scalar apexHeight =
+                        validRing && validApex && areaMag > VSMALL
+                      ? mag(((pts[pointI] - baseCtr) & (baseArea / areaMag)))
+                      : scalar(0.0);
+                    Info << "CAP_CANDIDATE pointI=" << pointI
+                         << " N=" << origFacePoints.size()
+                         << " validRing=" << validRing
+                         << " baseAreaMag=" << areaMag
+                         << " apexHeight=" << apexHeight
+                         << " feSize=" << fe.size()
+                         << " pos=" << pos
+                         << " ring=" << origFacePoints
+                         << endl;
+                }
+                # endif
+                createCell = false;
+                break;
+            }
+
             const label origPointI = adc.origPoint(fe[0], origFacePointI);
 
             //- create a face attached to pointI
@@ -1176,6 +1269,9 @@ void extrudeLayer::createLayerCells()
             cf[2] = origPointI;
             cf[3] = origFacePoints[pos];
         }
+
+        if( !createCell )
+            continue;
 
         //- close the cell by creating new faces from the existing
         //- faces which obey pre-determined order. If a face contains

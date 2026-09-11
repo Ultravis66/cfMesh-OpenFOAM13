@@ -175,7 +175,12 @@ meshOptimizer::meshOptimizer(polyMeshGen& mesh)
     lockedFaces_(),
     msePtr_(NULL),
     enforceConstraints_(false),
-    badPointsSubsetName_()
+    badPointsSubsetName_(),
+    surfaceOctreePtr_(NULL),
+    bndPointPatchesPtr_(NULL),
+    globalToBoundaryPointPtr_(NULL),
+    featureCornerPointsPtr_(NULL),
+    featureCurveTangentsPtr_(NULL)
 {
     calculatePointLocations();
 }
@@ -194,6 +199,22 @@ void meshOptimizer::enforceConstraints(const word subsetName)
     enforceConstraints_ = true;
 
     badPointsSubsetName_ = subsetName;
+}
+
+void meshOptimizer::setSurfaceConstraint
+(
+    const meshOctree* octreePtr,
+    const VRWGraph* bndPointPatchesPtr,
+    const labelLongList* globalToBoundaryPointPtr,
+    const labelHashSet* featureCornerPointsPtr,
+    const vectorField* featureCurveTangentsPtr
+)
+{
+    surfaceOctreePtr_ = octreePtr;
+    bndPointPatchesPtr_ = bndPointPatchesPtr;
+    globalToBoundaryPointPtr_ = globalToBoundaryPointPtr;
+    featureCornerPointsPtr_ = featureCornerPointsPtr;
+    featureCurveTangentsPtr_ = featureCurveTangentsPtr;
 }
 
 void meshOptimizer::lockCellsInSubset(const word& subsetName)
@@ -241,7 +262,7 @@ void meshOptimizer::lockPointsInSubset(const word& subsetName)
         labelLongList lp;
         mesh_.pointsInSubset(subsetI, lp);
 
-        lockCells(lp);
+        lockPoints(lp);
     }
     else
     {

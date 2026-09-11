@@ -76,7 +76,68 @@ class boundaryLayers
         //- shall the layers be terminated at concave edges (true)
         bool terminateLayersAtConcaveEdges_;
         mutable boolList zeroDistPoints_;
+        mutable boolList rampSeedPoints_; //- finite ramp seeds: not collapsed, seeds ring prop, excluded from blblJunctionPoints_
         mutable scalarField layerScale_;
+
+        //- meshDict-configurable BL transition parameters
+        scalar blblFeatureAngleDeg_;   // degrees, default 40
+        scalar blSharpEdgeAngleDeg_;    // degrees, default 75 (Franjo original)
+        //- Per-boundary-point suppression reason code for dropout atlas.
+        //- 0=none 1=gap 2=transEdge 3=tripleJunction 4=corner
+        //- 5=sharpEdge 6=blblSharp 7=blNoBLEdge
+        mutable labelList blSuppressReason_;
+        mutable labelList blRampRing_;        // ring level (0=not ramp, 1-6)
+        mutable labelList blRampSeedReason_;  // seed point reason code
+        scalar blblCornerAcuteThreshold_; // dot product threshold, default 0.3
+        scalar layerScaleRing1_;       // default 0.25
+        scalar layerScaleRing2_;       // default 0.50
+        scalar layerScaleRing3_;       // default 0.75
+        scalar layerScaleRing4_;       // default 1.00
+        scalar layerScaleRing5_;       // default 0.80
+        scalar layerScaleRing6_;       // default 1.00
+        // Acute corner local taper -- stronger suppression seeded from blblAcuteCornerPoints_
+        scalar acuteCornerRing0_;      // default 0.0
+        scalar acuteCornerRing1_;      // default 0.0
+        scalar acuteCornerRing2_;      // default 0.05
+        scalar acuteCornerRing3_;      // default 0.15
+        scalar acuteCornerRing4_;      // default 0.35
+        scalar acuteCornerRing5_;      // default 0.60
+        scalar acuteCornerRing6_;      // default 1.00
+        // Virtual topology BL exclusion/taper around pathological
+        // acute triple-junctions. Internal mesher view only:
+        // no STL mutation, no patch renaming, no BL graph surgery.
+        bool virtualTopologyExclusion_; // default false
+        scalar virtualTopoRing0_;       // default 0.0  full exclusion
+        scalar virtualTopoRing1_;       // default 0.0  full exclusion
+        scalar virtualTopoRing2_;       // default 0.05 taper onset
+
+        // Gap face-ring exclusion controls
+        bool   gapFaceRingExclusion_;  // default true
+        bool   tripleJunctionFaceRingExclusion_;  // default false
+        labelHashSet tripleJunctionSuppressPatches_;  // patch indices to suppress
+        scalar gapFaceRing0Scale_;     // default 0.02
+        scalar gapFaceRing1Scale_;     // default 0.05
+        scalar gapFaceRing2Scale_;     // default 0.20
+        scalar gapFaceRing3Scale_;     // default 0.50
+
+        //- taper scale for protected (blade/periodic) ring0 faces at triple
+        //- junctions. Does not suppress topology -- only reduces BL height.
+        scalar tripleJunctionProtectedRing0Scale_;
+
+        //- Gap conflict arbitration: loser-side patch indices (STL space).
+        //- Ring1 topology suppression applied to these patches in gap zones.
+        labelHashSet gapLoserPatches_;
+
+        //- Loser-side patch names stored at detection time (STL name space).
+        //- Avoids STL->polyMesh index space conversion bugs.
+        wordList gapLoserPatchNames_;
+
+        //- Enable ring1 topology suppression on loser side (default true).
+        bool gapLoserRing1Suppress_;
+
+        //- meshDict knobs for loser-side ring max layers
+        label gapLoserRing1MaxLayers_;   // default 1
+        label gapLoserRing2MaxLayers_;   // default 2
 
         //- is it a 2D mesh
         bool is2DMesh_;
@@ -107,9 +168,122 @@ class boundaryLayers
         //- number of BL layers per patch (0 = no BL = termination patch)
         labelList nLayersForPatch_;
 
+        //- patch role classification
+        //  0 = BL_PATCH, 1 = TERMINATION_PATCH, 2 = NEUTRAL_PATCH
+        labelList patchRole_;
+
         //- boundary faces with mixed zero/nonzero layer displacement
         //- passed to refineBoundaryLayers for single-layer treatment
         mutable labelHashSet mixedDisplacementFaces_;
+
+        //- boundary points on sharp BL/BL junction feature curves
+        //- populated by markConcaveEdgePoints, consumed by C2/C3
+        mutable labelHashSet blblJunctionPoints_;
+        //- Per-junction-point class: 0=hard 1=moderate 2=mild
+        //- Set in markConcaveEdgePoints, consumed in createNewVertex.
+        mutable Map<label> blblJunctionClass_;
+
+        //- Per-boundary-point contact class from edge-based atlas.
+        //- 0=unclassified 1=HardBLBL 2=ModerateBLBL 3=MildBLBL
+        //- 4=SmoothBLBL 5=PeriodicSeam 6=FlowBoundaryTerm 7=TripleJunction
+        //- Built by buildBLContactPointPolicy(), consumed by blblSharp block.
+        //- Min-class wins when point sits on multiple edges.
+        mutable Map<label> blContactPointClass_;
+
+        //- Cap cell policy for HardBLBL blade/endwall contacts.
+        //- Gated by useHardBLBLCapCells_ (meshDict: useHardBLBLCapCells).
+        //- Per-bpI maps store the patchI/pKey for endwall and blade sides.
+        //- Used after pKey routing is proven by diagnostic atlas.
+        bool useHardBLBLCapCells_;
+        bool useHardBLBLCapVertexInsertion_; // gate for step4 real vertices
+        bool useHardBLBLReducedCells_;        // gate for reduced topology
+        scalar hardBLBLCapScale_;  // meshDict: hardBLBLCapScale, default 0.10
+        scalar flowTerminationTaperFloor_; // meshDict: flowTerminationTaperFloor, default 0.25
+        scalar periodicNeutralTaperFloor_; // meshDict: periodicNeutralTaperFloor, default 0.0
+        mutable Map<label> blCapCellEndwallPatch_;
+        mutable Map<label> blCapCellBladePatch_;
+        mutable Map<label> blCapCellEndwallPKey_;
+        mutable Map<label> blCapCellBladePKey_;
+
+        //- Option C: cap-side vertex override map.
+        //- Key: std::pair(meshPointI, pKey).
+        //- Value: vertex label for that point/patch combination.
+        //- findNewNodeLabel() checks this first before otherVrts_/newLabelForVertex_.
+        //- Empty = no behavior change (step 1).
+        mutable std::map<std::pair<label,label>, label> capSideVrtMap_;
+        //- CFMitch v2 pre-cell height-field diagnostics.
+        //- Enabled only by the constraintPlanner architecture.
+        bool cfmitchHeightDiagnostics_;
+
+        //- CFMitch v2.3 symmetric graph height compatibility solver.
+        //
+        //- The first implementation is deliberately monotone:
+        //- it may reduce an unconstrained smooth-wall hair height,
+        //- but it never increases one beyond the geometry-derived
+        //- as-born height.
+        bool   cfmitchHeightSmoothing_;
+        scalar cfmitchHeightMaxEdgeRatio_;
+        scalar cfmitchHeightMaxMoveFraction_;
+        label  cfmitchHeightSmoothingIterations_;
+
+        //- CFMitch v2.8 BL/neutral birth-height guard.
+        //
+        //- At an unscaled BL/neutral EDGENODE the extrusion direction is
+        //- the established pure treated-wall normal.  The historical
+        //- projected-neighbour distance may become arbitrarily small when
+        //- a boundary-neighbour edge is nearly tangential to that normal.
+        //
+        //- A positive value floors that projected candidate by this
+        //- fraction of the shortest eligible neighbour half-edge length.
+        //
+        //- The caller still preserves any pre-existing smaller distance
+        //- ceiling.  Zero disables the guard completely.
+        scalar cfmitchNeutralProjectionFloor_;
+
+        //- Gate for contact-line policy (meshDict: useContactLinePolicy)
+        bool useContactLinePolicy_;
+        bool useContactLineHeightSmoother_;
+        bool writeContactLineHeightSmootherAtlas_;
+        scalar contactLineSmootherMaxGrowth_;
+        scalar contactLineSmootherMinCollapse_;
+        scalar contactLineSmootherMaxMoveFraction_;
+        label  contactLineSmootherIterations_;
+        scalar contactLineSmootherMinHeight_;
+
+        mutable labelHashSet blblCornerPoints_;
+        mutable labelHashSet blblAcuteCornerPoints_;
+
+        //- Per-face virtual topology ring assignment (-1=untouched, 0/1/2=ring)
+        //- Populated by applyVirtualTopologyExclusion, consumed by refineBoundaryLayers
+        mutable labelList vtFaceRing_;
+
+        //- gap points for BL suppression in thin clearance regions
+        labelHashSet gapPoints_;       //- loser-side action points
+        labelHashSet gapZonePoints_;   //- symmetric zone points (both sides)
+        //- triple-junction seed points (blade/hub-shroud/periodic singularities)
+        labelHashSet tripleJunctionPoints_;
+
+        //- face-level BL suppression mask -- set by gap/VT detection
+        //- createNewFacesAndCells skips faces where this is true
+        mutable boolList suppressLayerAtBndFace_;
+
+        //- edges where at least one adjacent patch requests BL and
+        //- at least one adjacent patch requests zero layers.
+        //- populated by markConcaveEdgePoints, consumed by surface mapper.
+        mutable labelHashSet blNoBlEdges_;
+
+        //- boundary points on BL/no-BL transition edges
+        mutable labelHashSet blNoBlEdgePoints_;
+
+        //- patch index for each BL/no-BL interface point
+        //- stores the BL-side patch index for patch-constrained projection
+        mutable Map<label> blNoBlPointPatch_;
+
+        //- BL/neutral edge points (BL patch meets periodic/symmetry)
+        mutable labelHashSet blNeutralEdgePoints_;
+
+        //- BL-side patch index per neutral edge point
+        mutable Map<label> blNeutralPointPatch_;
 
         //- number of vertices in the mesh
         label nPoints_;
@@ -152,6 +326,13 @@ class boundaryLayers
         (
             const boolList& treatPatches
         );
+
+        //- CFMitch connected BL/neutral seam constraint.
+        //
+        // Runs after local candidate macro vertices exist but before
+        // old/new coordinate swap, while original boundary geometry
+        // remains authoritative.
+        void constrainNeutralSeamCandidatesBeforeSwap();
 
         //- create new vertices such that layers for selected patches
         //- are generated in a single run
@@ -211,6 +392,14 @@ class boundaryLayers
             const label pKey
         ) const;
 
+        //- Patch-aware lookup (patchI-keyed capSideVrtMap_)
+        inline label findNewNodeLabelForPatch
+        (
+            const label pointI,
+            const label patchI,
+            const label pKey
+        ) const;
+
         //- creating hex cells near feature edges
         inline void createNewCellFromEdge
         (
@@ -256,6 +445,66 @@ class boundaryLayers
 
 public:
 
+        //- Enable CFMitch v2 height-field diagnostics.
+        //- This does not alter the extrusion geometry.
+        void setCFMitchHeightDiagnostics(const bool enabled)
+        {
+            cfmitchHeightDiagnostics_ = enabled;
+        }
+
+        //- Configure the CFMitch v2.8 BL/neutral projected-height floor.
+        //
+        //- Zero disables the guard.  Values are expected in [0,1].
+        void setCFMitchNeutralProjectionFloor(const scalar floorFraction)
+        {
+            cfmitchNeutralProjectionFloor_ = floorFraction;
+        }
+
+        //- Configure the CFMitch v2.1 smooth-wall height solver.
+        void setCFMitchHeightSmoothing
+        (
+            const bool enabled,
+            const scalar maxEdgeRatio,
+            const scalar maxMoveFraction,
+            const label iterations
+        )
+        {
+            cfmitchHeightSmoothing_ = enabled;
+            cfmitchHeightMaxEdgeRatio_ = maxEdgeRatio;
+            cfmitchHeightMaxMoveFraction_ = maxMoveFraction;
+            cfmitchHeightSmoothingIterations_ = iterations;
+        }
+
+        //- Write the as-born BL hair-height field immediately after
+        //- extrusion coordinate swap and before any height smoother
+        //- or rollback modifies it.
+        void writeCFMitchHeightAtlas
+        (
+            const word& passName,
+            const labelList& bPoints,
+            const VRWGraph& pointPoints,
+            const boolList& treatPatches,
+            const labelList& boundaryFacePatches,
+            const VRWGraph& pointFaces
+        ) const;
+
+
+        //- CFMitch v2.3 symmetric log-height graph projection.
+        //
+        //- Only clean single-BL-patch points participate.
+        //- Only smooth<->smooth same-patch graph edges are considered.
+        //- Heights can only decrease.
+        void applyCFMitchHeightCompatibility
+        (
+            const word& passName,
+            const labelList& bPoints,
+            const VRWGraph& pointPoints,
+            const boolList& treatPatches,
+            const labelList& boundaryFacePatches,
+            const VRWGraph& pointFaces
+        );
+
+
     // Constructors
 
         //- Construct from mesh reference
@@ -270,6 +519,155 @@ public:
             return mixedDisplacementFaces_;
         }
 
+        //- return boundary points on sharp BL/BL junction curves
+        const labelHashSet& junctionEdgePoints() const
+        {
+            return blblJunctionPoints_;
+        }
+
+        const labelHashSet& blblCornerPoints() const
+        {
+            return blblCornerPoints_;
+        }
+
+        const labelHashSet& blblAcuteCornerPoints() const
+        {
+            return blblAcuteCornerPoints_;
+        }
+        const boolList& rampSeedPoints() const
+        {
+            return rampSeedPoints_;
+        }
+
+        //- Return per-boundary-point intended layer scale
+        //- (0=suppressed, 1=full BL). Use layerScale < 0.01 as suppressed
+        //- threshold. Reports effective BL coverage, not vertex existence.
+        const scalarField& layerScale() const
+        {
+            return layerScale_;
+        }
+
+        //- Return virtual topology face ring assignments
+        const labelList& vtFaceRing() const
+        {
+            return vtFaceRing_;
+        }
+
+        //- return edges where BL and no-BL patches meet
+        const labelHashSet& blNoBlEdges() const
+        {
+            return blNoBlEdges_;
+        }
+
+        //- detect BL/no-BL transition edges and populate blNoBlEdgePoints_
+        //- lightweight: reads meshDict + mesh surface only, no mesh modification
+        //- safe to call before addLayerForAllPatches()
+        void detectBLNoBlTransitionEdges() const;
+
+        //- return boundary points on BL/no-BL transition edges
+        const labelHashSet& blNoBlEdgePoints() const
+        {
+            return blNoBlEdgePoints_;
+        }
+
+        //- return patch index map for BL/no-BL interface points
+        const Map<label>& blNoBlPointPatch() const
+        {
+            return blNoBlPointPatch_;
+        }
+
+        //- return BL/neutral edge points (blade/periodic junctions)
+        const labelHashSet& blNeutralEdgePoints() const
+        {
+            return blNeutralEdgePoints_;
+        }
+
+        //- Exact old-mesh-point -> newly-created base-point lineage
+        //  for the initial macro BL extrusion.
+        //
+        //  After coordinate swapping:
+        //
+        //      old mesh-point label = macro-layer/top point
+        //      mapped new label     = physical wall/base point
+        //
+        const labelLongList& newLabelForVertexMap() const
+        {
+            return newLabelForVertex_;
+        }
+
+        //- return BL-side patch per neutral edge point
+        const Map<label>& blNeutralPointPatch() const
+        {
+            return blNeutralPointPatch_;
+        }
+
+        //- set gap points for BL suppression in thin clearance regions
+        //- These are LOSER-SIDE action points only -- not symmetric zone points.
+        void setGapPoints(const labelHashSet& gpts)
+        {
+            gapPoints_ = gpts;
+        }
+        //- return loser-side gap action points (mesh point labels)
+        const labelHashSet& gapPoints() const
+        {
+            return gapPoints_;
+        }
+        void addGapPoints(const labelHashSet& gpts)
+        {
+            forAllConstIter(labelHashSet, gpts, iter)
+                gapPoints_.insert(iter.key());
+        }
+        //- set symmetric gap zone points (both sides) for classification only.
+        //- Does not trigger BL suppression -- use setGapPoints for that.
+        void setGapZonePoints(const labelHashSet& gpts)
+        {
+            gapZonePoints_ = gpts;
+        }
+        // CFMITCH AUTO_BOUNDARY_JUNCTIONS API
+        // Read-only access to the already-resolved per-patch BL intent.
+        // This is deliberately independent of patch name/type semantics.
+        inline label numberOfLayersForPatch(const label patchI) const
+        {
+            if
+            (
+                patchI < 0
+             || patchI >= label(nLayersForPatch_.size())
+            )
+                return 0;
+
+            return nLayersForPatch_[patchI];
+        }
+
+        inline bool patchHasBoundaryLayers(const label patchI) const
+        {
+            return numberOfLayersForPatch(patchI) > 0;
+        }
+
+        void setTripleJunctionPoints(const labelHashSet& pts)
+        {
+            tripleJunctionPoints_ = pts;
+        }
+        //- set loser-side patch indices for gap conflict arbitration
+        void setGapLoserPatches(const labelHashSet& loserPatches)
+        {
+            gapLoserPatches_ = loserPatches;
+        }
+        //- set loser-side patch names (built at detection time, STL name space)
+        void setGapLoserPatchNames(const wordList& names)
+        {
+            gapLoserPatchNames_ = names;
+        }
+        //- return loser-side patch names (stable, built at detection time)
+        const wordList& gapLoserPatchNames() const
+        {
+            return gapLoserPatchNames_;
+        }
+        void addTripleJunctionPoints(const labelHashSet& pts)
+        {
+            forAllConstIter(labelHashSet, pts, iter)
+                tripleJunctionPoints_.insert(iter.key());
+        }
+
     // Public member functions
         //- adds layer for a given patch
         void addLayerForPatch(const word& patchName);
@@ -280,6 +678,36 @@ public:
         //- terminate boundary layers at concave edges (used as a flag)
         void terminateLayersAtConcaveEdges();
         void markConcaveEdgePoints(boolList& skipPoint) const;
+        //- Build per-point contact class from edge-based atlas
+        //- Call before blblSharp suppression block
+        void buildBLContactPointPolicy() const;
+        void smoothContactLineHeights
+        (
+            const word& passName,
+            const labelList& bPoints,
+            const VRWGraph& pointPoints,
+            const boolList& treatPatches,
+            const faceList::subList& bFaces,
+            const VRWGraph& pointFaces,
+            const labelList& boundaryFacePatches
+        );
+
+        //- Build HardBLBL cap cell candidate map (no geometry change)
+        void buildBLCapCellCandidates() const;
+        void writeCapCellGeometryDryRun() const;
+        //- Write cap cell pKey routing diagnostic CSV
+        void writeCapCellRoutingAtlas() const;
+        //- Write edge-based BL contact line atlas (diagnostic only)
+        void writeBLContactLineAtlas() const;
+        //- Apply virtual topology BL exclusion zones around acute
+        //- BL triple-junctions before any layer graph is constructed.
+        void applyVirtualTopologyExclusion() const;
+        //- Apply face-ring BL suppression/taper around gap points
+        void applyGapFaceRingExclusion() const;
+        void reportBLTransitionSeeds() const;
+        void buildBLTransitionPlan() const;
+        void reportBLPlanningPerPatch() const;
+        void suppressFailedSingularityExtrusions(const labelList& patchLabels);
 
         //- avoid generating layers for empty patches in case of a 2D mesh
         //- used as a flag prior to addLayerForAllPatches

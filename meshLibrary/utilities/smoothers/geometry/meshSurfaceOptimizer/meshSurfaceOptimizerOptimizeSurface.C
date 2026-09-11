@@ -145,6 +145,7 @@ label meshSurfaceOptimizer::findInvertedVertices
 
             forAll(receivedData, j)
             {
+                if( !globalToLocal.found(receivedData[j]) ) continue;
                 const label bpI = globalToLocal[receivedData[j]];
 
                 smoothVertex[bpI] = true;
@@ -196,16 +197,111 @@ void meshSurfaceOptimizer::smoothEdgePoints
         edgeNodeDisplacementParallel(procEdgePoints);
 
     meshSurfaceEngineModifier surfaceModifier(surfaceEngine_);
-    forAll(newPositions, threadI)
-    {
-        const LongList<labelledPoint>& newPos = newPositions[threadI];
 
-        forAll(newPos, i)
-            surfaceModifier.moveBoundaryVertexNoUpdate
+    if( !Pstream::parRun() )
+    {
+        label nCandidates = 0;
+        label nAccepted = 0;
+        label nRejectedVolumeGate = 0;
+        label nTouchingExistingBad = 0;
+
+        scalar minAcceptedPositiveRatio = GREAT;
+
+        // Deterministic serial transaction for feature-edge smoothing.
+        // The edge proposal itself is unchanged here. This pass only
+        // prevents a currently-positive incident volume cell from being
+        // made non-positive by the proposed edge-point motion.
+        forAll(newPositions, threadI)
+        {
+            const LongList<labelledPoint>& newPos =
+                newPositions[threadI];
+
+            forAll(newPos, i)
+            {
+                ++nCandidates;
+
+                const label bpI =
+                    newPos[i].pointLabel();
+
+                const point& candidate =
+                    newPos[i].coordinates();
+
+                bool touchesExistingBad = false;
+                scalar minPositiveRatio = GREAT;
+
+                const bool preservesVolume =
+                    surfaceModifier.candidatePreservesPositiveCellVolumes
+                    (
+                        bpI,
+                        candidate,
+                        touchesExistingBad,
+                        minPositiveRatio
+                    );
+
+                if( touchesExistingBad )
+                {
+                    ++nTouchingExistingBad;
+                }
+
+                if( !preservesVolume )
+                {
+                    ++nRejectedVolumeGate;
+                    continue;
+                }
+
+                surfaceModifier.moveBoundaryVertexNoUpdate
+                (
+                    bpI,
+                    candidate
+                );
+
+                ++nAccepted;
+
+                if( minPositiveRatio < GREAT )
+                {
+                    minAcceptedPositiveRatio =
+                        Foam::min
+                        (
+                            minAcceptedPositiveRatio,
+                            minPositiveRatio
+                        );
+                }
+            }
+        }
+
+        Info
+            << "[EDGE_SMOOTH_VOLUME_TRANSACTION]"
+            << " candidates=" << nCandidates
+            << " accepted=" << nAccepted
+            << " rejectedVolumeGate=" << nRejectedVolumeGate
+            << " touchingExistingBad=" << nTouchingExistingBad
+            << " minAcceptedPositiveRatio="
+            <<
             (
-                newPos[i].pointLabel(),
-                newPos[i].coordinates()
-            );
+                minAcceptedPositiveRatio < GREAT
+              ? minAcceptedPositiveRatio
+              : scalar(-1)
+            )
+            << endl;
+    }
+    else
+    {
+        // Preserve legacy MPI behaviour until the parallel transaction
+        // and shared-point synchronization path is explicitly audited.
+        forAll(newPositions, threadI)
+        {
+            const LongList<labelledPoint>& newPos =
+                newPositions[threadI];
+
+            forAll(newPos, i)
+            {
+                surfaceModifier.moveBoundaryVertexNoUpdate
+                (
+                    newPos[i].pointLabel(),
+                    newPos[i].coordinates()
+                );
+            }
+        }
     }
 
     surfaceModifier.updateGeometry(edgePoints);
@@ -256,24 +352,111 @@ void meshSurfaceOptimizer::smoothLaplacianFC
 
     meshSurfaceEngineModifier surfaceModifier(surfaceEngine_);
 
-    # ifdef USE_OMP
-    # pragma omp parallel num_threads(newPositions.size())
-    # endif
+    if( !Pstream::parRun() )
     {
-        # ifdef USE_OMP
-        const label threadI = omp_get_thread_num();
-        # else
-        const label threadI = 0;
-        # endif
+        label nCandidates = 0;
+        label nAccepted = 0;
+        label nRejectedVolumeGate = 0;
+        label nTouchingExistingBad = 0;
 
-        const LongList<labelledPoint>& newPos = newPositions[threadI];
+        scalar minAcceptedPositiveRatio = GREAT;
 
-        forAll(newPos, i)
-            surfaceModifier.moveBoundaryVertexNoUpdate
+        // Deterministic serial transaction.
+        // Candidate positions were calculated above in parallel, but
+        // each commit is checked against the current live volume mesh,
+        // including all earlier accepted moves in this pass.
+        forAll(newPositions, threadI)
+        {
+            const LongList<labelledPoint>& newPos =
+                newPositions[threadI];
+
+            forAll(newPos, i)
+            {
+                ++nCandidates;
+
+                const label bpI =
+                    newPos[i].pointLabel();
+
+                const point& candidate =
+                    newPos[i].coordinates();
+
+                bool touchesExistingBad = false;
+                scalar minPositiveRatio = GREAT;
+
+                const bool preservesVolume =
+                    surfaceModifier.candidatePreservesPositiveCellVolumes
+                    (
+                        bpI,
+                        candidate,
+                        touchesExistingBad,
+                        minPositiveRatio
+                    );
+
+                if( touchesExistingBad )
+                {
+                    ++nTouchingExistingBad;
+                }
+
+                if( !preservesVolume )
+                {
+                    ++nRejectedVolumeGate;
+                    continue;
+                }
+
+                surfaceModifier.moveBoundaryVertexNoUpdate
+                (
+                    bpI,
+                    candidate
+                );
+
+                ++nAccepted;
+
+                if( minPositiveRatio < GREAT )
+                {
+                    minAcceptedPositiveRatio =
+                        Foam::min
+                        (
+                            minAcceptedPositiveRatio,
+                            minPositiveRatio
+                        );
+                }
+            }
+        }
+
+        Info
+            << "[LAPLACIAN_FC_VOLUME_TRANSACTION]"
+            << " transform=" << transform
+            << " candidates=" << nCandidates
+            << " accepted=" << nAccepted
+            << " rejectedVolumeGate=" << nRejectedVolumeGate
+            << " touchingExistingBad=" << nTouchingExistingBad
+            << " minAcceptedPositiveRatio="
+            <<
             (
-                newPos[i].pointLabel(),
-                newPos[i].coordinates()
-            );
+                minAcceptedPositiveRatio < GREAT
+              ? minAcceptedPositiveRatio
+              : scalar(-1)
+            )
+            << endl;
+    }
+    else
+    {
+        // Preserve legacy MPI behaviour until parallel transactional
+        // synchronization is explicitly audited.
+        forAll(newPositions, threadI)
+        {
+            const LongList<labelledPoint>& newPos =
+                newPositions[threadI];
+
+            forAll(newPos, i)
+            {
+                surfaceModifier.moveBoundaryVertexNoUpdate
+                (
+                    newPos[i].pointLabel(),
+                    newPos[i].coordinates()
+                );
+            }
+        }
     }
 
     surfaceModifier.updateGeometry(selectedPoints);
@@ -305,14 +488,97 @@ void meshSurfaceOptimizer::smoothSurfaceOptimizer
 
     meshSurfaceEngineModifier surfaceModifier(surfaceEngine_);
 
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 100)
-    # endif
-    forAll(newPositions, i)
+    if( !Pstream::parRun() )
     {
-        const label bpI = selectedPoints[i];
+        label nCandidates = 0;
+        label nAccepted = 0;
+        label nRejectedVolumeGate = 0;
+        label nTouchingExistingBad = 0;
 
-        surfaceModifier.moveBoundaryVertexNoUpdate(bpI, newPositions[i]);
+        scalar minAcceptedPositiveRatio = GREAT;
+
+        // Deterministic serial transaction for surface-optimizer proposals.
+        // The optimization target itself is unchanged. Each candidate is
+        // evaluated against the current live volume state, including all
+        // earlier accepted moves in this pass.
+        forAll(newPositions, i)
+        {
+            ++nCandidates;
+
+            const label bpI = selectedPoints[i];
+            const point& candidate = newPositions[i];
+
+            bool touchesExistingBad = false;
+            scalar minPositiveRatio = GREAT;
+
+            const bool preservesVolume =
+                surfaceModifier.candidatePreservesPositiveCellVolumes
+                (
+                    bpI,
+                    candidate,
+                    touchesExistingBad,
+                    minPositiveRatio
+                );
+
+            if( touchesExistingBad )
+            {
+                ++nTouchingExistingBad;
+            }
+
+            if( !preservesVolume )
+            {
+                ++nRejectedVolumeGate;
+                continue;
+            }
+
+            surfaceModifier.moveBoundaryVertexNoUpdate
+            (
+                bpI,
+                candidate
+            );
+
+            ++nAccepted;
+
+            if( minPositiveRatio < GREAT )
+            {
+                minAcceptedPositiveRatio =
+                    Foam::min
+                    (
+                        minAcceptedPositiveRatio,
+                        minPositiveRatio
+                    );
+            }
+        }
+
+        Info
+            << "[SURFACE_OPT_VOLUME_TRANSACTION]"
+            << " candidates=" << nCandidates
+            << " accepted=" << nAccepted
+            << " rejectedVolumeGate=" << nRejectedVolumeGate
+            << " touchingExistingBad=" << nTouchingExistingBad
+            << " minAcceptedPositiveRatio="
+            <<
+            (
+                minAcceptedPositiveRatio < GREAT
+              ? minAcceptedPositiveRatio
+              : scalar(-1)
+            )
+            << endl;
+    }
+    else
+    {
+        // Preserve legacy parallel behaviour until shared-point
+        // transactional synchronization is explicitly audited.
+        forAll(newPositions, i)
+        {
+            const label bpI = selectedPoints[i];
+
+            surfaceModifier.moveBoundaryVertexNoUpdate
+            (
+                bpI,
+                newPositions[i]
+            );
+        }
     }
 
     //- ensure that vertices at inter-processor boundaries are at the same
@@ -372,6 +638,36 @@ bool meshSurfaceOptimizer::untangleSurface
     label nInvertedTria;
     label nGlobalIter(0);
 
+    // Distinguish the many untangleSurface() calls made during one mesh run.
+    static label untangleVolumeCallCounter = 0;
+    const label untangleVolumeCallId =
+        ++untangleVolumeCallCounter;
+
+    // Diagnostic-only raw volume lineage for untangleSurface.
+    // Cache coherency is now maintained by meshSurfaceEngineModifier.
+    auto untangleVolumeLineage =
+    [&](const word& stageName, const label outerI, const label innerI)
+    {
+        labelHashSet negVolCells;
+
+        polyMeshGenChecks::checkCellVolumes
+        (
+            surfaceEngine_.mesh(),
+            false,
+            &negVolCells
+        );
+
+        Info << "[UNTANGLE_VOLUME_LINEAGE]"
+             << " call=" << untangleVolumeCallId
+             << " outer=" << outerI
+             << " inner=" << innerI
+             << " stage=" << stageName
+             << " negVol=" << negVolCells.size()
+             << endl;
+    };
+
+    untangleVolumeLineage("entry", -1, -1);
+
     labelLongList procBndPoints, movedPoints;
     labelLongList procEdgePoints, movedEdgePoints;
 
@@ -387,6 +683,13 @@ bool meshSurfaceOptimizer::untangleSurface
         {
             nInvertedTria =
                 findInvertedVertices(smoothVertex, nAdditionalLayers);
+
+            untangleVolumeLineage
+            (
+                "iterEntry",
+                nGlobalIter,
+                nIter
+            );
 
             if( nInvertedTria == 0 )
             {
@@ -485,24 +788,198 @@ bool meshSurfaceOptimizer::untangleSurface
                 }
             }
 
-            //- smooth edge vertices
-            smoothEdgePoints(movedEdgePoints, procEdgePoints);
-            if( remapVertex && mapperPtr )
-                mapperPtr->mapEdgeNodes(movedEdgePoints);
+            //- Feature-edge motion: resolve smoothing intent onto the
+            //- feature BEFORE modifying the live mesh.
+            //
+            //- The old path committed an off-feature Laplacian midpoint,
+            //- then remapped it, then blindly restored a stale pre-smoothing
+            //- position when remapping failed. Neighbouring points may have
+            //- moved meanwhile, so that rollback was not a valid transaction.
+            //
+            //- In the serial transactional path below, the midpoint is only
+            //- a geometric intent. mapEdgeNodes() resolves the final exact
+            //- native/virtual feature target while the point remains at its
+            //- current live position, validates the final move, and performs
+            //- at most one commit.
+            const bool directFeatureTransaction =
+                remapVertex
+             && mapperPtr
+             && transactionalFeatureOptimization_
+             && !Pstream::parRun();
+
+            if( directFeatureTransaction )
+            {
+                pointField desiredEdgePositions
+                (
+                    movedEdgePoints.size(),
+                    point::zero
+                );
+
+                forAll(movedEdgePoints, epI)
+                {
+                    desiredEdgePositions[epI] =
+                        newEdgePositionLaplacian
+                        (
+                            movedEdgePoints[epI]
+                        );
+                }
+
+                // No mesh mutation has occurred yet. This checkpoint must
+                // therefore match iterEntry apart from unrelated prior state.
+                untangleVolumeLineage
+                (
+                    "afterEdgeIntentBeforeFeatureTransaction",
+                    nGlobalIter,
+                    nIter
+                );
+
+                boolList mappingAccepted;
+
+                mapperPtr->mapEdgeNodes
+                (
+                    movedEdgePoints,
+                    desiredEdgePositions,
+                    mappingAccepted
+                );
+
+                label nAcceptedFeature = 0;
+
+                forAll(mappingAccepted, epI)
+                {
+                    if( mappingAccepted[epI] )
+                    {
+                        ++nAcceptedFeature;
+                    }
+                }
+
+                Info
+                    << "[EDGE_1DOF_TRANSACTION]"
+                    << " phase=untangle"
+                    << " input=" << movedEdgePoints.size()
+                    << " accepted=" << nAcceptedFeature
+                    << " rejected="
+                    << (movedEdgePoints.size() - nAcceptedFeature)
+                    << endl;
+            }
+            else
+            {
+                // Legacy path retained for MPI, disabled transactions, and
+                // remapVertex=false. The serial remap=true transactional path
+                // above never creates an off-feature intermediate state.
+                pointField oldEdgePositions(movedEdgePoints.size());
+
+                forAll(movedEdgePoints, epI)
+                {
+                    oldEdgePositions[epI] =
+                        points[bPoints[movedEdgePoints[epI]]];
+                }
+
+                smoothEdgePoints
+                (
+                    movedEdgePoints,
+                    procEdgePoints
+                );
+
+                untangleVolumeLineage
+                (
+                    "afterEdgeSmoothingBeforeRemap",
+                    nGlobalIter,
+                    nIter
+                );
+
+                if( remapVertex && mapperPtr )
+                {
+                    if
+                    (
+                        transactionalFeatureOptimization_
+                     && !Pstream::parRun()
+                    )
+                    {
+                        boolList mappingAccepted;
+
+                        mapperPtr->mapEdgeNodes
+                        (
+                            movedEdgePoints,
+                            mappingAccepted
+                        );
+
+                        label nRolledBack = 0;
+
+                        forAll(movedEdgePoints, epI)
+                        {
+                            if( mappingAccepted[epI] )
+                                continue;
+
+                            surfaceModifier.moveBoundaryVertexNoUpdate
+                            (
+                                movedEdgePoints[epI],
+                                oldEdgePositions[epI]
+                            );
+
+                            ++nRolledBack;
+                        }
+
+                        Info
+                            << "[EDGEOPT_TRANSACTION]"
+                            << " phase=untangle"
+                            << " input=" << movedEdgePoints.size()
+                            << " accepted="
+                            << (movedEdgePoints.size() - nRolledBack)
+                            << " rolledBack=" << nRolledBack
+                            << endl;
+                    }
+                    else
+                    {
+                        mapperPtr->mapEdgeNodes
+                        (
+                            movedEdgePoints
+                        );
+                    }
+                }
+            }
+
             surfaceModifier.updateGeometry(movedEdgePoints);
+
+            untangleVolumeLineage
+            (
+                "afterEdgeTransaction",
+                nGlobalIter,
+                nIter
+            );
 
             //- use laplacian smoothing
             smoothLaplacianFC(movedPoints, procBndPoints);
             surfaceModifier.updateGeometry(movedPoints);
 
+            untangleVolumeLineage
+            (
+                "afterPartitionLaplacian",
+                nGlobalIter,
+                nIter
+            );
+
             //- use surface optimizer
             smoothSurfaceOptimizer(movedPoints, procBndPoints);
+
+            untangleVolumeLineage
+            (
+                "afterPartitionSurfaceOptimizer",
+                nGlobalIter,
+                nIter
+            );
 
             if( remapVertex && mapperPtr )
                 mapperPtr->mapVerticesOntoSurface(movedPoints);
 
             //- update normals and other geometric data
             surfaceModifier.updateGeometry(movedPoints);
+
+            untangleVolumeLineage
+            (
+                "afterPartitionRemap",
+                nGlobalIter,
+                nIter
+            );
 
         } while( nInvertedTria && (++nIter < 20) );
 
@@ -514,6 +991,13 @@ bool meshSurfaceOptimizer::untangleSurface
                 sMod.moveBoundaryVertexNoUpdate(bpI, minInvertedPoints[bpI]);
 
             sMod.updateGeometry();
+
+            untangleVolumeLineage
+            (
+                "afterMinInvertedRestore",
+                nGlobalIter,
+                nIter
+            );
         }
 
         if( nInvertedTria )
@@ -525,6 +1009,13 @@ bool meshSurfaceOptimizer::untangleSurface
             forAll(smoothVertex, bpI)
                 if( smoothVertex[bpI] )
                 {
+                    // Fallback: only smooth PARTITION points here.
+                    // EDGE points must not be Laplacian-smoothed as surface
+                    // points -- that moves them off feature curves.
+                    // mapVerticesOntoSurface is also unsafe for edge points
+                    // (global projection); use patch-constrained version.
+                    if( !(vertexType_[bpI] & PARTITION) ) continue;
+
                     movedPoints.append(bpI);
 
                     if( vertexType_[bpI] & PROCBND )
@@ -533,17 +1024,35 @@ bool meshSurfaceOptimizer::untangleSurface
 
             smoothLaplacianFC(movedPoints, procBndPoints, false);
 
+            untangleVolumeLineage
+            (
+                "afterFallbackPartitionLaplacian",
+                nGlobalIter,
+                nIter
+            );
+
+            // Use patch-constrained projection -- mapVerticesOntoSurface
+            // uses global nearest-surface which is unsafe near junctions.
             if( remapVertex && mapperPtr )
-                mapperPtr->mapVerticesOntoSurface(movedPoints);
+                mapperPtr->mapVerticesOntoSurfacePatches(movedPoints);
 
             //- update normals and other geometric data
             surfaceModifier.updateGeometry(movedPoints);
+
+            untangleVolumeLineage
+            (
+                "afterFallbackPartitionRemap",
+                nGlobalIter,
+                nIter
+            );
 
             if( nGlobalIter > 5 )
                 remapVertex = false;
         }
 
     } while( nInvertedTria && (++nGlobalIter < 10) );
+
+    untangleVolumeLineage("exit", nGlobalIter, -1);
 
     deleteDemandDrivenData(mapperPtr);
 
@@ -581,6 +1090,7 @@ bool meshSurfaceOptimizer::untangleSurface(const label nAdditionalLayers)
 void meshSurfaceOptimizer::optimizeSurface(const label nIterations)
 {
     const labelList& bPoints = surfaceEngine_.boundaryPoints();
+    const pointFieldPMG& points = surfaceEngine_.points();
 
     //- needed for parallel execution
     surfaceEngine_.pointFaces();
@@ -625,11 +1135,66 @@ void meshSurfaceOptimizer::optimizeSurface(const label nIterations)
 
         meshSurfaceEngineModifier bMod(surfaceEngine_);
 
+        // Snapshot the last valid feature positions before the unconstrained
+        // Laplacian edge proposal.
+        pointField oldEdgePositions(edgePoints.size());
+        forAll(edgePoints, epI)
+        {
+            oldEdgePositions[epI] =
+                points[bPoints[edgePoints[epI]]];
+        }
+
         smoothEdgePoints(edgePoints, procBndPoints);
 
-        //- project vertices back onto the boundary
+        //- Project vertices back onto the true feature boundary.
+        //
+        // In serial, treat smoothing + constrained projection as one
+        // transaction.  A rejected projection must not leave the preceding
+        // off-feature Laplacian proposal in the mesh.
         if( mapperPtr )
-            mapperPtr->mapEdgeNodes(edgePoints);
+        {
+            if
+            (
+                transactionalFeatureOptimization_
+             && !Pstream::parRun()
+            )
+            {
+                boolList mappingAccepted;
+                mapperPtr->mapEdgeNodes(edgePoints, mappingAccepted);
+
+                label nRolledBack = 0;
+
+                forAll(edgePoints, epI)
+                {
+                    if( mappingAccepted[epI] )
+                        continue;
+
+                    bMod.moveBoundaryVertexNoUpdate
+                    (
+                        edgePoints[epI],
+                        oldEdgePositions[epI]
+                    );
+
+                    ++nRolledBack;
+                }
+
+                Info
+                    << "[EDGEOPT_TRANSACTION]"
+                    << " phase=optimize"
+                    << " iteration=" << i
+                    << " input=" << edgePoints.size()
+                    << " accepted="
+                    << (edgePoints.size() - nRolledBack)
+                    << " rolledBack=" << nRolledBack
+                    << endl;
+            }
+            else
+            {
+                // Keep existing parallel behaviour pending an explicit audit
+                // of mapToSmallestDistance() cross-rank acceptance semantics.
+                mapperPtr->mapEdgeNodes(edgePoints);
+            }
+        }
 
         //- update the geometry information
         bMod.updateGeometry(edgePoints);
@@ -719,7 +1284,8 @@ void meshSurfaceOptimizer::optimizeSurface2D(const label nIterations)
         mesh2DEngine.correctPoints();
 
         //- map boundary edges to the surface
-        mapperPtr->mapVerticesOntoSurfacePatches(activeEdges);
+        if( mapperPtr )
+            mapperPtr->mapVerticesOntoSurfacePatches(activeEdges);
 
         //- update normal, centres, etc, after the surface has been modified
         bMod.updateGeometry(updatePoints);
@@ -748,7 +1314,7 @@ void meshSurfaceOptimizer::optimizeSurface2D(const label nIterations)
         mesh2DEngine.correctPoints();
 
         //- update geometrical data due to movement of vertices
-        bMod.updateGeometry();
+        bMod.updateGeometry(movedPoints);
     }
 
     Info << endl;
@@ -856,6 +1422,7 @@ void meshSurfaceOptimizer::untangleSurface2D()
             //- ensure that all processors have the same Pts active
             forAll(receivedData, i)
             {
+                if( !globalToLocal.found(receivedData[i]) ) continue;
                 const label bpI = globalToLocal[receivedData[i]];
 
                 //- activate this boundary point

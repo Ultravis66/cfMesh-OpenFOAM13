@@ -86,10 +86,19 @@ class meshSurfaceOptimizer
         //- enforce constraints
         bool enforceConstraints_;
 
+        //- Make feature-edge smoothing transactional:
+        //- rejected constrained remaps restore the pre-smoothing position.
+        //- Disabled by default so existing optimizer call sites retain
+        //- legacy behaviour unless explicitly enabled.
+        bool transactionalFeatureOptimization_;
+
         //- name of the subset contaning tangled points
         word badPointsSubsetName_;
 
     // Private member functions
+        //- BL/BL junction points constrained to slide along feature curves
+        labelHashSet featureEdgePoints_;
+
         //- classify surface vertices as PARTITION, EDGE, CORNER
         void classifySurfaceVertices();
 
@@ -246,7 +255,8 @@ class meshSurfaceOptimizer
             EDGE = 2,
             CORNER = 4,
             PROCBND = 8,
-            LOCKED = 16
+            LOCKED = 16,
+            FEATURE_EDGE = 32
         };
 
 public:
@@ -294,6 +304,44 @@ public:
         //- Points which must be moved away from the required position are
         //- stored into a point subset
         void enforceConstraints(const word subsetName="badPoints");
+
+        //- Opt in to transactional feature-edge smoothing.
+        void enableTransactionalFeatureOptimization()
+        {
+            transactionalFeatureOptimization_ = true;
+        }
+
+        //- constrain BL/BL junction points to preserve feature edges
+        //- must be called AFTER construction since vertexType_ is already set
+        void setFeatureEdgePoints(const labelHashSet& featurePts)
+        {
+            featureEdgePoints_ = featurePts;
+
+            forAllConstIter(labelHashSet, featureEdgePoints_, it)
+            {
+                const label bpI = it.key();
+
+                if( bpI < 0 || bpI >= label(vertexType_.size()) )
+                    continue;
+
+                if( vertexType_[bpI] & CORNER )
+                    vertexType_[bpI] |= FEATURE_EDGE;
+                else
+                    vertexType_[bpI] = EDGE | FEATURE_EDGE;
+            }
+        }
+
+        //- lock acute BL+BL+neutral corner points -- prevent optimizer movement
+        void setAcuteCornerPoints(const labelHashSet& acutePts)
+        {
+            forAllConstIter(labelHashSet, acutePts, it)
+            {
+                const label bpI = it.key();
+                if( bpI < 0 || bpI >= label(vertexType_.size()) )
+                    continue;
+                vertexType_[bpI] = LOCKED | FEATURE_EDGE;
+            }
+        }
 
         //- runs a surface smoother on the selected boundary points
         bool untangleSurface

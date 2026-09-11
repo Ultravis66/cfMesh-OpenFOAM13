@@ -39,6 +39,7 @@ Description
 
 # ifdef USE_OMP
 #include <omp.h>
+#include "polyMeshGenChecks.H"
 # endif
 
 //#define DEBUGMapping
@@ -124,7 +125,10 @@ void correctEdgesBetweenPatches::decomposeProblematicFaces()
         label counter(0);
         while( counter < receivedData.size() )
         {
-            featureBndEdge[globalToLocalEdge[receivedData[counter++]]] = true;
+            const label geI = receivedData[counter++];
+            if( !globalToLocalEdge.found(geI) ) continue;
+            if( !globalToLocalEdge.found(geI) ) continue;
+            featureBndEdge[globalToLocalEdge[geI]] = true;
         }
     }
 
@@ -345,8 +349,10 @@ void correctEdgesBetweenPatches::decomposeConcaveFaces()
 
         for(label i=0;i<receivedData.size();)
         {
-            const label beI = globalToLocal[receivedData[i++]];
+            const label geI = receivedData[i++];
             const label patchI = receivedData[i++];
+            if( !globalToLocal.found(geI) ) continue;
+            const label beI = globalToLocal[geI];
             if( edgeInPatch[beI] == -1 )
             {
                 edgeInPatch[beI] = patchI;
@@ -439,6 +445,7 @@ void correctEdgesBetweenPatches::decomposeConcaveFaces()
 void correctEdgesBetweenPatches::patchCorrection()
 {
     Info << "Performing patch correction" << endl;
+    newPatchCorrectionPoints_.clear();
 
     const meshSurfaceEngine& mse = meshSurface();
 
@@ -497,6 +504,66 @@ void correctEdgesBetweenPatches::patchCorrection()
     face triF(3);
 
     label nDecomposedFaces(0);
+
+    // Diagnostic only: quantify whether face::centre() is a
+    // geometrically admissible fan apex for >4-sided patch faces.
+    label nFanApex = 0;
+    label nFanApexOutsideAabb = 0;
+    label worstFanApexBfI = -1;
+    scalar maxFanApexOffsetRatio = -1.0;
+
+    // Diagnostic only: test whether the arithmetic-mean fan is
+    // orientation-coherent. A reversed fan triangle indicates that
+    // the bounded apex is not geometrically admissible as a simple
+    // star fan for this polygon.
+    label nFanCoherenceChecked = 0;
+    label nFanWithReverse = 0;
+    label nFanWithNearFold = 0;
+    label nFanRejected = 0;
+    scalar worstFanMinAlignment = 1.0;
+    label worstFanAlignmentBfI = -1;
+
+    // Diagnostic only: retain provenance of every fan decomposition
+    // so any post-patchCorrection negative owner can be tied directly
+    // back to the boundary face/apex which created it.
+    DynamicList<label> fanDiagBfI;
+    DynamicList<label> fanDiagOwner;
+    DynamicList<label> fanDiagPatch;
+    DynamicList<label> fanDiagNVerts;
+    DynamicList<point> fanDiagApex;
+
+    // Diagnostic only: provenance for legacy 4-sided split.
+    DynamicList<label> quadDiagBfI;
+    DynamicList<label> quadDiagOwner;
+    DynamicList<label> quadDiagPatch;
+    DynamicList<label> quadDiagCorner;
+    DynamicList<label> quadDiagA;
+    DynamicList<label> quadDiagB;
+
+    // General patch-correction transaction state.
+    //
+    // 0 = unchanged
+    // 1 = >4-sided arithmetic-apex fan
+    // 2 = quad split
+    labelList patchCorrectionType(bFaces.size(), 0);
+    labelList quadCorrectionCorner(bFaces.size(), -1);
+
+    // Fan candidates remain virtual until the complete patch-correction
+    // transaction has been accepted.  No mesh point is allocated during
+    // discovery.
+    List<point> fanCorrectionApex
+    (
+        bFaces.size(),
+        point::zero
+    );
+
+    labelList fanCorrectionApexPoint(bFaces.size(), -1);
+
+    // 0 = legacy i--i+2 diagonal
+    // 1 = alternate (i+1)--(i-1) diagonal
+    // -1 = preserve original quad
+    labelList quadCorrectionChoice(bFaces.size(), 0);
+
     forAll(bFaces, bfI)
     {
         const face& bf = bFaces[bfI];
@@ -513,49 +580,331 @@ void correctEdgesBetweenPatches::patchCorrection()
             {
                 if( bf.size() > 4 )
                 {
-                    store = false;
-                    ++nDecomposedFaces;
-                    decomposeCell_[boundaryFaceOwners[bfI]] = true;
-                    decompose_ = true;
+                    // Defer topology mutation state until the bounded
+                    // arithmetic-mean fan has passed its geometric
+                    // coherence test.
 
                     //- decompose into triangles
                     const point p = bf.centre(mesh_.points());
-                    triF[2] = mesh_.points().size();
-                    mesh_.points().append(p);
 
-                    forAll(bf, j)
+                    // Diagnostic only: compare the OpenFOAM
+                    // area-weighted face centre with the raw vertex
+                    // cloud of this polygon.
+                    point pAvg = point::zero;
+
+                    scalar minX = GREAT;
+                    scalar minY = GREAT;
+                    scalar minZ = GREAT;
+                    scalar maxX = -GREAT;
+                    scalar maxY = -GREAT;
+                    scalar maxZ = -GREAT;
+                    scalar maxEdgeLen = 0.0;
+
+                    forAll(bf, fpI)
                     {
-                        triF[0] = bf[j];
-                        triF[1] = bf.nextLabel(j);
+                        const point& fp =
+                            mesh_.points()[bf[fpI]];
 
-                        newBoundaryFaces_.appendList(triF);
-                        newBoundaryOwners_.append(boundaryFaceOwners[bfI]);
-                        newBoundaryPatches_.append(facePatches[bfI]);
+                        pAvg += fp;
+
+                        minX = Foam::min(minX, fp.x());
+                        minY = Foam::min(minY, fp.y());
+                        minZ = Foam::min(minZ, fp.z());
+
+                        maxX = Foam::max(maxX, fp.x());
+                        maxY = Foam::max(maxY, fp.y());
+                        maxZ = Foam::max(maxZ, fp.z());
+
+                        const point& fpNext =
+                            mesh_.points()
+                            [
+                                bf[bf.fcIndex(fpI)]
+                            ];
+
+                        maxEdgeLen =
+                            Foam::max
+                            (
+                                maxEdgeLen,
+                                mag(fpNext - fp)
+                            );
                     }
+
+                    pAvg /= scalar(bf.size());
+
+                    const point aabbMin(minX, minY, minZ);
+                    const point aabbMax(maxX, maxY, maxZ);
+
+                    const scalar aabbDiag =
+                        mag(aabbMax - aabbMin);
+
+                    const scalar localScale =
+                        Foam::max
+                        (
+                            Foam::max(aabbDiag, maxEdgeLen),
+                            VSMALL
+                        );
+
+                    // Evaluate orientation coherence of the
+                    // exact arithmetic-mean fan which would be created.
+                    vector aggregateFanArea = vector::zero;
+
+                    forAll(bf, fpI)
+                    {
+                        const point& fp =
+                            mesh_.points()[bf[fpI]];
+
+                        const point& fpNext =
+                            mesh_.points()
+                            [
+                                bf[bf.fcIndex(fpI)]
+                            ];
+
+                        aggregateFanArea +=
+                            0.5
+                           *((fpNext - fp) ^ (pAvg - fp));
+                    }
+
+                    scalar minFanAlignment = 1.0;
+                    label nReverseTriangles = 0;
+                    label nNearFoldTriangles = 0;
+
+                    const scalar aggregateMag =
+                        mag(aggregateFanArea);
+
+                    if( aggregateMag > VSMALL )
+                    {
+                        forAll(bf, fpI)
+                        {
+                            const point& fp =
+                                mesh_.points()[bf[fpI]];
+
+                            const point& fpNext =
+                                mesh_.points()
+                                [
+                                    bf[bf.fcIndex(fpI)]
+                                ];
+
+                            const vector triArea =
+                                0.5
+                               *((fpNext - fp) ^ (pAvg - fp));
+
+                            const scalar triMag =
+                                mag(triArea);
+
+                            scalar alignment = -1.0;
+
+                            if( triMag > VSMALL )
+                            {
+                                alignment =
+                                    (triArea & aggregateFanArea)
+                                   /(triMag*aggregateMag);
+                            }
+
+                            minFanAlignment =
+                                Foam::min
+                                (
+                                    minFanAlignment,
+                                    alignment
+                                );
+
+                            if( alignment <= 0.0 )
+                            {
+                                ++nReverseTriangles;
+                            }
+                            else if( alignment < 0.1 )
+                            {
+                                ++nNearFoldTriangles;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        minFanAlignment = -1.0;
+                        nReverseTriangles = bf.size();
+                    }
+
+                    ++nFanCoherenceChecked;
+
+                    if( nReverseTriangles != 0 )
+                        ++nFanWithReverse;
+
+                    if( nNearFoldTriangles != 0 )
+                        ++nFanWithNearFold;
+
+                    if
+                    (
+                        minFanAlignment <
+                        worstFanMinAlignment
+                    )
+                    {
+                        worstFanMinAlignment =
+                            minFanAlignment;
+
+                        worstFanAlignmentBfI =
+                            bfI;
+                    }
+
+                    if
+                    (
+                        nReverseTriangles != 0
+                     || nNearFoldTriangles != 0
+                    )
+                    {
+                        Info
+                            << "[PATCH_FAN_COHERENCE]"
+                            << " bfI=" << bfI
+                            << " owner="
+                            << boundaryFaceOwners[bfI]
+                            << " patch="
+                            << facePatches[bfI]
+                            << " nVerts=" << bf.size()
+                            << " minAlignment="
+                            << minFanAlignment
+                            << " reverse="
+                            << nReverseTriangles
+                            << " nearFold="
+                            << nNearFoldTriangles
+                            << " pAvg=" << pAvg
+                            << endl;
+                    }
+
+                    const scalar centreOffset =
+                        mag(p - pAvg);
+
+                    const scalar centreOffsetRatio =
+                        centreOffset/localScale;
+
+                    const bool outsideAabb =
+                    (
+                        p.x() < minX - SMALL ||
+                        p.x() > maxX + SMALL ||
+                        p.y() < minY - SMALL ||
+                        p.y() > maxY + SMALL ||
+                        p.z() < minZ - SMALL ||
+                        p.z() > maxZ + SMALL
+                    );
+
+                    ++nFanApex;
+
+                    if( outsideAabb )
+                    {
+                        ++nFanApexOutsideAabb;
+                    }
+
+                    if
+                    (
+                        centreOffsetRatio >
+                        maxFanApexOffsetRatio
+                    )
+                    {
+                        maxFanApexOffsetRatio =
+                            centreOffsetRatio;
+
+                        worstFanApexBfI = bfI;
+                    }
+
+                    if
+                    (
+                        outsideAabb ||
+                        centreOffsetRatio > 0.25
+                    )
+                    {
+                        Info
+                            << "[PATCH_APEX_DIAG]"
+                            << " bfI=" << bfI
+                            << " owner="
+                            << boundaryFaceOwners[bfI]
+                            << " patch="
+                            << facePatches[bfI]
+                            << " nVerts=" << bf.size()
+                            << " pAvg=" << pAvg
+                            << " pCtr=" << p
+                            << " aabbMin=" << aabbMin
+                            << " aabbMax=" << aabbMax
+                            << " aabbDiag=" << aabbDiag
+                            << " maxEdgeLen=" << maxEdgeLen
+                            << " centreOffset="
+                            << centreOffset
+                            << " offsetRatio="
+                            << centreOffsetRatio
+                            << " outsideAabb="
+                            << outsideAabb
+                            << endl;
+                    }
+
+                    // Production admissibility gate:
+                    //
+                    // A bounded apex is not sufficient by itself.
+                    // Every oriented triangle in the proposed fan must
+                    // agree with the aggregate fan orientation.  The
+                    // diagnostic assigns alignment=-1 for degenerate
+                    // triangles or a degenerate aggregate fan, so those
+                    // cases also fail closed here.
+                    if( nReverseTriangles != 0 )
+                    {
+                        ++nFanRejected;
+
+                        Info
+                            << "[PATCH_FAN_REJECT]"
+                            << " bfI=" << bfI
+                            << " owner="
+                            << boundaryFaceOwners[bfI]
+                            << " patch="
+                            << facePatches[bfI]
+                            << " nVerts=" << bf.size()
+                            << " minAlignment="
+                            << minFanAlignment
+                            << " reverse="
+                            << nReverseTriangles
+                            << " nearFold="
+                            << nNearFoldTriangles
+                            << " action=preserveOriginal"
+                            << endl;
+
+                        // store remains true, so the original polygon is
+                        // retained by the normal unchanged-face path.
+                        break;
+                    }
+
+                    // The exact fan candidate is geometrically coherent.
+                    // Record it, but defer ALL decomposition state until
+                    // the complete prospective owner cell has passed the
+                    // transaction gate.
+                    store = false;
+
+                    fanDiagBfI.append(bfI);
+                    fanDiagOwner.append(boundaryFaceOwners[bfI]);
+                    fanDiagPatch.append(facePatches[bfI]);
+                    fanDiagNVerts.append(bf.size());
+                    fanDiagApex.append(pAvg);
+
+                    // Store only the accepted geometric candidate.
+                    // The physical mesh point is allocated later, during
+                    // the single final boundary commit.
+                    patchCorrectionType[bfI] = 1;
+                    fanCorrectionApex[bfI] = pAvg;
 
                     break;
                 }
                 else if( bf.size() == 4 )
                 {
                     store = false;
-                    ++nDecomposedFaces;
-                    decomposeCell_[boundaryFaceOwners[bfI]] = true;
-                    decompose_ = true;
 
-                    //- decompose the quad into 2 triangles
-                    triF[0] = bf[i];
+                    // Defer the actual diagonal choice until all corrected
+                    // quads belonging to the same owner cell are known.
+                    // Choices belonging to one owner are evaluated together
+                    // against the exact prospective owner-cell volume.
+                    patchCorrectionType[bfI] = 2;
+                    quadCorrectionCorner[bfI] = i;
 
-                    triF[1] = bf.nextLabel(i);
-                    triF[2] = bf[(i+2)%4];
-                    newBoundaryFaces_.appendList(triF);
-                    newBoundaryOwners_.append(boundaryFaceOwners[bfI]);
-                    newBoundaryPatches_.append(facePatches[bfI]);
-
-                    triF[1] = bf[(i+2)%4];
-                    triF[2] = bf.prevLabel(i);
-                    newBoundaryFaces_.appendList(triF);
-                    newBoundaryOwners_.append(boundaryFaceOwners[bfI]);
-                    newBoundaryPatches_.append(facePatches[bfI]);
+                    // Retain provenance while this algorithm is being
+                    // validated.
+                    quadDiagBfI.append(bfI);
+                    quadDiagOwner.append(boundaryFaceOwners[bfI]);
+                    quadDiagPatch.append(facePatches[bfI]);
+                    quadDiagCorner.append(i);
+                    quadDiagA.append(bf[i]);
+                    quadDiagB.append(bf[(i+2)%4]);
 
                     break;
                 }
@@ -571,6 +920,840 @@ void correctEdgesBetweenPatches::patchCorrection()
         }
     }
 
+
+    // -----------------------------------------------------------------
+    // General quad-diagonal transaction.
+    //
+    // Boundary replacement reconstructs the physical boundary faces in
+    // every affected owner cell.  Therefore choose all quad diagonals
+    // belonging to an owner together, before replaceBoundary() mutates
+    // anything.
+    //
+    // The prospective volume below duplicates the face-centre/face-area
+    // representation and raw signed-volume arithmetic used by
+    // polyMeshGenChecks::checkCellVolumes().
+    // -----------------------------------------------------------------
+
+    const faceListPMG& allFaces = mesh_.faces();
+    const cellListPMG& allCells = mesh_.cells();
+    const labelList& allOwners = mesh_.owner();
+    const pointFieldPMG& allPoints = mesh_.points();
+
+    const label boundaryStart =
+        mesh_.boundaries()[0].patchStart();
+
+    const label boundaryEnd =
+        boundaryStart + bFaces.size();
+
+
+    auto calcVirtualFaceGeometry =
+    [&]
+    (
+        const face& vf,
+        point& fc,
+        vector& fa
+    )
+    {
+        const label nPoints = vf.size();
+
+        if( nPoints == 3 )
+        {
+            fc =
+                (1.0/3.0)
+               *(
+                    allPoints[vf[0]]
+                  + allPoints[vf[1]]
+                  + allPoints[vf[2]]
+                );
+
+            fa =
+                0.5
+               *(
+                    (allPoints[vf[1]] - allPoints[vf[0]])
+                  ^ (allPoints[vf[2]] - allPoints[vf[0]])
+                );
+
+            return;
+        }
+
+        vector sumN = vector::zero;
+        scalar sumA = 0.0;
+        vector sumAc = vector::zero;
+
+        point fCentre = allPoints[vf[0]];
+
+        for(label pi=1; pi<nPoints; ++pi)
+            fCentre += allPoints[vf[pi]];
+
+        fCentre /= scalar(nPoints);
+
+        for(label pi=0; pi<nPoints; ++pi)
+        {
+            const point& nextPoint =
+                allPoints[vf[(pi+1)%nPoints]];
+
+            const vector c =
+                allPoints[vf[pi]]
+              + nextPoint
+              + fCentre;
+
+            const vector n =
+                (nextPoint - allPoints[vf[pi]])
+              ^ (fCentre - allPoints[vf[pi]]);
+
+            const scalar a = mag(n);
+
+            sumN += n;
+            sumA += a;
+            sumAc += a*c;
+        }
+
+        fc =
+            (1.0/3.0)
+           *sumAc/(sumA + VSMALL);
+
+        fa = 0.5*sumN;
+    };
+
+
+    auto appendFaceGeometry =
+    [&]
+    (
+        const face& vf,
+        const bool reverseOrientation,
+        DynamicList<point>& centres,
+        DynamicList<vector>& areas
+    )
+    {
+        point fc(point::zero);
+        vector fa(vector::zero);
+
+        calcVirtualFaceGeometry(vf, fc, fa);
+
+        if( reverseOrientation )
+            fa = -fa;
+
+        centres.append(fc);
+        areas.append(fa);
+    };
+
+
+    auto appendVirtualTriangleGeometry =
+    [&]
+    (
+        const point& p0,
+        const point& p1,
+        const point& p2,
+        const bool reverseOrientation,
+        DynamicList<point>& centres,
+        DynamicList<vector>& areas
+    )
+    {
+        const point fc =
+            (1.0/3.0)*(p0 + p1 + p2);
+
+        vector fa =
+            0.5*((p1 - p0) ^ (p2 - p0));
+
+        if( reverseOrientation )
+            fa = -fa;
+
+        centres.append(fc);
+        areas.append(fa);
+    };
+
+
+    auto prospectiveOwnerVolume =
+    [&]
+    (
+        const label ownerCell,
+        const DynamicList<label>& ownerQuadBfI,
+        const label choiceMask,
+        const bool preserveAllQuads
+    ) -> scalar
+    {
+        DynamicList<point> centres;
+        DynamicList<vector> areas;
+
+        const cell& c = allCells[ownerCell];
+
+        forAll(c, cfI)
+        {
+            const label faceI = c[cfI];
+
+            const bool physicalBoundary =
+            (
+                faceI >= boundaryStart
+             && faceI < boundaryEnd
+            );
+
+            if( !physicalBoundary )
+            {
+                appendFaceGeometry
+                (
+                    allFaces[faceI],
+                    allOwners[faceI] != ownerCell,
+                    centres,
+                    areas
+                );
+
+                continue;
+            }
+
+
+            const label bfI =
+                faceI - boundaryStart;
+
+            const face& bf = bFaces[bfI];
+
+            if( patchCorrectionType[bfI] == 0 )
+            {
+                appendFaceGeometry
+                (
+                    bf,
+                    false,
+                    centres,
+                    areas
+                );
+
+                continue;
+            }
+
+
+            if( patchCorrectionType[bfI] == 1 )
+            {
+                const point& apex =
+                    fanCorrectionApex[bfI];
+
+                forAll(bf, j)
+                {
+                    appendVirtualTriangleGeometry
+                    (
+                        allPoints[bf[j]],
+                        allPoints[bf.nextLabel(j)],
+                        apex,
+                        false,
+                        centres,
+                        areas
+                    );
+                }
+
+                continue;
+            }
+
+
+            // Quad correction.
+            if( preserveAllQuads )
+            {
+                appendFaceGeometry
+                (
+                    bf,
+                    false,
+                    centres,
+                    areas
+                );
+
+                continue;
+            }
+
+
+            label localQuadI = -1;
+
+            forAll(ownerQuadBfI, qI)
+            {
+                if( ownerQuadBfI[qI] == bfI )
+                {
+                    localQuadI = qI;
+                    break;
+                }
+            }
+
+            if( localQuadI < 0 )
+                return -GREAT;
+
+
+            const label i =
+                quadCorrectionCorner[bfI];
+
+            if( i < 0 )
+                return -GREAT;
+
+
+            const bool alternate =
+                (choiceMask & (label(1) << localQuadI));
+
+            face t0(3);
+            face t1(3);
+
+            if( !alternate )
+            {
+                // Legacy diagonal i -- i+2.
+                t0[0] = bf[i];
+                t0[1] = bf.nextLabel(i);
+                t0[2] = bf[(i+2)%4];
+
+                t1[0] = bf[i];
+                t1[1] = bf[(i+2)%4];
+                t1[2] = bf.prevLabel(i);
+            }
+            else
+            {
+                // Alternate diagonal (i+1) -- (i-1).
+                t0[0] = bf[i];
+                t0[1] = bf.nextLabel(i);
+                t0[2] = bf.prevLabel(i);
+
+                t1[0] = bf.nextLabel(i);
+                t1[1] = bf[(i+2)%4];
+                t1[2] = bf.prevLabel(i);
+            }
+
+            appendFaceGeometry
+            (
+                t0,
+                false,
+                centres,
+                areas
+            );
+
+            appendFaceGeometry
+            (
+                t1,
+                false,
+                centres,
+                areas
+            );
+        }
+
+
+        if( centres.size() == 0 )
+            return -GREAT;
+
+
+        point cEst(point::zero);
+
+        forAll(centres, fI)
+            cEst += centres[fI];
+
+        cEst /= scalar(centres.size());
+
+
+        scalar cellVol = 0.0;
+
+        forAll(centres, fI)
+        {
+            cellVol +=
+                areas[fI] & (centres[fI] - cEst);
+        }
+
+        return cellVol/3.0;
+    };
+
+
+    labelHashSet correctionOwnerSet;
+
+    forAll(quadDiagOwner, qI)
+        correctionOwnerSet.insert(quadDiagOwner[qI]);
+
+    forAll(fanDiagOwner, fI)
+        correctionOwnerSet.insert(fanDiagOwner[fI]);
+
+
+    label nCorrectionOwnerGroups = 0;
+
+    label nFanOnlyOwnerGroups = 0;
+    label nFanOnlyAcceptedGroups = 0;
+    label nFanOnlyPreservedGroups = 0;
+
+    label nQuadOwnerGroups = 0;
+    label nQuadLegacySafeGroups = 0;
+    label nQuadAlternateGroups = 0;
+    label nQuadAlternateFaces = 0;
+    label nQuadPreservedGroups = 0;
+
+    const label maxEnumeratedQuadsPerOwner = 8;
+
+
+    forAllConstIter(labelHashSet, correctionOwnerSet, ownIt)
+    {
+        const label ownerCell = ownIt.key();
+
+        DynamicList<label> ownerQuadBfI;
+
+        forAll(quadDiagOwner, qI)
+        {
+            if( quadDiagOwner[qI] == ownerCell )
+                ownerQuadBfI.append(quadDiagBfI[qI]);
+        }
+
+        const label nQuads =
+            ownerQuadBfI.size();
+
+        ++nCorrectionOwnerGroups;
+
+        if( nQuads == 0 )
+        {
+            ++nFanOnlyOwnerGroups;
+
+            const scalar proposedVolume =
+                prospectiveOwnerVolume
+                (
+                    ownerCell,
+                    ownerQuadBfI,
+                    0,
+                    false
+                );
+
+            if( proposedVolume >= VSMALL )
+            {
+                ++nFanOnlyAcceptedGroups;
+            }
+            else
+            {
+                // Fail closed.  No point has been allocated yet, so
+                // preserving these polygons leaves no orphan geometry
+                // and no partial topology mutation.
+                forAll(fanDiagOwner, fI)
+                {
+                    if( fanDiagOwner[fI] == ownerCell )
+                    {
+                        patchCorrectionType
+                        [
+                            fanDiagBfI[fI]
+                        ] = 0;
+                    }
+                }
+
+                ++nFanOnlyPreservedGroups;
+
+                Info
+                    << "[PATCH_FAN_OWNER_TRANSACTION]"
+                    << " owner=" << ownerCell
+                    << " action=preserve"
+                    << " proposedVol="
+                    << proposedVolume
+                    << endl;
+            }
+
+            continue;
+        }
+
+        ++nQuadOwnerGroups;
+
+
+        if( nQuads > maxEnumeratedQuadsPerOwner )
+        {
+            const scalar preserveVol =
+                prospectiveOwnerVolume
+                (
+                    ownerCell,
+                    ownerQuadBfI,
+                    0,
+                    true
+                );
+
+            if( preserveVol < VSMALL )
+            {
+                FatalErrorIn
+                (
+                    "void correctEdgesBetweenPatches::patchCorrection()"
+                )
+                    << "Cannot preserve positive owner cell "
+                    << ownerCell
+                    << " when quad transaction exceeds complexity guard."
+                    << " nQuads=" << nQuads
+                    << " preserveVol=" << preserveVol
+                    << abort(FatalError);
+            }
+
+            forAll(ownerQuadBfI, qI)
+            {
+                const label bfI = ownerQuadBfI[qI];
+
+                patchCorrectionType[bfI] = 0;
+                quadCorrectionChoice[bfI] = -1;
+            }
+
+            ++nQuadPreservedGroups;
+
+            Info
+                << "[PATCH_QUAD_OWNER_TRANSACTION]"
+                << " owner=" << ownerCell
+                << " nQuads=" << nQuads
+                << " action=preserve"
+                << " reason=complexityGuard"
+                << " preserveVol=" << preserveVol
+                << endl;
+
+            continue;
+        }
+
+
+        const scalar legacyVolume =
+            prospectiveOwnerVolume
+            (
+                ownerCell,
+                ownerQuadBfI,
+                0,
+                false
+            );
+
+
+        label selectedMask = -1;
+        scalar selectedVolume = -GREAT;
+
+
+        // Preserve historical behaviour whenever it is already valid.
+        if( legacyVolume >= VSMALL )
+        {
+            selectedMask = 0;
+            selectedVolume = legacyVolume;
+            ++nQuadLegacySafeGroups;
+        }
+        else
+        {
+            const label nCombinations =
+                label(1) << nQuads;
+
+            for
+            (
+                label mask=1;
+                mask<nCombinations;
+                ++mask
+            )
+            {
+                const scalar candidateVolume =
+                    prospectiveOwnerVolume
+                    (
+                        ownerCell,
+                        ownerQuadBfI,
+                        mask,
+                        false
+                    );
+
+                if
+                (
+                    candidateVolume >= VSMALL
+                 && candidateVolume > selectedVolume
+                )
+                {
+                    selectedMask = mask;
+                    selectedVolume = candidateVolume;
+                }
+            }
+        }
+
+
+        if( selectedMask < 0 )
+        {
+            // Fail closed: retain the original quads rather than creating
+            // a known non-positive owner cell.
+            const scalar preserveVol =
+                prospectiveOwnerVolume
+                (
+                    ownerCell,
+                    ownerQuadBfI,
+                    0,
+                    true
+                );
+
+            if( preserveVol < VSMALL )
+            {
+                FatalErrorIn
+                (
+                    "void correctEdgesBetweenPatches::patchCorrection()"
+                )
+                    << "No positive quad decomposition or preservation "
+                    << "exists for owner " << ownerCell
+                    << ". legacyVol=" << legacyVolume
+                    << " preserveVol=" << preserveVol
+                    << abort(FatalError);
+            }
+
+            forAll(ownerQuadBfI, qI)
+            {
+                const label bfI = ownerQuadBfI[qI];
+
+                patchCorrectionType[bfI] = 0;
+                quadCorrectionChoice[bfI] = -1;
+            }
+
+            ++nQuadPreservedGroups;
+
+            Info
+                << "[PATCH_QUAD_OWNER_TRANSACTION]"
+                << " owner=" << ownerCell
+                << " nQuads=" << nQuads
+                << " action=preserve"
+                << " legacyVol=" << legacyVolume
+                << " preserveVol=" << preserveVol
+                << endl;
+
+            continue;
+        }
+
+
+        label nAlternateThisOwner = 0;
+
+        forAll(ownerQuadBfI, qI)
+        {
+            const label bfI = ownerQuadBfI[qI];
+
+            const label choice =
+                (
+                    selectedMask
+                  & (label(1) << qI)
+                )
+              ? 1
+              : 0;
+
+            quadCorrectionChoice[bfI] = choice;
+
+            if( choice == 1 )
+            {
+                ++nAlternateThisOwner;
+                ++nQuadAlternateFaces;
+            }
+
+            ++nDecomposedFaces;
+        }
+
+        decomposeCell_[ownerCell] = true;
+        decompose_ = true;
+
+
+        if( selectedMask != 0 )
+        {
+            ++nQuadAlternateGroups;
+
+            Info
+                << "[PATCH_QUAD_OWNER_TRANSACTION]"
+                << " owner=" << ownerCell
+                << " nQuads=" << nQuads
+                << " action=alternate"
+                << " selectedMask=" << selectedMask
+                << " alternateFaces=" << nAlternateThisOwner
+                << " legacyVol=" << legacyVolume
+                << " selectedVol=" << selectedVolume
+                << endl;
+        }
+    }
+
+
+    label nCommittedFanFaces = 0;
+
+    forAll(fanDiagBfI, fI)
+    {
+        const label bfI =
+            fanDiagBfI[fI];
+
+        if( patchCorrectionType[bfI] != 1 )
+            continue;
+
+        ++nCommittedFanFaces;
+        ++nDecomposedFaces;
+
+        decomposeCell_
+        [
+            boundaryFaceOwners[bfI]
+        ] = true;
+
+        decompose_ = true;
+    }
+
+
+    Info
+        << "[PATCH_CORRECTION_TRANSACTION_SUMMARY]"
+        << " ownerGroups=" << nCorrectionOwnerGroups
+        << " fanOnlyGroups=" << nFanOnlyOwnerGroups
+        << " fanOnlyAccepted="
+        << nFanOnlyAcceptedGroups
+        << " fanOnlyPreserved="
+        << nFanOnlyPreservedGroups
+        << " committedFanFaces="
+        << nCommittedFanFaces
+        << endl;
+
+
+    Info
+        << "[PATCH_QUAD_TRANSACTION_SUMMARY]"
+        << " ownerGroups=" << nQuadOwnerGroups
+        << " legacySafeGroups=" << nQuadLegacySafeGroups
+        << " alternateGroups=" << nQuadAlternateGroups
+        << " alternateFaces=" << nQuadAlternateFaces
+        << " preservedGroups=" << nQuadPreservedGroups
+        << endl;
+
+
+    // -----------------------------------------------------------------
+    // Rebuild the complete proposed boundary exactly once using the
+    // owner-cell-selected quad choices.
+    // -----------------------------------------------------------------
+
+    newBoundaryFaces_.clear();
+    newBoundaryOwners_.clear();
+    newBoundaryPatches_.clear();
+
+
+    forAll(bFaces, bfI)
+    {
+        const face& bf = bFaces[bfI];
+
+        if( patchCorrectionType[bfI] == 0 )
+        {
+            newBoundaryFaces_.appendList(bf);
+            newBoundaryOwners_.append
+            (
+                boundaryFaceOwners[bfI]
+            );
+            newBoundaryPatches_.append
+            (
+                facePatches[bfI]
+            );
+
+            continue;
+        }
+
+
+        if( patchCorrectionType[bfI] == 1 )
+        {
+            // The fan has survived geometric admissibility and all
+            // preceding transaction decisions.  Allocate its real mesh
+            // point only now, immediately before the single boundary
+            // commit.
+            const label apexPoint =
+                mesh_.points().size();
+
+            mesh_.points().append
+            (
+                fanCorrectionApex[bfI]
+            );
+
+            fanCorrectionApexPoint[bfI] =
+                apexPoint;
+
+            newPatchCorrectionPoints_.append
+            (
+                apexPoint
+            );
+
+            static label nCommittedFanApex = 0;
+
+            if( ++nCommittedFanApex <= 10 )
+            {
+                Info
+                    << "[GeomFix] committed fan apex point "
+                    << apexPoint
+                    << " at "
+                    << fanCorrectionApex[bfI]
+                    << " patch="
+                    << facePatches[bfI]
+                    << endl;
+            }
+
+            face tf(3);
+            tf[2] = apexPoint;
+
+            forAll(bf, j)
+            {
+                tf[0] = bf[j];
+                tf[1] = bf.nextLabel(j);
+
+                newBoundaryFaces_.appendList(tf);
+                newBoundaryOwners_.append
+                (
+                    boundaryFaceOwners[bfI]
+                );
+                newBoundaryPatches_.append
+                (
+                    facePatches[bfI]
+                );
+            }
+
+            continue;
+        }
+
+
+        const label i =
+            quadCorrectionCorner[bfI];
+
+        const label choice =
+            quadCorrectionChoice[bfI];
+
+        if( i < 0 || (choice != 0 && choice != 1) )
+        {
+            FatalErrorIn
+            (
+                "void correctEdgesBetweenPatches::patchCorrection()"
+            )
+                << "Invalid committed quad state for bfI="
+                << bfI
+                << " corner=" << i
+                << " choice=" << choice
+                << abort(FatalError);
+        }
+
+
+        face t0(3);
+        face t1(3);
+
+        if( choice == 0 )
+        {
+            t0[0] = bf[i];
+            t0[1] = bf.nextLabel(i);
+            t0[2] = bf[(i+2)%4];
+
+            t1[0] = bf[i];
+            t1[1] = bf[(i+2)%4];
+            t1[2] = bf.prevLabel(i);
+        }
+        else
+        {
+            t0[0] = bf[i];
+            t0[1] = bf.nextLabel(i);
+            t0[2] = bf.prevLabel(i);
+
+            t1[0] = bf.nextLabel(i);
+            t1[1] = bf[(i+2)%4];
+            t1[2] = bf.prevLabel(i);
+        }
+
+        newBoundaryFaces_.appendList(t0);
+        newBoundaryOwners_.append
+        (
+            boundaryFaceOwners[bfI]
+        );
+        newBoundaryPatches_.append
+        (
+            facePatches[bfI]
+        );
+
+        newBoundaryFaces_.appendList(t1);
+        newBoundaryOwners_.append
+        (
+            boundaryFaceOwners[bfI]
+        );
+        newBoundaryPatches_.append
+        (
+            facePatches[bfI]
+        );
+    }
+
+
+    Info
+        << "[PATCH_APEX_SUMMARY]"
+        << " fanApexCount=" << nFanApex
+        << " outsideAabb=" << nFanApexOutsideAabb
+        << " maxOffsetRatio=" << maxFanApexOffsetRatio
+        << " worstBfI=" << worstFanApexBfI
+        << " coherenceChecked=" << nFanCoherenceChecked
+        << " fansWithReverse=" << nFanWithReverse
+        << " fansWithNearFold=" << nFanWithNearFold
+        << " rejected=" << nFanRejected
+        << " worstMinAlignment=" << worstFanMinAlignment
+        << " worstAlignmentBfI=" << worstFanAlignmentBfI
+        << endl;
+
     reduce(decompose_, maxOp<bool>());
 
     if( returnReduce(nDecomposedFaces, sumOp<label>()) != 0 )
@@ -578,6 +1761,98 @@ void correctEdgesBetweenPatches::patchCorrection()
         replaceBoundary();
         clearMeshSurface();
         mesh_.clearAddressingData();
+
+        labelHashSet patchNegVolCells;
+
+        polyMeshGenChecks::checkCellVolumes
+        (
+            mesh_,
+            false,
+            &patchNegVolCells
+        );
+
+        label matchedFanOwners = 0;
+        label matchedFanRecords = 0;
+        label matchedQuadOwners = 0;
+        label matchedQuadRecords = 0;
+
+        labelHashSet matchedAnyOwner;
+
+        forAll(fanDiagOwner, i)
+        {
+            if( patchNegVolCells.found(fanDiagOwner[i]) )
+            {
+                ++matchedFanRecords;
+                matchedAnyOwner.insert(fanDiagOwner[i]);
+
+                bool firstForOwner = true;
+
+                for(label j=0; j<i; ++j)
+                {
+                    if
+                    (
+                        fanDiagOwner[j] == fanDiagOwner[i]
+                     && patchNegVolCells.found(fanDiagOwner[j])
+                    )
+                    {
+                        firstForOwner = false;
+                        break;
+                    }
+                }
+
+                if( firstForOwner )
+                {
+                    ++matchedFanOwners;
+                }
+
+                Info
+                    << "[PATCH_RESIDUAL_FAN_OWNER]"
+                    << " cell=" << fanDiagOwner[i]
+                    << " bfI=" << fanDiagBfI[i]
+                    << " patch=" << fanDiagPatch[i]
+                    << " nVerts=" << fanDiagNVerts[i]
+                    << " apex=" << fanDiagApex[i]
+                    << endl;
+            }
+        }
+
+        labelHashSet matchedQuadOwnerSet;
+
+        forAll(quadDiagOwner, i)
+        {
+            if( patchNegVolCells.found(quadDiagOwner[i]) )
+            {
+                ++matchedQuadRecords;
+                matchedQuadOwnerSet.insert(quadDiagOwner[i]);
+                matchedAnyOwner.insert(quadDiagOwner[i]);
+
+                Info
+                    << "[PATCH_RESIDUAL_QUAD_OWNER]"
+                    << " cell=" << quadDiagOwner[i]
+                    << " bfI=" << quadDiagBfI[i]
+                    << " patch=" << quadDiagPatch[i]
+                    << " cornerI=" << quadDiagCorner[i]
+                    << " diagonalPoints="
+                    << quadDiagA[i] << "|" << quadDiagB[i]
+                    << endl;
+            }
+        }
+
+        matchedQuadOwners = matchedQuadOwnerSet.size();
+
+        Info
+            << "[PATCH_RESIDUAL_OWNER_SUMMARY]"
+            << " negVol=" << patchNegVolCells.size()
+            << " fanRecords=" << fanDiagOwner.size()
+            << " matchedFanOwners=" << matchedFanOwners
+            << " matchedFanRecords=" << matchedFanRecords
+            << " quadRecords=" << quadDiagOwner.size()
+            << " matchedQuadOwners=" << matchedQuadOwners
+            << " matchedQuadRecords=" << matchedQuadRecords
+            << " matchedAnyOwners=" << matchedAnyOwner.size()
+            << " unmatchedNegOwners="
+            << patchNegVolCells.size() - matchedAnyOwner.size()
+            << endl;
     }
 
     Info << "Finished with patch correction" << endl;

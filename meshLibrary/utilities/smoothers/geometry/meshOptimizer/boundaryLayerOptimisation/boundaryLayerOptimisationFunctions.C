@@ -271,9 +271,7 @@ void boundaryLayerOptimisation::calculateHairEdges()
     isExitFace_.setSize(isBndLayerBase_.size());
     isExitFace_ = false;
 
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 100)
-    # endif
+    // Serial: isExitFace_[f0/f1]=true races on shared faces
     forAll(edgeFaces, edgeI)
     {
         //- avoid edges at inter-processor boundaries
@@ -354,6 +352,46 @@ void boundaryLayerOptimisation::calculateHairEdges()
     }
 
     thinnedHairEdge_.setSize(hairEdges_.size());
+
+    // Hair-edge dependency audit. Non-mutating diagnostic only.
+    // duplicateEnds: multiple hair edges write the same end point.
+    // startIsEnd: one hair edge reads a point that another hair edge writes.
+    {
+        labelList endCount(mesh_.points().size(), 0);
+        labelList startCount(mesh_.points().size(), 0);
+
+        forAll(hairEdges_, heI)
+        {
+            const edge& he = hairEdges_[heI];
+
+            if( he.start() >= 0 && he.start() < label(startCount.size()) )
+                ++startCount[he.start()];
+
+            if( he.end() >= 0 && he.end() < label(endCount.size()) )
+                ++endCount[he.end()];
+        }
+
+        label duplicateEnds = 0;
+        label startIsEnd = 0;
+        label maxEndCount = 0;
+
+        forAll(endCount, pointI)
+        {
+            if( endCount[pointI] > 1 )
+                ++duplicateEnds;
+
+            if( endCount[pointI] > 0 && startCount[pointI] > 0 )
+                ++startIsEnd;
+
+            maxEndCount = Foam::max(maxEndCount, endCount[pointI]);
+        }
+
+        Info << "Hair-edge dependency audit: hairEdges=" << hairEdges_.size()
+             << " duplicateEndPoints=" << duplicateEnds
+             << " startAlsoEndPoints=" << startIsEnd
+             << " maxEndCount=" << maxEndCount
+             << endl;
+    }
 
     //- calculate which other hair edges influence a hair edges
     //- and store it in a graph
@@ -501,9 +539,7 @@ bool boundaryLayerOptimisation::optimiseLayersAtExittingFaces()
     //- in the previous procedure
     boolList thinnedPoints(mesh_.points().size(), false);
 
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 50)
-    # endif
+    // Serial: modified=true is a shared bool write
     forAll(thinnedHairEdge_, heI)
     {
         if
@@ -530,6 +566,44 @@ bool boundaryLayerOptimisation::optimiseLayersAtExittingFaces()
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// ============================================================
+// CFMITCH V6.0b NORMAL-ONLY
+//
+// Reuse Franjo's coupled hair-neighbour graph and normal smoothing,
+// but deliberately bypass:
+//
+//   optimiseThicknessVariation()
+//   meshSurfaceOptimizer::optimizeSurface()
+//
+// Therefore this mode may rotate hair vectors but does not
+// deliberately modify their lengths or move the boundary surface.
+// ============================================================
+
+void boundaryLayerOptimisation::optimiseHairNormalsOnly()
+{
+    Info
+        << "CFMITCH V6.0b NORMAL-ONLY:"
+        << " smoothing boundary hair directions"
+        << endl;
+
+    optimiseHairNormalsAtTheBoundary();
+
+    Info
+        << "CFMITCH V6.0b NORMAL-ONLY:"
+        << " smoothing internal hair directions"
+        << endl;
+
+    optimiseHairNormalsInside();
+
+    Info
+        << "CFMITCH V6.0b NORMAL-ONLY:"
+        << " finished"
+        << endl;
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
 void boundaryLayerOptimisation::optimiseLayer()
 {
     //- create surface smoother
@@ -554,7 +628,7 @@ void boundaryLayerOptimisation::optimiseLayer()
         //- smoothing thickness variation of boundary hairs
         optimiseThicknessVariation(BOUNDARY);
 
-        if( true )
+        // Surface geometry update after each BL normal/thickness pass
         {
             meshSurfaceEngineModifier bMod(meshSurface());
             bMod.updateGeometry();

@@ -49,13 +49,12 @@ void meshSurfaceOptimizer::classifySurfaceVertices()
     //- set all vertices to partition
     vertexType_ = PARTITION;
 
-    //- set corners
-    forAllConstIter(labelHashSet, corners, it)
-        vertexType_[it.key()] = CORNER;
-
-    //- set edges
+    //- set edges first, then corners override (corner takes precedence)
     forAllConstIter(labelHashSet, edgePoints, it)
         vertexType_[it.key()] = EDGE;
+
+    forAllConstIter(labelHashSet, corners, it)
+        vertexType_[it.key()] = CORNER;
 
     if( Pstream::parRun() )
     {
@@ -83,6 +82,7 @@ meshSurfaceOptimizer::meshSurfaceOptimizer(const meshSurfaceEngine& surface)
     octreePtr_(NULL),
     triMeshPtr_(NULL),
     enforceConstraints_(false),
+    transactionalFeatureOptimization_(false),
     badPointsSubsetName_("invertedBoundaryPoints")
 {
     classifySurfaceVertices();
@@ -93,10 +93,11 @@ meshSurfaceOptimizer::meshSurfaceOptimizer(const meshSurfacePartitioner& mPart)
     surfaceEngine_(mPart.surfaceEngine()),
     vertexType_(surfaceEngine_.boundaryPoints().size()),
     partitionerPtr_(&mPart),
-    deletePartitioner_(true),
+    deletePartitioner_(false),  // Fix: external ref, do not delete
     octreePtr_(NULL),
     triMeshPtr_(NULL),
     enforceConstraints_(false),
+    transactionalFeatureOptimization_(false),
     badPointsSubsetName_("invertedBoundaryPoints")
 {
     classifySurfaceVertices();
@@ -115,6 +116,7 @@ meshSurfaceOptimizer::meshSurfaceOptimizer
     octreePtr_(&octree),
     triMeshPtr_(NULL),
     enforceConstraints_(false),
+    transactionalFeatureOptimization_(false),
     badPointsSubsetName_("invertedBoundaryPoints")
 {
     classifySurfaceVertices();
@@ -133,6 +135,7 @@ meshSurfaceOptimizer::meshSurfaceOptimizer
     octreePtr_(&octree),
     triMeshPtr_(NULL),
     enforceConstraints_(false),
+    transactionalFeatureOptimization_(false),
     badPointsSubsetName_("invertedBoundaryPoints")
 {
     classifySurfaceVertices();
@@ -156,8 +159,7 @@ void meshSurfaceOptimizer::removeUserConstraints()
     # pragma omp parallel for schedule(dynamic, 100)
     # endif
     forAll(vertexType_, bpI)
-        if( vertexType_[bpI] & LOCKED )
-            vertexType_[bpI] ^= LOCKED;
+        vertexType_[bpI] &= ~LOCKED;
 }
 
 void meshSurfaceOptimizer::enforceConstraints(const word subsetName)

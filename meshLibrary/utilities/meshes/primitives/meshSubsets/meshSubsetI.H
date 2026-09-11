@@ -170,7 +170,14 @@ inline bool meshSubset::operator==(const meshSubset& ms) const
 {
     if( ms.name_ != name_ )
         return false;
-    if( ms.type_ != ms.type_ )
+
+    if( ms.type_ != type_ )
+        return false;
+
+    // Equality of the contained label sets requires identical
+    // cardinality as well as membership.  Without this check a
+    // proper subset could compare equal to a larger subset.
+    if( ms.data_.size() != data_.size() )
         return false;
 
     forAllConstIter(std::set<label>, data_, it)

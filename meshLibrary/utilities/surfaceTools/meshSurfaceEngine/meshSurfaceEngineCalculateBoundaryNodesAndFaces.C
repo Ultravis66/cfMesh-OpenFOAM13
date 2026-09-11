@@ -114,7 +114,9 @@ void meshSurfaceEngine::calculateBoundaryOwners() const
 
     labelList& owners = *boundaryFaceOwnersPtr_;
 
-    const label start = mesh_.boundaries()[0].patchStart();
+    label start = mesh_.boundaries()[0].patchStart();
+    if( activePatch_ >= 0 )
+        start = mesh_.boundaries()[activePatch_].patchStart();
 
     # ifdef USE_OMP
     # pragma omp parallel for schedule(static, 1)
@@ -137,8 +139,8 @@ void meshSurfaceEngine::calculateBoundaryNodes() const
 
     # ifdef USE_OMP
     const label nThreads = omp_get_max_threads();
-    # pragma omp parallel for num_threads(nThreads) schedule(static, 1)
     # endif
+    // Serial: multiple faces share points, parallel write to isBndPoint races
     forAll(boundaryFaces, bfI)
     {
         const face& bf = boundaryFaces[bfI];
@@ -217,9 +219,17 @@ void meshSurfaceEngine::calculateBoundaryNodes() const
                     const label fI = receiveData[counter++];
                     const label pI = receiveData[counter++];
 
-                    if( bp[faces[start+fI][pI]] == -1 )
+                    if( fI < 0 || fI >= procBoundaries[patchI].patchSize() )
+                        continue;
+
+                    const face& f = faces[start+fI];
+
+                    if( pI < 0 || pI >= label(f.size()) )
+                        continue;
+
+                    if( bp[f[pI]] == -1 )
                     {
-                        bp[faces[start+fI][pI]] = pointI++;
+                        bp[f[pI]] = pointI++;
                         found = true;
                     }
                 }
@@ -253,16 +263,28 @@ void meshSurfaceEngine::calculateBoundaryFacePatches() const
     boundaryFacePatchPtr_ = new labelList(bFaces.size());
     labelList& facePatch = *boundaryFacePatchPtr_;
 
-    label faceI(0);
     const PtrList<boundaryPatch>& boundaries = mesh_.boundaries();
-    forAll(boundaries, patchI)
+    if( activePatch_ >= 0 )
     {
-        const label nFaces = boundaries[patchI].patchSize();
-        for(label patchFaceI=0;patchFaceI<nFaces;++patchFaceI)
+        forAll(facePatch, i)
+            facePatch[i] = activePatch_;
+    }
+    else
+    {
+        label faceI(0);
+        forAll(boundaries, patchI)
         {
-            facePatch[faceI] = patchI;
-            ++faceI;
+            const label nFaces = boundaries[patchI].patchSize();
+            for(label patchFaceI=0;patchFaceI<nFaces;++patchFaceI)
+                facePatch[faceI++] = patchI;
         }
+        if( faceI != facePatch.size() )
+            FatalErrorIn
+            (
+                "void meshSurfaceEngine::calculateBoundaryFacePatches() const"
+            ) << "Boundary patch addressing mismatch: faceI="
+              << faceI << " facePatch.size()=" << facePatch.size()
+              << exit(FatalError);
     }
 }
 
@@ -587,8 +609,16 @@ void meshSurfaceEngine::calculatePointPatches() const
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label bpI = globalToLocal[receivedData[counter++]];
+            const label gp = receivedData[counter++];
             const label nPatches = receivedData[counter++];
+
+            if( !globalToLocal.found(gp) )
+            {
+                counter += nPatches;
+                continue;
+            }
+
+            const label bpI = globalToLocal[gp];
             for(label i=0;i<nPatches;++i)
                 pPatches.appendIfNotIn(bpI, receivedData[counter++]);
         }
@@ -723,8 +753,15 @@ void meshSurfaceEngine::calculatePointPoints() const
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label bpI = globalToLocal[receivedData[counter++]];
+            const label gp = receivedData[counter++];
             const label size = receivedData[counter++];
+
+            if( !globalToLocal.found(gp) )
+            {
+                counter += size;
+                continue;
+            }
+            const label bpI = globalToLocal[gp];
             for(label i=0;i<size;++i)
             {
                 const label gpI = receivedData[counter++];
@@ -782,6 +819,12 @@ void meshSurfaceEngine::calculateFaceNormals() const
     {
         const face& bf = bFaces[bfI];
 
+        if( bf.size() < 3 )
+        {
+            faceNormalsPtr_->operator[](bfI) = vector::zero;
+            continue;
+        }
+
         // Triangle fan normal (robust for cfMesh face ordering)
         vector normal = vector::zero;
         const point& p0 = points[bf[0]];
@@ -804,6 +847,13 @@ void meshSurfaceEngine::calculateFaceCentres() const
     forAll(bFaces, bfI)
     {
         const face& bf = bFaces[bfI];
+
+        if( bf.empty() )
+        {
+            faceCentresPtr_->operator[](bfI) = vector::zero;
+            continue;
+        }
+
         vector centre = vector::zero;
         forAll(bf, pI)
             centre += points[bf[pI]];
@@ -865,6 +915,9 @@ void meshSurfaceEngine::updatePointNormalsAtProcBoundaries() const
 
     forAll(receivedData, i)
     {
+        if( !globalToLocal.found(receivedData[i].pointLabel()) )
+            continue;
+        if( !globalToLocal.found(receivedData[i].pointLabel()) ) continue;
         const label bpI = globalToLocal[receivedData[i].pointLabel()];
         pNormals[bpI] += receivedData[i].coordinates();
     }
@@ -1067,8 +1120,14 @@ void meshSurfaceEngine::calculateEdgesAndAddressing() const
             label nReceivedEdges(0);
             while( nReceivedEdges < receivedEdges.size() )
             {
-                const face& f = faces[start+receivedEdges[nReceivedEdges++]];
-                const label eI = receivedEdges[nReceivedEdges++];
+                const label fIdx = receivedEdges[nReceivedEdges++];
+                const label eI   = receivedEdges[nReceivedEdges++];
+
+                const label patchSize = procBoundaries[patchI].patchSize();
+                if( fIdx < 0 || fIdx >= patchSize ) continue;
+
+                const face& f = faces[start+fIdx];
+                if( eI < 0 || eI >= label(f.size()) ) continue;
 
                 const edge e = f.faceEdge(eI);
                 const label s = bp[e.start()];
@@ -1083,12 +1142,17 @@ void meshSurfaceEngine::calculateEdgesAndAddressing() const
 
                 if( !found )
                 {
+                    const label bps = bp[e.start()];
+                    const label bpe = bp[e.end()];
+                    if( bps < 0 || bpe < 0 )
+                        continue;
+
                     //- create a new edge
                     addEdges = true;
                     edges.newElmt(edgeI) = e;
 
-                    bpEdges.append(bp[e.start()], edgeI);
-                    bpEdges.append(bp[e.end()], edgeI);
+                    bpEdges.append(bps, edgeI);
+                    bpEdges.append(bpe, edgeI);
                     ++edgeI;
                 }
             }
@@ -1150,6 +1214,11 @@ void meshSurfaceEngine::calculateFaceEdgesAddressing() const
 
                 const label bps = bp[e.start()];
 
+                faceEdges(bfI, eI) = -1;  // sentinel
+
+                if( bps < 0 )
+                    continue;
+
                 forAllRow(bpEdges, bps, peI)
                 {
                     const label beI = bpEdges(bps, peI);
@@ -1198,6 +1267,9 @@ void meshSurfaceEngine::calculateEdgeFacesAddressing() const
             const edge& ee = edges[edgeI];
             const label bpI = bp[ee.start()];
 
+            if( bpI < 0 )
+                continue;
+
             forAllRow(pointFaces, bpI, pfI)
             {
                 const label bfI = pointFaces(bpI, pfI);
@@ -1231,6 +1303,9 @@ void meshSurfaceEngine::calculateEdgeFacesAddressing() const
         {
             const edge& ee = edges[edgeI];
             const label bpI = bp[ee.start()];
+
+            if( bpI < 0 )
+                continue;
 
             //- find boundary faces attached to this edge
             DynList<label> eFaces;
@@ -1305,7 +1380,8 @@ void meshSurfaceEngine::calculateEdgePatchesAddressing() const
         {
             const label beI = it();
 
-            edgePatches.appendIfNotIn(beI, otherPatch[beI]);
+            if( otherPatch.found(beI) )
+                edgePatches.appendIfNotIn(beI, otherPatch[beI]);
         }
     }
 }

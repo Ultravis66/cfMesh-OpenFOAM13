@@ -115,7 +115,8 @@ void edgeExtractor::calculateValence()
         {
             const labelPair& lp = receivedData[i];
 
-            pointValence_[globalToLocal[lp.first()]] += lp.second();
+            if( !globalToLocal.found(lp.first()) ) continue;
+        pointValence_[globalToLocal[lp.first()]] += lp.second();
         }
     }
 }
@@ -385,7 +386,9 @@ void edgeExtractor::markPatchPoints(boolList& patchPoint)
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label beI = globalToLocal[receivedData[counter++]];
+            const label geI_ee = receivedData[counter++];
+        if( !globalToLocal.found(geI_ee) ) { ++counter; continue; }
+        const label beI = globalToLocal[geI_ee];
             const label fPatch = receivedData[counter++];
 
             otherProcPatch[beI] = fPatch;
@@ -459,7 +462,10 @@ void edgeExtractor::markPatchPoints(boolList& patchPoint)
         help::exchangeMap(sendData, receivedData);
 
         forAll(receivedData, i)
-                patchPoint[globalToLocal[receivedData[i]]] = false;
+                {
+                if( !globalToLocal.found(receivedData[i]) ) continue;
+            patchPoint[globalToLocal[receivedData[i]]] = false;
+                }
     }
 }
 
@@ -645,7 +651,9 @@ void edgeExtractor::findOtherFacePatchesParallel
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label beI = globalToLocal[receivedData[counter++]];
+            const label geI_ee = receivedData[counter++];
+        if( !globalToLocal.found(geI_ee) ) { ++counter; continue; }
+        const label beI = globalToLocal[geI_ee];
             const label fPatch = receivedData[counter++];
 
             otherFacePatch.insert(beI, fPatch);
@@ -805,7 +813,8 @@ void edgeExtractor::moveVerticesTowardsDiscontinuities(const label nIterations)
                 const label globalLabel = receivedData[i].objectLabel();
                 const labelledPoint& lp = receivedData[i].lPoint();
 
-                const label bpI = globalToLocal[globalLabel];
+                if( !globalToLocal.found(globalLabel) ) continue;
+            const label bpI = globalToLocal[globalLabel];
 
                 pointDisplacements[bpI].coordinates() += lp.coordinates();
                 pointDisplacements[bpI].pointLabel() += lp.pointLabel();
@@ -1056,12 +1065,23 @@ bool edgeExtractor::distributeBoundaryFacesNormalAlignment()
                 distanceSq[i] = dSq;
             }
 
-            scalar maxAlignment(0.0);
+            //- CONTACT-ROBUSTNESS PATCH (oblique coincident junctions)
+            //- pick best normal-ALIGNED patch first; proximity only breaks ties
+            //- among patches that are essentially co-aligned. Fixes zigzag/noProj.
+            scalar bestAlign(0.0);
             forAll(normalAlignment, i)
+                bestAlign = Foam::max(bestAlign, normalAlignment[i]);
+
+            const scalar alignTol(0.05);   //- tune vs EDGEAUDIT zigzag/noProj
+            scalar maxAlignment(0.0);
+            forAll(allNeiPatches, i)
             {
+                if( normalAlignment[i] < (bestAlign - alignTol) )
+                    continue;
+
                 const scalar metric
                 (
-                    sqrt(maxDSq / (distanceSq[i] + VSMALL)) * normalAlignment[i]
+                    sqrt(maxDSq / (distanceSq[i] + VSMALL))
                 );
 
                 if( metric > maxAlignment )
@@ -1535,9 +1555,7 @@ bool edgeExtractor::checkConcaveEdgeCells()
                         DynList<DynList<label>, 2> facesInPatch;
                         facesInPatch.setSize(2);
 
-                        DynList<label, 2> nFacesInPatch;
-                        nFacesInPatch.setSize(2);
-                        nFacesInPatch = 0;
+                        label nFacesInPatch[2] = {0, 0};
 
                         DynList<bool, 2> hasPatchPoints;
                         hasPatchPoints.setSize(2);
@@ -1908,7 +1926,8 @@ class featureEdgesNeiOp
                 {
                     const labelPair& lp = receivedData[i];
 
-                    nFeatureEdgesAtPoint_[globalToLocal[lp.first()]] +=
+                    if( !globalToLocal.found(lp.first()) ) continue;
+            nFeatureEdgesAtPoint_[globalToLocal[lp.first()]] +=
                         lp.second();
                 }
             }
@@ -2029,6 +2048,7 @@ public:
         forAll(receivedData, i)
         {
             const labelPair& lp = receivedData[i];
+            if( !globalToLocal.found(lp.first()) ) continue;
             const label groupI = elementInGroup[globalToLocal[lp.first()]];
 
             DynList<label>& ng = neiGroups[localGroupLabel[groupI]];
@@ -2140,6 +2160,12 @@ bool edgeExtractor::checkFacePatchesGeometry()
 
         //- untangle the surface
         meshSurfaceOptimizer mso(mPart, meshOctree_);
+
+        // Feature-edge moves made while correcting inverted surface
+        // patches must remain on their geometric feature curves.
+        // Failed constrained remaps restore the pre-smoothing position.
+        mso.enableTransactionalFeatureOptimization();
+
         mso.untangleSurface(activePointLabel, 1);
 
         nCorrected = 0;
@@ -2320,6 +2346,7 @@ void edgeExtractor::projectDeterminedFeatureVertices()
         {
             const labelPair& lp = receivedData[i];
 
+            if( !globalToLocal.found(lp.first()) ) continue;
             pointPatches[globalToLocal[lp.first()]].appendIfNotIn(lp.second());
         }
     }

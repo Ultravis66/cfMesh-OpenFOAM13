@@ -123,6 +123,111 @@ void meshOptimizer::untangleMeshFV
 
     labelHashSet badFaces;
 
+    // CFMitch V5.1f: preserve the actual best point state and stop when
+    // the global relaxed defect count clearly regresses. Other untangler
+    // callers retain the legacy logic.
+    pointField relaxedBestPoints;
+    label relaxedBestBadFaces = 10 * faces.size();
+    label relaxedRegressionStreak = 0;
+    bool relaxedBestValid = false;
+    bool relaxedStop = false;
+
+    auto relaxedRegressionStop =
+    [&](const label observed, const char* phase) -> bool
+    {
+        if( !relaxedCheck ) return false;
+
+        if( !relaxedBestValid || observed < relaxedBestBadFaces )
+        {
+            const pointFieldPMG& pts = mesh_.points();
+            relaxedBestPoints.setSize(pts.size());
+            forAll(pts, pointI)
+                relaxedBestPoints[pointI] = pts[pointI];
+
+            relaxedBestBadFaces = observed;
+            relaxedRegressionStreak = 0;
+            relaxedBestValid = true;
+
+            Info << "CFMITCH V5.1f UNTANGLE BEST: phase=" << phase
+                 << " badFaces=" << observed << endl;
+
+            return false;
+        }
+
+        if( observed <= relaxedBestBadFaces )
+        {
+            relaxedRegressionStreak = 0;
+            return false;
+        }
+
+        ++relaxedRegressionStreak;
+
+        const bool catastrophic =
+            scalar(observed)
+          > Foam::max
+            (
+                scalar(relaxedBestBadFaces) + scalar(32),
+                scalar(4)*scalar(relaxedBestBadFaces)
+            );
+
+        Info << "CFMITCH V5.1f UNTANGLE REGRESSION: phase=" << phase
+             << " observed=" << observed
+             << " best=" << relaxedBestBadFaces
+             << " streak=" << relaxedRegressionStreak
+             << " catastrophic=" << (catastrophic ? "yes" : "no")
+             << endl;
+
+        if( !catastrophic && relaxedRegressionStreak < 2 )
+            return false;
+
+        pointFieldPMG& pts = mesh_.points();
+
+        if( pts.size() != relaxedBestPoints.size() )
+            FatalErrorIn("meshOptimizer::untangleMeshFV")
+                << "Point count changed during a motion-only untangle"
+                << abort(FatalError);
+
+        forAll(pts, pointI)
+            pts[pointI] = relaxedBestPoints[pointI];
+
+        mesh_.clearAddressingData();
+
+        changedFace = true;
+
+        if( !relaxedCheck )
+            nBadFaces = polyMeshGenChecks::findBadFaces
+            (
+                mesh_,
+                badFaces,
+                false,
+                &changedFace
+            );
+        else
+            nBadFaces = polyMeshGenChecks::findBadFacesRelaxed
+            (
+                mesh_,
+                badFaces,
+                false,
+                &changedFace
+            );
+
+        Info << "CFMITCH V5.1f UNTANGLE EARLY STOP: phase=" << phase
+             << " observed=" << observed
+             << " restoredBadFaces=" << nBadFaces
+             << " expectedBest=" << relaxedBestBadFaces
+             << endl;
+
+        if( nBadFaces != relaxedBestBadFaces )
+            FatalErrorIn("meshOptimizer::untangleMeshFV")
+                << "Best-state restoration mismatch: expected "
+                << relaxedBestBadFaces
+                << " bad faces, found "
+                << nBadFaces
+                << abort(FatalError);
+
+        return true;
+    };
+
     do
     {
         nIter = 0;
@@ -156,6 +261,12 @@ void meshOptimizer::untangleMeshFV
             Info << "Iteration " << nIter
                 << ". Number of bad faces is " << nBadFaces << endl;
 
+            if( relaxedRegressionStop(nBadFaces, "volume") )
+            {
+                relaxedStop = true;
+                break;
+            }
+
             //- perform optimisation
             if( nBadFaces == 0 )
                 break;
@@ -174,6 +285,16 @@ void meshOptimizer::untangleMeshFV
                 badFaces,
                 (nGlobalIter / 2) + 1
             );
+            if( surfaceOctreePtr_ && bndPointPatchesPtr_
+             && globalToBoundaryPointPtr_ )
+                tetMesh.setSurfaceConstraint
+                (
+                    surfaceOctreePtr_,
+                    bndPointPatchesPtr_,
+                    globalToBoundaryPointPtr_,
+                    featureCornerPointsPtr_,
+                    featureCurveTangentsPtr_
+                );
 
             //- construct tetMeshOptimisation and improve positions of
             //- points in the tet mesh
@@ -188,13 +309,21 @@ void meshOptimizer::untangleMeshFV
             //- update points in the mesh from the coordinates in the tet mesh
             tetMesh.updateOrigMesh(&changedFace);
 
+            if( relaxedCheck )
+                changedFace = true;
+
         } while( (nIter < minIter+5) && (++nIter < maxNumIterations) );
+
+        if( relaxedStop )
+            break;
 
         if( (nBadFaces == 0) || (++nGlobalIter >= maxNumGlobalIterations) )
             break;
 
         // move boundary vertices
         nIter = 0;
+        label nSurfStuck(0);
+        label prevSurfBadFaces(-1);
 
         while( nIter++ < maxNumSurfaceIterations )
         {
@@ -223,6 +352,12 @@ void meshOptimizer::untangleMeshFV
 
             Info << "Iteration " << nIter
                 << ". Number of bad faces is " << nBadFaces << endl;
+
+            if( relaxedRegressionStop(nBadFaces, "surface") )
+            {
+                relaxedStop = true;
+                break;
+            }
 
             //- perform optimisation
             if( nBadFaces == 0 )
@@ -258,32 +393,121 @@ void meshOptimizer::untangleMeshFV
             }
 
             //- create tethrahedral mesh from the cells which shall be smoothed
-            partTetMesh tetMesh(mesh_, lockedPoints, badFaces, 0);
+            // Use 1 layer of neighbours so optimizer has non-locked interior
+            // points to work with when bad faces touch locked junction points.
+            partTetMesh tetMesh(mesh_, lockedPoints, badFaces, 1);
+            if( surfaceOctreePtr_ && bndPointPatchesPtr_
+             && globalToBoundaryPointPtr_ )
+                tetMesh.setSurfaceConstraint
+                (
+                    surfaceOctreePtr_,
+                    bndPointPatchesPtr_,
+                    globalToBoundaryPointPtr_,
+                    featureCornerPointsPtr_,
+                    featureCurveTangentsPtr_
+                );
 
             //- contruct tetMeshOptimisation
             tetMeshOptimisation tmo(tetMesh);
 
-            if( nGlobalIter < 2 )
+            // Track surface-loop stagnation. If constrained boundary
+            // optimizer cannot reduce bad faces for several iterations,
+            // allow unconstrained fallback to break junction deadlock.
+            // Guard: only activate for small residual counts (<=8),
+            // not during large early repair phase.
+            if( nBadFaces == prevSurfBadFaces )
+                ++nSurfStuck;
+            else
+                nSurfStuck = 0;
+            prevSurfBadFaces = nBadFaces;
+
+            const bool useUnconstrained =
+                (nBadFaces <= 8 && nSurfStuck >= 4) || (nGlobalIter >= 5);
+
+            if( !useUnconstrained )
             {
-                //- the point stays in the plane determined by the point normal
-                tmo.optimiseBoundaryVolumeOptimizer(true);
-            }
-            else if( nGlobalIter < 5 )
-            {
-                //- move points without any constraints on the movement
-                tmo.optimiseBoundarySurfaceLaplace();
+                tmo.optimiseBoundaryVolumeOptimizer(1, true);
             }
             else
             {
-                //- move boundary points without any constraints
-                tmo.optimiseBoundaryVolumeOptimizer(false);
+                Info << "Surface untangle stagnation: nBadFaces="
+                     << nBadFaces << " nSurfStuck=" << nSurfStuck
+                     << " -- using unconstrained fallback." << endl;
+                tmo.optimiseBoundaryVolumeOptimizer(1, false);
             }
 
             tetMesh.updateOrigMesh(&changedFace);
 
+            if( relaxedCheck )
+                changedFace = true;
+
         }
 
+        if( relaxedStop )
+            break;
+
     } while( nBadFaces );
+
+    // ================================================================
+    // CFMITCH V5.1g UNTANGLE FINAL BEST RESTORE
+    //
+    // V5.1f preserved relaxedBestPoints whenever the relaxed defect
+    // count decreased, but only restored them after an explicit
+    // regression.  Equal-count states (e.g. 8 -> 8) were allowed to
+    // continue modifying the mesh, and normal function exit returned
+    // the LAST state rather than the BEST saved state.
+    //
+    // For relaxed untangling, always finish from the best point state
+    // actually observed.  Then rebuild the bad-face set so downstream
+    // diagnostics/subsets describe that restored geometry.
+    // ================================================================
+    if( relaxedCheck && relaxedBestValid )
+    {
+        pointFieldPMG& pts = mesh_.points();
+
+        if( pts.size() != relaxedBestPoints.size() )
+        {
+            FatalErrorIn("meshOptimizer::untangleMeshFV")
+                << "V5.1g best-state point count mismatch: current="
+                << pts.size()
+                << " saved="
+                << relaxedBestPoints.size()
+                << abort(FatalError);
+        }
+
+        forAll(pts, pointI)
+            pts[pointI] = relaxedBestPoints[pointI];
+
+        mesh_.clearAddressingData();
+
+        changedFace = true;
+        badFaces.clear();
+
+        nBadFaces =
+            polyMeshGenChecks::findBadFacesRelaxed
+            (
+                mesh_,
+                badFaces,
+                false,
+                &changedFace
+            );
+
+        Info
+            << "CFMITCH V5.1g UNTANGLE FINAL BEST RESTORE:"
+            << " restoredBadFaces=" << nBadFaces
+            << " expectedBest=" << relaxedBestBadFaces
+            << " restoredPoints=" << pts.size()
+            << endl;
+
+        if( nBadFaces != relaxedBestBadFaces )
+        {
+            FatalErrorIn("meshOptimizer::untangleMeshFV")
+                << "V5.1g final best-state restoration mismatch: "
+                << "expected " << relaxedBestBadFaces
+                << " bad faces, found " << nBadFaces
+                << abort(FatalError);
+        }
+    }
 
     if( nBadFaces != 0 )
     {
@@ -307,6 +531,7 @@ void meshOptimizer::optimizeBoundaryLayer(const bool addBufferLayer)
             mesh_.returnTime().lookupObject<IOdictionary>("meshDict");
 
         bool smoothLayer(false);
+        bool addOptimisationBufferLayer(false);
 
         if( meshDict.found("boundaryLayers") )
         {
@@ -314,12 +539,19 @@ void meshOptimizer::optimizeBoundaryLayer(const bool addBufferLayer)
 
             if( layersDict.found("optimiseLayer") )
                 smoothLayer = readBool(layersDict.lookup("optimiseLayer"));
+
+            // Keep BL smoothing separate from the optional buffer-refinement
+            // pre-pass. The buffer path uses refineBoundaryLayers special mode
+            // and is more fragile near BL/BL/neutral transition junctions.
+            if( layersDict.found("optimiseLayerBuffer") )
+                addOptimisationBufferLayer =
+                    readBool(layersDict.lookup("optimiseLayerBuffer"));
         }
 
         if( !smoothLayer )
             return;
 
-        if( addBufferLayer )
+        if( addBufferLayer && addOptimisationBufferLayer )
         {
             //- create a buffer layer which will not be modified by the smoother
             refineBoundaryLayers refLayers(mesh_);
@@ -343,7 +575,72 @@ void meshOptimizer::optimizeBoundaryLayer(const bool addBufferLayer)
 
         boundaryLayerOptimisation::readSettings(meshDict, optimiser);
 
+        // Transactional BL optimisation: this pass can improve BL smoothness,
+        // but on acute BL/periodic transition zones it can also create
+        // negative-volume or highly skewed cells. Snapshot before the pass
+        // so it can be rejected if quality worsens.
+        labelHashSet blOptBadBefore;
+        polyMeshGenChecks::checkFacePyramids(mesh_, false, -SMALL, &blOptBadBefore);
+
+        labelHashSet blOptNegBefore;
+        polyMeshGenChecks::checkCellVolumes(mesh_, false, &blOptNegBefore);
+
+        labelHashSet blOptOpenBefore;
+        polyMeshGenChecks::checkClosedCells(mesh_, false, 0.5, &blOptOpenBefore);
+
+        scalarField blOptSkewBefore;
+        polyMeshGenChecks::checkFaceSkewness(mesh_, blOptSkewBefore);
+        const scalar blOptMaxSkewBefore =
+            blOptSkewBefore.size() > 0 ? max(blOptSkewBefore) : scalar(0.0);
+
+        const pointField blOptPointsBefore(mesh_.points());
+
+        {
+            labelHashSet diagBad;
+            polyMeshGenChecks::checkFacePyramids(mesh_, false, -SMALL, &diagBad);
+            labelHashSet diagNeg;
+            polyMeshGenChecks::checkCellVolumes(mesh_, false, &diagNeg);
+            Info << "BLOPTDIAG stage=beforeOptimiseLayer"
+                 << " badPyramids=" << diagBad.size()
+                 << " negVol=" << diagNeg.size()
+                 << endl;
+        }
+
+           const pointField blStagePointsBefore(mesh_.points());
         optimiser.optimiseLayer();
+
+        {
+            mesh_.clearAddressingData();
+            labelHashSet diagBad;
+            polyMeshGenChecks::checkFacePyramids(mesh_, false, -SMALL, &diagBad);
+            labelHashSet diagNeg;
+            polyMeshGenChecks::checkCellVolumes(mesh_, false, &diagNeg);
+            Info << "BLOPTDIAG stage=afterOptimiseLayer"
+                 << " badPyramids=" << diagBad.size()
+                 << " negVol=" << diagNeg.size()
+                 << endl;
+            if
+            (
+                diagNeg.size() > blOptNegBefore.size()
+             || diagBad.size() > blOptBadBefore.size()
+            )
+            {
+                Info << "BLOPTDIAG optimiseLayer rejected: negVol "
+                     << blOptNegBefore.size() << "->" << diagNeg.size()
+                     << ", badPyramids " << blOptBadBefore.size()
+                     << "->" << diagBad.size()
+                     << " -- restoring points" << endl;
+                polyMeshGenModifier meshModifier(mesh_);
+                pointFieldPMG& pts = meshModifier.pointsAccess();
+                pts = blStagePointsBefore;
+                mesh_.clearAddressingData();
+                labelHashSet rbNeg;
+                polyMeshGenChecks::checkCellVolumes(mesh_, false, &rbNeg);
+                Info << "BLOPTDIAG stage=afterOptimiseLayerRollback"
+                     << " negVol=" << rbNeg.size()
+                     << endl;
+            }
+        }
 
         //- check if the bnd layer is tangled somewhere
         labelLongList bndLayerCells;
@@ -380,8 +677,79 @@ void meshOptimizer::optimizeBoundaryLayer(const bool addBufferLayer)
         //- optimize mesh quality
         optimizeMeshFV(5, 1, 50, 0);
 
+        {
+            mesh_.clearAddressingData();
+            labelHashSet diagBad;
+            polyMeshGenChecks::checkFacePyramids(mesh_, false, -SMALL, &diagBad);
+            labelHashSet diagNeg;
+            polyMeshGenChecks::checkCellVolumes(mesh_, false, &diagNeg);
+            Info << "BLOPTDIAG stage=afterOptimizeMeshFV"
+                 << " badPyramids=" << diagBad.size()
+                 << " negVol=" << diagNeg.size()
+                 << endl;
+        }
+
         //- untangle remaining faces and lock the boundary layer cells
         untangleMeshFV(2, 50, 0);
+
+        {
+            mesh_.clearAddressingData();
+            labelHashSet diagBad;
+            polyMeshGenChecks::checkFacePyramids(mesh_, false, -SMALL, &diagBad);
+            labelHashSet diagNeg;
+            polyMeshGenChecks::checkCellVolumes(mesh_, false, &diagNeg);
+            Info << "BLOPTDIAG stage=afterUntangleMeshFV"
+                 << " badPyramids=" << diagBad.size()
+                 << " negVol=" << diagNeg.size()
+                 << endl;
+        }
+
+        labelHashSet blOptBadAfter;
+        polyMeshGenChecks::checkFacePyramids(mesh_, false, -SMALL, &blOptBadAfter);
+
+        labelHashSet blOptNegAfter;
+        polyMeshGenChecks::checkCellVolumes(mesh_, false, &blOptNegAfter);
+
+        labelHashSet blOptOpenAfter;
+        polyMeshGenChecks::checkClosedCells(mesh_, false, 0.5, &blOptOpenAfter);
+
+        scalarField blOptSkewAfter;
+        polyMeshGenChecks::checkFaceSkewness(mesh_, blOptSkewAfter);
+        const scalar blOptMaxSkewAfter =
+            blOptSkewAfter.size() > 0 ? max(blOptSkewAfter) : scalar(0.0);
+
+        const bool blOptSkewOK =
+            blOptMaxSkewAfter <= blOptMaxSkewBefore;
+
+        const bool blOptOK =
+            blOptBadAfter.size() <= blOptBadBefore.size()
+         && blOptNegAfter.size() <= blOptNegBefore.size()
+         && blOptOpenAfter.size() <= blOptOpenBefore.size()
+         && blOptSkewOK;
+
+        if( !blOptOK )
+        {
+            Info << "Boundary layer optimisation rejected: badFaces "
+                 << blOptBadBefore.size() << "->" << blOptBadAfter.size()
+                 << ", negVol " << blOptNegBefore.size() << "->" << blOptNegAfter.size()
+                 << ", openCells " << blOptOpenBefore.size() << "->" << blOptOpenAfter.size()
+                 << ", skew " << blOptMaxSkewBefore << "->" << blOptMaxSkewAfter
+                 << " -- rolling back" << endl;
+
+            polyMeshGenModifier meshModifier(mesh_);
+            pointFieldPMG& pts = meshModifier.pointsAccess();
+            pts = blOptPointsBefore;
+            mesh_.clearAddressingData();
+        }
+        else
+        {
+            Info << "Boundary layer optimisation accepted: badFaces "
+                 << blOptBadBefore.size() << "->" << blOptBadAfter.size()
+                 << ", negVol " << blOptNegBefore.size() << "->" << blOptNegAfter.size()
+                 << ", openCells " << blOptOpenBefore.size() << "->" << blOptOpenAfter.size()
+                 << ", skew " << blOptMaxSkewBefore << "->" << blOptMaxSkewAfter
+                 << endl;
+        }
 
         # ifdef DEBUGSmooth
         forAll(vertexLocation_, pI)
@@ -460,9 +828,38 @@ void meshOptimizer::untangleBoundaryLayer()
     }
     else
     {
-        optimizeLowQualityFaces();
-        removeUserConstraints();
-        untangleMeshFV(2, 50, 1, true);
+        // Guard: skip optimizeLowQualityFaces if negVol cells present
+        // partTetMesh constructor is unsafe on degenerate cells
+        labelHashSet negVolCells;
+        polyMeshGenChecks::checkCellVolumes(mesh_, false, &negVolCells);
+        if( negVolCells.size() == 0 )
+        {
+            optimizeLowQualityFaces();
+
+            // BL_UNTANGLE_PRESERVE_LOCKS_V1
+            //
+            // The caller may explicitly lock boundary-layer points before
+            // entering untangleBoundaryLayer().  Keep those constraints
+            // active through the aggressive finite-volume untangler.
+            //
+            // Previously removeUserConstraints() was called here, which
+            // discarded the caller's BL locks immediately before
+            // untangleMeshFV().  On repaired deep-layer meshes this allowed
+            // the untangler to catastrophically distort an otherwise valid
+            // BL state.
+            untangleMeshFV(2, 50, 1, true);
+
+            // User/temporary constraints are local to this operation.
+            // Clear them only after the constrained untangle has completed.
+            removeUserConstraints();
+        }
+        else
+        {
+            Info << "untangleBoundaryLayer: skipping optimizeLowQualityFaces"
+                 << " and untangleMeshFV -- " << negVolCells.size()
+                 << " negVol cells present, volume optimizer unsafe" << endl;
+            removeUserConstraints();
+        }
     }
 }
 
@@ -504,7 +901,29 @@ void meshOptimizer::optimizeLowQualityFaces(const label maxNumIterations)
         if( nBadFaces == 0 )
             break;
 
-        partTetMesh tetMesh(mesh_, lockedPoints, lowQualityFaces, 2);
+        // Safety guard: partTetMesh is unsafe when fed a large low-quality
+        // face set from heavily degraded BL/refinement topology, even when
+        // checkCellVolumes reports negVol=0. Skip rather than segfault.
+        if( nBadFaces > 500 )
+        {
+            Info << "optimizeLowQualityFaces: skipping partTetMesh repair -- "
+                 << nBadFaces
+                 << " low-quality faces exceeds safe constructor threshold"
+                 << endl;
+            break;
+        }
+
+        partTetMesh tetMesh(mesh_, lockedPoints, lowQualityFaces, 1);
+        if( surfaceOctreePtr_ && bndPointPatchesPtr_
+         && globalToBoundaryPointPtr_ )
+            tetMesh.setSurfaceConstraint
+            (
+                surfaceOctreePtr_,
+                bndPointPatchesPtr_,
+                globalToBoundaryPointPtr_,
+                featureCornerPointsPtr_,
+                featureCurveTangentsPtr_
+            );
 
         //- construct tetMeshOptimisation and improve positions
         //- of points in the tet mesh
@@ -517,6 +936,130 @@ void meshOptimizer::optimizeLowQualityFaces(const label maxNumIterations)
 
     } while( ++nIter < maxNumIterations );
 }
+
+// CFMitch V6.1 -- explicitly selected-face local optimiser.
+//
+// This is deliberately separate from optimizeLowQualityFaces().
+//
+// The legacy path first calls polyMeshGenChecks::findLowQualityFaces(),
+// which can produce a very large population unrelated to the exact
+// OpenFOAM failure population.  Its existing >500-face safety guard
+// remains unchanged.
+//
+// This entry point consumes only the face set supplied by the caller.
+// Candidate acceptance/rollback remains the caller's responsibility.
+void meshOptimizer::optimizeSelectedFaces
+(
+    const labelHashSet& selectedFaces,
+    const label maxNumIterations,
+    const direction additionalLayers
+)
+{
+    if( selectedFaces.size() == 0 || maxNumIterations <= 0 )
+    {
+        Info
+            << "optimizeSelectedFaces: nothing to do"
+            << " faces=" << selectedFaces.size()
+            << " iterations=" << maxNumIterations
+            << endl;
+
+        return;
+    }
+
+    const faceListPMG& faces = mesh_.faces();
+
+    // Validate/copy the caller population.  partTetMesh takes a mutable
+    // labelHashSet&, but the public API intentionally accepts const input.
+    labelHashSet targetFaces;
+
+    forAllConstIter(labelHashSet, selectedFaces, it)
+    {
+        const label faceI = it.key();
+
+        if( faceI >= 0 && faceI < label(faces.size()) )
+            targetFaces.insert(faceI);
+    }
+
+    if( targetFaces.size() == 0 )
+    {
+        Info
+            << "optimizeSelectedFaces: no valid face labels after filtering"
+            << endl;
+
+        return;
+    }
+
+    // Preserve all constraints already installed on this meshOptimizer.
+    // This is the same LOCKED-point treatment used by
+    // optimizeLowQualityFaces().
+    labelLongList lockedPoints;
+
+    forAll(vertexLocation_, pointI)
+    {
+        if( vertexLocation_[pointI] & LOCKED )
+            lockedPoints.append(pointI);
+    }
+
+    Info
+        << "CFMITCH V6.1 SELECTED FACE OPT:"
+        << " faces=" << targetFaces.size()
+        << " lockedPoints=" << lockedPoints.size()
+        << " additionalLayers=" << label(additionalLayers)
+        << " iterations=" << maxNumIterations
+        << endl;
+
+    // Existing selected-face constructor:
+    //
+    //     partTetMesh
+    //     (
+    //         mesh,
+    //         lockedPoints,
+    //         badFaces,
+    //         additionalLayers
+    //     )
+    //
+    // It builds only the cells around vertices of the supplied faces,
+    // plus the explicitly requested extra cell layers.
+    partTetMesh tetMesh
+    (
+        mesh_,
+        lockedPoints,
+        targetFaces,
+        additionalLayers
+    );
+
+    if
+    (
+        surfaceOctreePtr_
+     && bndPointPatchesPtr_
+     && globalToBoundaryPointPtr_
+    )
+    {
+        tetMesh.setSurfaceConstraint
+        (
+            surfaceOctreePtr_,
+            bndPointPatchesPtr_,
+            globalToBoundaryPointPtr_,
+            featureCornerPointsPtr_,
+            featureCurveTangentsPtr_
+        );
+    }
+
+    tetMeshOptimisation tmo(tetMesh);
+
+    tmo.optimiseUsingVolumeOptimizer(maxNumIterations);
+
+    // No iterative generic re-selection here.  This routine performs one
+    // bounded operation on exactly the supplied population.  The caller
+    // re-evaluates exact OpenFOAM quality before deciding to commit it.
+    tetMesh.updateOrigMesh();
+
+    Info
+        << "CFMITCH V6.1 SELECTED FACE OPT complete:"
+        << " faces=" << targetFaces.size()
+        << endl;
+}
+
 
 void meshOptimizer::optimizeMeshNearBoundaries
 (
@@ -538,6 +1081,16 @@ void meshOptimizer::optimizeMeshNearBoundaries
     }
 
     partTetMesh tetMesh(mesh_, lockedPoints, numLayersOfCells);
+    if( surfaceOctreePtr_ && bndPointPatchesPtr_
+     && globalToBoundaryPointPtr_ )
+        tetMesh.setSurfaceConstraint
+        (
+            surfaceOctreePtr_,
+            bndPointPatchesPtr_,
+            globalToBoundaryPointPtr_,
+            featureCornerPointsPtr_,
+            featureCurveTangentsPtr_
+        );
     tetMeshOptimisation tmo(tetMesh);
     Info << "Iteration:" << flush;
     do
@@ -630,6 +1183,16 @@ void meshOptimizer::optimizeMeshFVBestQuality
         }
 
         partTetMesh tetMesh(mesh_, lockedPoints, lowQualityFaces, 2);
+        if( surfaceOctreePtr_ && bndPointPatchesPtr_
+         && globalToBoundaryPointPtr_ )
+            tetMesh.setSurfaceConstraint
+            (
+                surfaceOctreePtr_,
+                bndPointPatchesPtr_,
+                globalToBoundaryPointPtr_,
+                featureCornerPointsPtr_,
+                featureCurveTangentsPtr_
+            );
 
         //- construct tetMeshOptimisation and improve positions
         //- of points in the tet mesh

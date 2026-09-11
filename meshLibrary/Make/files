@@ -6,6 +6,7 @@ bndLayers = utilities/boundaryLayers
 boundaryLayers = $(bndLayers)/boundaryLayers
 detectBoundaryLayers = $(bndLayers)/detectBoundaryLayers
 extrudeLayer = $(bndLayers)/extrudeLayer
+boundaryLayerConstraintPlanner = utilities/boundaryLayers/boundaryLayerConstraintPlanner
 refineBoundaryLayers = $(bndLayers)/refineBoundaryLayers
 triangulateNonPlanarBaseFaces = $(bndLayers)/triangulateNonPlanarBaseFaces
 
@@ -93,6 +94,7 @@ triSurfaceCleanupDuplicateTriangles = $(triSurfaceTools)/triSurfaceCleanupDuplic
 triSurfaceCopyParts = $(triSurfaceTools)/triSurfaceCopyParts
 triSurfaceCurvatureEstimator = $(triSurfaceTools)/triSurfaceCurvatureEstimator
 triSurfacePartitioner = $(triSurfaceTools)/triSurfacePartitioner
+sourceFeatureGraph = $(triSurfaceTools)/sourceFeatureGraph
 triSurfaceDetectFeatureEdges = $(triSurfaceTools)/triSurfaceDetectFeatureEdges
 triSurfaceClassifyEdges = $(triSurfaceTools)/triSurfaceClassifyEdges
 triSurfaceImportSurfaceAsSubset = $(triSurfaceTools)/triSurfaceImportSurfaceAsSubset
@@ -268,9 +270,12 @@ $(boundaryLayers)/boundaryLayersFacesAndCells.C
 $(boundaryLayers)/boundaryLayerCells.C
 $(boundaryLayers)/boundaryLayersCheckTopologyOfBndFaces.C
 $(boundaryLayers)/boundaryLayersWrapperLayer.C
+$(boundaryLayers)/boundaryLayersContactLineAtlas.C
+$(boundaryLayers)/boundaryLayersContactLineSmoother.C
 $(extrudeLayer)/extrudeLayer.C
 $(detectBoundaryLayers)/detectBoundaryLayers.C
 $(detectBoundaryLayers)/detectBoundaryLayersFunctions.C
+$(boundaryLayerConstraintPlanner)/boundaryLayerConstraintPlanner.C
 $(refineBoundaryLayers)/refineBoundaryLayers.C
 $(refineBoundaryLayers)/refineBoundaryLayersFunctions.C
 $(refineBoundaryLayers)/refineBoundaryLayersFaces.C
@@ -422,6 +427,7 @@ $(triSurfaceCopyParts)/triSurfaceCopyParts.C
 
 $(triSurfacePartitioner)/triSurfacePartitioner.C
 $(triSurfacePartitioner)/triSurfacePartitionerCreateAddressing.C
+$(sourceFeatureGraph)/sourceFeatureGraph.C
 
 $(triSurfaceCurvatureEstimator)/triSurfaceCurvatureEstimator.C
 $(triSurfaceCurvatureEstimator)/triSurfaceCurvatureEstimatorCalculate.C
@@ -467,5 +473,23 @@ $(writeAsFPMA)/writeMeshFPMA.C
 $(writeAsFPMA)/fpmaMesh.C
 
 $(workflowControls)/workflowControls.C
+
+
+# classicCfMesh boundary-layer architecture.
+# Frozen algorithmic baseline:
+#   9d60e8bb31353b281565337ac0f06545e368fdf4
+utilities/boundaryLayers/classicCfMesh/classicBoundaryLayers/classicBoundaryLayerCells.C
+utilities/boundaryLayers/classicCfMesh/classicBoundaryLayers/classicBoundaryLayers.C
+utilities/boundaryLayers/classicCfMesh/classicBoundaryLayers/classicBoundaryLayersCheckTopologyOfBndFaces.C
+utilities/boundaryLayers/classicCfMesh/classicBoundaryLayers/classicBoundaryLayersCreateVertices.C
+utilities/boundaryLayers/classicCfMesh/classicBoundaryLayers/classicBoundaryLayersFacesAndCells.C
+utilities/boundaryLayers/classicCfMesh/classicBoundaryLayers/classicBoundaryLayersWrapperLayer.C
+
+utilities/boundaryLayers/classicCfMesh/classicRefineBoundaryLayers/classicRefineBoundaryLayers.C
+utilities/boundaryLayers/classicCfMesh/classicRefineBoundaryLayers/classicRefineBoundaryLayersCells.C
+utilities/boundaryLayers/classicCfMesh/classicRefineBoundaryLayers/classicRefineBoundaryLayersFaces.C
+utilities/boundaryLayers/classicCfMesh/classicRefineBoundaryLayers/classicRefineBoundaryLayersFunctions.C
+
+utilities/boundaryLayers/boundaryLayers/boundaryLayersCFMitchHeightAtlas.C
 
 LIB = $(FOAM_USER_LIBBIN)/libmeshLibrary

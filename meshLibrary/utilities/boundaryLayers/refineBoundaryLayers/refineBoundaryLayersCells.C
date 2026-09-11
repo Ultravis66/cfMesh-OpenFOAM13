@@ -26,9 +26,18 @@ Description
 \*---------------------------------------------------------------------------*/
 
 #include "refineBoundaryLayers.H"
+#include "polyMeshGenAddressing.H"
 #include "meshSurfaceEngine.H"
 #include "helperFunctions.H"
 #include "demandDrivenData.H"
+#include "pyramidPointFaceRef.H"
+#include "tetPointRef.H"
+#include "OFstream.H"
+#include <map>
+#include <set>
+#include <utility>
+#include <cstring>
+#include <cmath>
 
 //#define DEBUGLayer
 
@@ -39,13 +48,78 @@ namespace Foam
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-void refineBoundaryLayers::generateNewCellsPrism
+bool refineBoundaryLayers::generateNewCellsPrism
 (
     const label cellI,
     DynList<DynList<DynList<label, 8>, 10>, 64>& cellsFromCell
 ) const
 {
     cellsFromCell.clear();
+
+    // --------------------------------------------------------------
+    // CFMitch V3.5 -- fail-closed prism structural preflight.
+    //
+    // A topology-retreat candidate can convert a multidirectional
+    // BL-intersection parent into refType 1 while leaving face/split-edge
+    // metadata that does not satisfy the classical prism contract.
+    //
+    // Historically generateNewCellsPrism() indexed this metadata without
+    // validation.  An unresolved opposite face or split edge therefore
+    // became an index of -1 and caused SIGSEGV.
+    //
+    // Valid parents follow the original construction path unchanged.
+    // --------------------------------------------------------------
+    auto prismPreflightFail =
+    [&]
+    (
+        const char* reason,
+        const label d0,
+        const label d1,
+        const label d2,
+        const label d3
+    ) -> bool
+    {
+        Info
+            << "CFMITCH V3.5 PRISM PREFLIGHT FAIL:"
+            << " cell=" << cellI
+            << " reason=" << reason
+            << " d0=" << d0
+            << " d1=" << d1
+            << " d2=" << d2
+            << " d3=" << d3
+            << endl;
+
+        cellsFromCell.clear();
+        return false;
+    };
+
+    if
+    (
+        cellI < 0
+     || cellI >= label(mesh_.cells().size())
+    )
+    {
+        return prismPreflightFail
+        (
+            "cellOutOfRange",
+            cellI,
+            mesh_.cells().size(),
+            -1,
+            -1
+        );
+    }
+
+    if( mesh_.boundaries().size() == 0 )
+    {
+        return prismPreflightFail
+        (
+            "noBoundaryPatches",
+            -1,
+            -1,
+            -1,
+            -1
+        );
+    }
 
     const cell& c = mesh_.cells()[cellI];
     const labelList& owner = mesh_.owner();
@@ -76,6 +150,123 @@ void refineBoundaryLayers::generateNewCellsPrism
         baseFace = fI;
     }
 
+    if
+    (
+        baseFace < 0
+     || baseFace >= label(c.size())
+     || nLayers < 2
+    )
+    {
+        return prismPreflightFail
+        (
+            "activeBaseFaceMissing",
+            baseFace,
+            nLayers,
+            c.size(),
+            -1
+        );
+    }
+
+    const faceListPMG& preflightFaces =
+        mesh_.faces();
+
+    label preflightOtherBaseFace = -1;
+    label nOtherBaseCandidates = 0;
+
+    forAll(c, preflightLocalFaceI)
+    {
+        const label sourceFaceI =
+            c[preflightLocalFaceI];
+
+        if
+        (
+            sourceFaceI < 0
+         || sourceFaceI >= label(preflightFaces.size())
+         || sourceFaceI >= label(owner.size())
+         || sourceFaceI >= label(facesFromFace_.size())
+        )
+        {
+            return prismPreflightFail
+            (
+                "sourceFaceOutOfRange",
+                preflightLocalFaceI,
+                sourceFaceI,
+                preflightFaces.size(),
+                facesFromFace_.size()
+            );
+        }
+
+        const label nDerived =
+            facesFromFace_.sizeOfRow(sourceFaceI);
+
+        if( nDerived <= 0 )
+        {
+            return prismPreflightFail
+            (
+                "sourceFaceHasNoDerivedFaces",
+                preflightLocalFaceI,
+                sourceFaceI,
+                nDerived,
+                -1
+            );
+        }
+
+        forAllRow
+        (
+            facesFromFace_,
+            sourceFaceI,
+            preflightDerivedI
+        )
+        {
+            const label derivedFaceI =
+                facesFromFace_
+                (
+                    sourceFaceI,
+                    preflightDerivedI
+                );
+
+            if
+            (
+                derivedFaceI < 0
+             || derivedFaceI >= label(newFaces_.size())
+            )
+            {
+                return prismPreflightFail
+                (
+                    "derivedFaceOutOfRange",
+                    sourceFaceI,
+                    preflightDerivedI,
+                    derivedFaceI,
+                    newFaces_.size()
+                );
+            }
+        }
+
+        if
+        (
+            preflightLocalFaceI != baseFace
+         && nDerived == 1
+        )
+        {
+            preflightOtherBaseFace =
+                preflightLocalFaceI;
+
+            ++nOtherBaseCandidates;
+        }
+    }
+
+    if( nOtherBaseCandidates != 1 )
+    {
+        return prismPreflightFail
+        (
+            "oppositeBaseFaceCount",
+            nOtherBaseCandidates,
+            preflightOtherBaseFace,
+            baseFace,
+            nLayers
+        );
+    }
+
     # ifdef DEBUGLayer
     Pout << "Number of layers " << nLayers << endl;
     Pout << "Base face " << baseFace << " has points "
@@ -95,7 +286,7 @@ void refineBoundaryLayers::generateNewCellsPrism
     cellsFromCell.setSize(nLayers);
 
     //- distribute existing faces into new cells
-    label otherBaseFace(-1);
+    label otherBaseFace(preflightOtherBaseFace);
     forAll(c, fI)
     {
         if( fI == baseFace )
@@ -134,6 +325,19 @@ void refineBoundaryLayers::generateNewCellsPrism
     const faceListPMG& faces = mesh_.faces();
     const face& bf = faces[c[baseFace]];
     const face& obf = faces[c[otherBaseFace]];
+
+    if( bf.size() < 3 || obf.size() < 3 )
+    {
+        return prismPreflightFail
+        (
+            "baseFaceTooSmall",
+            bf.size(),
+            obf.size(),
+            baseFace,
+            otherBaseFace
+        );
+    }
+
     for(label layerI=1;layerI<nLayers;++layerI)
     {
         //- create new face from points at the same height
@@ -147,6 +351,22 @@ void refineBoundaryLayers::generateNewCellsPrism
                  << splitEdgesAtPoint_[pointI] << endl;
             # endif
 
+            if
+            (
+                pointI < 0
+             || pointI >= label(splitEdgesAtPoint_.size())
+            )
+            {
+                return prismPreflightFail
+                (
+                    "basePointOutOfRange",
+                    pointI,
+                    splitEdgesAtPoint_.size(),
+                    layerI,
+                    pI
+                );
+            }
+
             label seI(-1);
             if( splitEdgesAtPoint_.sizeOfRow(pointI) == 1 )
             {
@@ -156,7 +376,16 @@ void refineBoundaryLayers::generateNewCellsPrism
             {
                 forAllRow(splitEdgesAtPoint_, pointI, sepI)
                 {
-                    const label seJ = splitEdgesAtPoint_(pointI, sepI);
+                    const label seJ =
+                        splitEdgesAtPoint_(pointI, sepI);
+
+                    if
+                    (
+                        seJ < 0
+                     || seJ >= label(splitEdges_.size())
+                    )
+                        continue;
+
                     const edge& se = splitEdges_[seJ];
 
                     if( obf.which(se.end()) >= 0 || obf.which(se.start()) >= 0 )
@@ -167,7 +396,95 @@ void refineBoundaryLayers::generateNewCellsPrism
                 }
             }
 
-            cf.append(newVerticesForSplitEdge_(seI, layerI));
+            if
+            (
+                seI < 0
+             || seI >= label(splitEdges_.size())
+             || seI >= label(newVerticesForSplitEdge_.size())
+            )
+            {
+                return prismPreflightFail
+                (
+                    "splitEdgeUnresolved",
+                    pointI,
+                    layerI,
+                    seI,
+                    splitEdgesAtPoint_.sizeOfRow(pointI)
+                );
+            }
+
+            if
+            (
+                newVerticesForSplitEdge_.sizeOfRow(seI)
+             <= layerI
+            )
+            {
+                return prismPreflightFail
+                (
+                    "splitEdgeRowTooShort",
+                    seI,
+                    layerI,
+                    newVerticesForSplitEdge_.sizeOfRow(seI),
+                    nLayers
+                );
+            }
+
+            const label generatedPointI =
+                newVerticesForSplitEdge_
+                (
+                    seI,
+                    layerI
+                );
+
+            if
+            (
+                generatedPointI < 0
+             || generatedPointI >= label(mesh_.points().size())
+            )
+            {
+                return prismPreflightFail
+                (
+                    "generatedPointOutOfRange",
+                    seI,
+                    layerI,
+                    generatedPointI,
+                    mesh_.points().size()
+                );
+            }
+
+            cf.append(generatedPointI);
+        }
+
+        // C3: skip degenerate intermediate face where all vertices are
+        // the same point (zero-length hair edge at BL/BL junction).
+        // This produces correct wedge topology instead of zero-volume cells.
+        bool degenerateFace = true;
+        for(label pI=1;pI<cf.size();++pI)
+            if( cf[pI] != cf[0] )
+            { degenerateFace = false; break; }
+        if( degenerateFace )
+        {
+            //- DEGFACE_AUDIT: diagnostic only, no behavior change
+            static label nDegFaceSkips = 0;
+            if( nDegFaceSkips < 10 )
+            {
+                const label baseGlobalFaceI = c[baseFace];
+                const label startBnd = mesh_.boundaries()[0].patchStart();
+                const label bfI_audit = baseGlobalFaceI - startBnd;
+                Info << "DEGFACE_AUDIT:"
+                     << " cellI=" << cellI
+                     << " layerI=" << layerI
+                     << " nLayers=" << nLayers
+                     << " baseFace=" << baseFace
+                     << " bfI=" << bfI_audit
+                     << " cf0=" << cf[0]
+                     << " cfSize=" << cf.size()
+                     << endl;
+            }
+            ++nDegFaceSkips;
+            if( nDegFaceSkips == 10 )
+                Info << "DEGFACE_AUDIT: (further suppressed)" << endl;
+            continue;
         }
 
         //- add faces to cells
@@ -220,6 +537,8 @@ void refineBoundaryLayers::generateNewCellsPrism
             }
     }
     # endif
+
+    return true;
 }
 
 void refineBoundaryLayers::storeFacesIntoCells
@@ -1326,19 +1645,70 @@ void refineBoundaryLayers::generateNewCells()
 {
     labelList nCellsFromCell(mesh_.cells().size(), 1);
     labelList refType(mesh_.cells().size(), 0);
+    labelList cellToBfI(mesh_.cells().size(), -1);
+
+    // CFMitch zero-layer accounting diagnostics.
+    //
+    // A zero-layer boundary face is an inactive/terminated BL direction.
+    // It must not delete the owning parent from the cell-count predictor.
+    boolList zeroLayerParent(mesh_.cells().size(), false);
+    label nZeroLayerOwnerHits = 0;
+    label nZeroLayerParentsTouched = 0;
+    label nZeroLayerFactorsClamped = 0;
 
     const meshSurfaceEngine& mse = surfaceEngine();
     const labelList& faceOwners = mse.faceOwners();
+    const labelList& childSweepFacePatch =
+        mse.boundaryFacePatches();
+
+    // Owning copy survives deleteDemandDrivenData(msePtr_) and lets the
+    // exact-volume birth audit recover the source BL patch afterwards.
+    const labelList exactVolumeFacePatch(childSweepFacePatch);
+
+    const PtrList<boundaryPatch>& childSweepBoundaries =
+        mesh_.boundaries();
 
     //- calculate the number new cells generated from a cell
     forAll(faceOwners, bfI)
     {
         const label cellI = faceOwners[bfI];
 
-        nCellsFromCell[cellI] *= nLayersAtBndFace_[bfI];
+        const label faceLayers =
+            nLayersAtBndFace_[bfI];
 
-        if( nLayersAtBndFace_[bfI] > 1 )
+        if( faceLayers == 0 )
+        {
+            ++nZeroLayerOwnerHits;
+
+            if( !zeroLayerParent[cellI] )
+            {
+                zeroLayerParent[cellI] = true;
+                ++nZeroLayerParentsTouched;
+            }
+        }
+
+        // nCellsFromCell is a multiplicative child-count predictor.
+        //
+        // A zero-layer face means "no BL subdivision in this direction";
+        // it does NOT mean that the owning parent cell disappears.
+        //
+        // Using zero here makes nNewCells subtract one from allocation while
+        // refType still preserves/refines the parent.  That under-allocates
+        // cells and lets appended children write beyond cells.size().
+        const label cellCountFactor =
+            Foam::max(faceLayers, label(1));
+
+        if( faceLayers == 0 )
+            ++nZeroLayerFactorsClamped;
+
+        nCellsFromCell[cellI] *= cellCountFactor;
+
+        if( faceLayers > 1 )
+        {
             ++refType[cellI];
+            if( cellToBfI[cellI] < 0 )
+                cellToBfI[cellI] = bfI;
+        }
     }
 
     //- add cells which shall be refined in a subset
@@ -1357,10 +1727,60 @@ void refineBoundaryLayers::generateNewCells()
                 mesh_.addCellToSubset(subsetI, cI);
     }
 
+    label nZeroLayerParentType0 = 0;
+    label nZeroLayerParentType1 = 0;
+    label nZeroLayerParentType2 = 0;
+    label nZeroLayerParentType3Plus = 0;
+    label nCellCountBelowOne = 0;
+
+    forAll(zeroLayerParent, cellI)
+    {
+        if( zeroLayerParent[cellI] )
+        {
+            if( refType[cellI] == 0 )
+                ++nZeroLayerParentType0;
+            else if( refType[cellI] == 1 )
+                ++nZeroLayerParentType1;
+            else if( refType[cellI] == 2 )
+                ++nZeroLayerParentType2;
+            else
+                ++nZeroLayerParentType3Plus;
+        }
+
+        if( nCellsFromCell[cellI] < 1 )
+            ++nCellCountBelowOne;
+    }
+
     //- check the number of cells which will be generated
     label nNewCells(0);
     forAll(nCellsFromCell, cellI)
         nNewCells += (nCellsFromCell[cellI] - 1);
+
+    Info
+        << "CFMITCH ZERO-LAYER ACCOUNTING:"
+        << " ownerHits=" << nZeroLayerOwnerHits
+        << " parentCells=" << nZeroLayerParentsTouched
+        << " factorsClamped=" << nZeroLayerFactorsClamped
+        << " parentType0=" << nZeroLayerParentType0
+        << " parentType1=" << nZeroLayerParentType1
+        << " parentType2=" << nZeroLayerParentType2
+        << " parentType3Plus=" << nZeroLayerParentType3Plus
+        << " countBelowOne=" << nCellCountBelowOne
+        << " predictedNewCells=" << nNewCells
+        << " predictedTotalCells="
+        << label(mesh_.cells().size()+nNewCells)
+        << endl;
+
+    if( nCellCountBelowOne )
+    {
+        refinementValid_ = false;
+
+        FatalErrorIn("void refineBoundaryLayers::generateNewCells()")
+            << "CFMITCH zero-layer accounting failure: "
+            << nCellCountBelowOne
+            << " parent cells have predicted replacement count < 1"
+            << exit(FatalError);
+    }
 
     # ifdef DEBUGLayer
     forAll(nCellsFromCell, cellI)
@@ -1385,6 +1805,5019 @@ void refineBoundaryLayers::generateNewCells()
     label nCells = cells.size();
     cells.setSize(nCells+nNewCells);
 
+    // Exact-volume provenance.
+    //
+    // A refined parent's local child zero may reuse the original cell label,
+    // while later children receive new labels.  Preserve the mapping now so
+    // it remains available after newCellsFromCell is discarded and faces
+    // are relabelled.
+    labelList exactVolumeParent(cells.size(), -1);
+    labelList exactVolumeLocalChild(cells.size(), -1);
+    labelList exactVolumeRefType(cells.size(), -1);
+
+    // BL_CHILD_SWEEP_AUDIT
+    //
+    // Diagnostic only.
+    //
+    // For triangular type-1 prism parents, inspect the exact six points
+    // used by every discrete child interval.  Unlike the earlier coarse
+    // contact-sweep test, this uses the independently generated
+    // newVerticesForSplitEdge_ rows consumed by generateNewCellsPrism().
+    //
+    // A child is bad if its complete linear-wedge Jacobian is singular
+    // somewhere, or if its orientation differs from the full parent sweep.
+    label nChildSweepParentsChecked = 0;
+    label nChildSweepChildrenChecked = 0;
+    label nChildSweepBadChildren = 0;
+    label nChildSweepParentUnsafe = 0;
+    label nChildSweepSkippedParents = 0;
+    label nChildSweepBadPrinted = 0;
+
+    auto childSweepState =
+    [&]
+    (
+        const point& B0,
+        const point& B1,
+        const point& B2,
+        const point& T0,
+        const point& T1,
+        const point& T2,
+        scalar& normalizedMargin
+    ) -> label
+    {
+        const vector H0 = T0 - B0;
+        const vector H1 = T1 - B1;
+        const vector H2 = T2 - B2;
+
+        const vector A0 = B1 - B0;
+        const vector Bv0 = B2 - B0;
+
+        const vector dA = H1 - H0;
+        const vector dB = H2 - H0;
+
+        scalar L = scalar(0);
+
+        L = Foam::max(L, mag(B1-B0));
+        L = Foam::max(L, mag(B2-B0));
+        L = Foam::max(L, mag(B2-B1));
+
+        L = Foam::max(L, mag(T1-T0));
+        L = Foam::max(L, mag(T2-T0));
+        L = Foam::max(L, mag(T2-T1));
+
+        L = Foam::max(L, mag(H0));
+        L = Foam::max(L, mag(H1));
+        L = Foam::max(L, mag(H2));
+
+        if( L <= VSMALL )
+        {
+            normalizedMargin = scalar(0);
+            return 0;
+        }
+
+        const scalar L3 = L*L*L;
+
+        // Numerical-zero tolerance only, not a quality criterion.
+        const scalar tol =
+            scalar(1e-12)*L3 + VSMALL;
+
+        scalar globalMin = GREAT;
+        scalar globalMax = -GREAT;
+
+        vector H[3];
+        H[0] = H0;
+        H[1] = H1;
+        H[2] = H2;
+
+        for(label k=0; k<3; ++k)
+        {
+            const scalar c0 =
+                (A0 ^ Bv0) & H[k];
+
+            const scalar c1 =
+                ((dA ^ Bv0) + (A0 ^ dB)) & H[k];
+
+            const scalar c2 =
+                (dA ^ dB) & H[k];
+
+            auto sample =
+            [&](const scalar t)
+            {
+                const scalar q =
+                    c0 + c1*t + c2*t*t;
+
+                globalMin =
+                    Foam::min(globalMin, q);
+
+                globalMax =
+                    Foam::max(globalMax, q);
+            };
+
+            sample(scalar(0));
+            sample(scalar(1));
+
+            if( mag(c2) > VSMALL )
+            {
+                const scalar tStar =
+                    -c1/(scalar(2)*c2);
+
+                if
+                (
+                    tStar > scalar(0)
+                 && tStar < scalar(1)
+                )
+                    sample(tStar);
+            }
+        }
+
+        if( globalMin > tol )
+        {
+            normalizedMargin = globalMin/L3;
+            return 1;
+        }
+
+        if( globalMax < -tol )
+        {
+            normalizedMargin = -globalMax/L3;
+            return -1;
+        }
+
+        normalizedMargin = scalar(0);
+        return 0;
+    };
+
+
+    auto auditExactPrismChildren =
+    [&]
+    (
+        const label parentCellI
+    )
+    {
+        if
+        (
+            parentCellI < 0
+         || parentCellI >= label(cells.size())
+        )
+        {
+            ++nChildSweepSkippedParents;
+            return;
+        }
+
+        const cell& ac = cells[parentCellI];
+
+        const label startBoundary =
+            mesh_.boundaries()[0].patchStart();
+
+        label nLayers = 1;
+        label baseFace = -1;
+
+        forAll(ac, fI)
+        {
+            const label bfI =
+                ac[fI] - startBoundary;
+
+            if
+            (
+                bfI < 0
+             || bfI >= label(nLayersAtBndFace_.size())
+            )
+                continue;
+
+            if( nLayersAtBndFace_[bfI] < 2 )
+                continue;
+
+            nLayers =
+                nLayersAtBndFace_[bfI];
+
+            baseFace = fI;
+        }
+
+        if
+        (
+            baseFace < 0
+         || nLayers < 2
+        )
+        {
+            ++nChildSweepSkippedParents;
+            return;
+        }
+
+        label otherBaseFace = -1;
+
+        forAll(ac, fI)
+        {
+            if( fI == baseFace )
+                continue;
+
+            if
+            (
+                facesFromFace_.sizeOfRow(ac[fI]) == 1
+            )
+                otherBaseFace = fI;
+        }
+
+        if( otherBaseFace < 0 )
+        {
+            ++nChildSweepSkippedParents;
+            return;
+        }
+
+        const face& bf =
+            faces[ac[baseFace]];
+
+        const face& obf =
+            faces[ac[otherBaseFace]];
+
+        // This first audit targets the triangular-prism/wedge population,
+        // including the known surviving deep-BL failure.  Polygonal type-1
+        // parents remain untouched and are counted as skipped.
+        if( bf.size() != 3 )
+        {
+            ++nChildSweepSkippedParents;
+            return;
+        }
+
+        label seI[3];
+        seI[0] = -1;
+        seI[1] = -1;
+        seI[2] = -1;
+
+        for(label pI=0; pI<3; ++pI)
+        {
+            const label pointI = bf[pI];
+
+            if
+            (
+                pointI < 0
+             || pointI >= label(splitEdgesAtPoint_.size())
+            )
+            {
+                ++nChildSweepSkippedParents;
+                return;
+            }
+
+            if
+            (
+                splitEdgesAtPoint_.sizeOfRow(pointI) == 1
+            )
+            {
+                seI[pI] =
+                    splitEdgesAtPoint_(pointI, 0);
+            }
+            else
+            {
+                forAllRow
+                (
+                    splitEdgesAtPoint_,
+                    pointI,
+                    sepI
+                )
+                {
+                    const label seJ =
+                        splitEdgesAtPoint_(pointI, sepI);
+
+                    if
+                    (
+                        seJ < 0
+                     || seJ >= label(splitEdges_.size())
+                    )
+                        continue;
+
+                    const edge& se =
+                        splitEdges_[seJ];
+
+                    if
+                    (
+                        obf.which(se.end()) >= 0
+                     || obf.which(se.start()) >= 0
+                    )
+                    {
+                        seI[pI] = seJ;
+                        break;
+                    }
+                }
+            }
+
+            if
+            (
+                seI[pI] < 0
+             || seI[pI] >= label(splitEdges_.size())
+             || newVerticesForSplitEdge_.sizeOfRow
+                (
+                    seI[pI]
+                ) <= nLayers
+            )
+            {
+                ++nChildSweepSkippedParents;
+                return;
+            }
+        }
+
+        const pointFieldPMG& auditPoints =
+            mesh_.points();
+
+        // Local provenance for the targeted forensic dump.
+        // Keep this independent of the later child-sweep provenance block.
+        const label badParentDumpBfI =
+            ac[baseFace] - startBoundary;
+
+        label badParentDumpPatchI = -1;
+
+        if
+        (
+            badParentDumpBfI >= 0
+         && badParentDumpBfI < label(childSweepFacePatch.size())
+        )
+            badParentDumpPatchI =
+                childSweepFacePatch[badParentDumpBfI];
+
+        word badParentDumpPatchName("?");
+
+        if
+        (
+            badParentDumpPatchI >= 0
+         && badParentDumpPatchI < label(childSweepBoundaries.size())
+        )
+            badParentDumpPatchName =
+                childSweepBoundaries[badParentDumpPatchI].patchName();
+
+        // Temporary forensic dump for the exact Q1 birth parent.
+        // Diagnostic only; remove after the mechanism is established.
+        if( parentCellI == 1218619 )
+        {
+            Info
+                << "BL_BAD_PARENT_GEOM"
+                << " parent=" << parentCellI
+                << " bfI=" << badParentDumpBfI
+                << " patch=" << badParentDumpPatchName
+                << " nLayers=" << nLayers
+                << " splitEdges=("
+                << seI[0] << " "
+                << seI[1] << " "
+                << seI[2] << ")"
+                << endl;
+
+            Info
+                << "BL_BAD_PARENT_CELL_FACES"
+                << " parent=" << parentCellI
+                << " cellFaces=" << ac
+                << endl;
+
+            forAll(ac, srcLocalFI)
+            {
+                const label srcFaceI =
+                    ac[srcLocalFI];
+
+                const label srcBfI =
+                    srcFaceI - startBoundary;
+
+                // We only need physical boundary lineage here.
+                if
+                (
+                    srcBfI < 0
+                 || srcBfI >= label(childSweepFacePatch.size())
+                )
+                    continue;
+
+                const label srcPatchI =
+                    childSweepFacePatch[srcBfI];
+
+                word srcPatchName("?");
+
+                if
+                (
+                    srcPatchI >= 0
+                 && srcPatchI < label(childSweepBoundaries.size())
+                )
+                    srcPatchName =
+                        childSweepBoundaries[srcPatchI].patchName();
+
+                Info
+                    << "BL_BAD_PARENT_SOURCE_FACE"
+                    << " parent=" << parentCellI
+                    << " localFace=" << srcLocalFI
+                    << " faceI=" << srcFaceI
+                    << " bfI=" << srcBfI
+                    << " patch=" << srcPatchName
+                    << " oldPts=" << faces[srcFaceI]
+                    << " nDerived="
+                    << facesFromFace_.sizeOfRow(srcFaceI)
+                    << endl;
+
+                forAllRow
+                (
+                    facesFromFace_,
+                    srcFaceI,
+                    srcDerivedI
+                )
+                {
+                    const label nfI =
+                        facesFromFace_
+                        (
+                            srcFaceI,
+                            srcDerivedI
+                        );
+
+                    if
+                    (
+                        nfI < 0
+                     || nfI >= label(newFaces_.size())
+                    )
+                        continue;
+
+                    Info
+                        << "BL_BAD_PARENT_DERIVED_FACE"
+                        << " parent=" << parentCellI
+                        << " sourceFaceI=" << srcFaceI
+                        << " patch=" << srcPatchName
+                        << " derivedLocal=" << srcDerivedI
+                        << " newFaceI=" << nfI
+                        << " pts=" << newFaces_[nfI]
+                        << endl;
+                }
+            }
+
+
+            for(label edgeSlot=0; edgeSlot<3; ++edgeSlot)
+            {
+                const label splitEdgeI = seI[edgeSlot];
+                const edge& se = splitEdges_[splitEdgeI];
+
+                Info
+                    << "BL_BAD_PARENT_EDGE"
+                    << " parent=" << parentCellI
+                    << " slot=" << edgeSlot
+                    << " seI=" << splitEdgeI
+                    << " edge=("
+                    << se.start() << " "
+                    << se.end() << ")"
+                    << " start="
+                    << auditPoints[se.start()]
+                    << " row1="
+                    << auditPoints
+                       [
+                           newVerticesForSplitEdge_
+                           (
+                               splitEdgeI,
+                               1
+                           )
+                       ]
+                    << " end="
+                    << auditPoints[se.end()]
+                    << " length="
+                    << mag
+                       (
+                           auditPoints[se.end()]
+                         - auditPoints[se.start()]
+                       )
+                    << endl;
+            }
+        }
+
+        auto splitPoint =
+        [&]
+        (
+            const label edgeSlot,
+            const label rowI
+        ) -> const point&
+        {
+            const label pI =
+                newVerticesForSplitEdge_
+                (
+                    seI[edgeSlot],
+                    rowI
+                );
+
+            return auditPoints[pI];
+        };
+
+
+        // Full parent sweep using the same three split edges.
+        scalar parentMargin = scalar(0);
+
+        const label parentState =
+            childSweepState
+            (
+                splitPoint(0, 0),
+                splitPoint(1, 0),
+                splitPoint(2, 0),
+
+                splitPoint(0, nLayers),
+                splitPoint(1, nLayers),
+                splitPoint(2, nLayers),
+
+                parentMargin
+            );
+
+        ++nChildSweepParentsChecked;
+
+        const label baseBfI =
+            ac[baseFace] - startBoundary;
+
+        label patchI = -1;
+
+        if
+        (
+            baseBfI >= 0
+         && baseBfI < label(childSweepFacePatch.size())
+        )
+            patchI =
+                childSweepFacePatch[baseBfI];
+
+        word patchName("?");
+
+        if
+        (
+            patchI >= 0
+         && patchI < label(childSweepBoundaries.size())
+        )
+            patchName =
+                childSweepBoundaries[patchI].patchName();
+
+        if( parentState == 0 )
+        {
+            ++nChildSweepParentUnsafe;
+
+            if( nChildSweepBadPrinted < 20 )
+            {
+                ++nChildSweepBadPrinted;
+
+                Info
+                    << "BL_CHILD_SWEEP_PARENT_UNSAFE"
+                    << " parentCell=" << parentCellI
+                    << " bfI=" << baseBfI
+                    << " patch=" << patchName
+                    << " nLayers=" << nLayers
+                    << " parentMargin="
+                    << parentMargin
+                    << " splitEdges=("
+                    << seI[0] << " "
+                    << seI[1] << " "
+                    << seI[2] << ")"
+                    << endl;
+            }
+
+            return;
+        }
+
+
+        auto edgeFraction =
+        [&]
+        (
+            const label edgeSlot,
+            const label rowI
+        ) -> scalar
+        {
+            const label splitEdgeI =
+                seI[edgeSlot];
+
+            const edge& se =
+                splitEdges_[splitEdgeI];
+
+            const vector ev =
+                auditPoints[se.end()]
+              - auditPoints[se.start()];
+
+            const scalar ev2 = ev & ev;
+
+            if( ev2 <= VSMALL )
+                return scalar(0);
+
+            const label pI =
+                newVerticesForSplitEdge_
+                (
+                    splitEdgeI,
+                    rowI
+                );
+
+            return
+                (
+                    (
+                        auditPoints[pI]
+                      - auditPoints[se.start()]
+                    )
+                  & ev
+                ) / ev2;
+        };
+
+
+        for
+        (
+            label layerI=0;
+            layerI<nLayers;
+            ++layerI
+        )
+        {
+            scalar childMargin = scalar(0);
+
+            const label childState =
+                childSweepState
+                (
+                    splitPoint(0, layerI),
+                    splitPoint(1, layerI),
+                    splitPoint(2, layerI),
+
+                    splitPoint(0, layerI+1),
+                    splitPoint(1, layerI+1),
+                    splitPoint(2, layerI+1),
+
+                    childMargin
+                );
+
+            ++nChildSweepChildrenChecked;
+
+            if( childState == parentState )
+                continue;
+
+            ++nChildSweepBadChildren;
+
+            const scalar l0 =
+                edgeFraction(0, layerI);
+            const scalar l1 =
+                edgeFraction(1, layerI);
+            const scalar l2 =
+                edgeFraction(2, layerI);
+
+            const scalar u0 =
+                edgeFraction(0, layerI+1);
+            const scalar u1 =
+                edgeFraction(1, layerI+1);
+            const scalar u2 =
+                edgeFraction(2, layerI+1);
+
+            const scalar lowerMin =
+                Foam::min(l0, Foam::min(l1, l2));
+
+            const scalar lowerMax =
+                Foam::max(l0, Foam::max(l1, l2));
+
+            const scalar upperMin =
+                Foam::min(u0, Foam::min(u1, u2));
+
+            const scalar upperMax =
+                Foam::max(u0, Foam::max(u1, u2));
+
+            if( nChildSweepBadPrinted < 20 )
+            {
+                ++nChildSweepBadPrinted;
+
+                Info
+                    << "BL_CHILD_SWEEP_BAD"
+                    << " parentCell=" << parentCellI
+                    << " bfI=" << baseBfI
+                    << " patch=" << patchName
+                    << " nLayers=" << nLayers
+                    << " layerInterval="
+                    << layerI << "->" << layerI+1
+                    << " localChild="
+                    << nLayers-1-layerI
+                    << " parentState="
+                    << parentState
+                    << " childState="
+                    << childState
+                    << " parentMargin="
+                    << parentMargin
+                    << " childMargin="
+                    << childMargin
+                    << " splitEdges=("
+                    << seI[0] << " "
+                    << seI[1] << " "
+                    << seI[2] << ")"
+                    << " lowerT=("
+                    << l0 << " "
+                    << l1 << " "
+                    << l2 << ")"
+                    << " upperT=("
+                    << u0 << " "
+                    << u1 << " "
+                    << u2 << ")"
+                    << " lowerSpread="
+                    << lowerMax-lowerMin
+                    << " upperSpread="
+                    << upperMax-upperMin
+                    << endl;
+            }
+        }
+    };
+
+
+    // REFINE_CHILD_CLOSURE_AUDIT
+    // Diagnostic only.  Check generated child shells before face-label
+    // consolidation/reconstruction can alter their connectivity.
+    label nGeneratedChildrenChecked = 0;
+    label nGeneratedChildrenBad = 0;
+    label nGeneratedBadType1 = 0;
+    label nGeneratedBadType2 = 0;
+    label nGeneratedBadType3 = 0;
+    label nGeneratedBadEdges = 0;
+    label nGeneratedMalformedFaces = 0;
+
+    auto auditGeneratedChild =
+    [&]
+    (
+        const auto& childFaces,
+        const label parentCellI,
+        const label localChildI,
+        const label childRefType
+    ) -> bool
+    {
+        ++nGeneratedChildrenChecked;
+
+        std::map<std::pair<label,label>, label> edgeUse;
+
+        bool bad = false;
+        label badEdgesThisChild = 0;
+        label malformedThisChild = 0;
+
+        forAll(childFaces, fI)
+        {
+            const auto& f = childFaces[fI];
+
+            if( f.size() < 3 )
+            {
+                bad = true;
+                ++malformedThisChild;
+                continue;
+            }
+
+            forAll(f, pI)
+            {
+                const label a = f[pI];
+                const label b = f[(pI+1)%f.size()];
+
+                if( a == b )
+                    bad = true;
+
+                ++edgeUse
+                [
+                    std::make_pair
+                    (
+                        Foam::min(a,b),
+                        Foam::max(a,b)
+                    )
+                ];
+            }
+        }
+
+        for
+        (
+            std::map<std::pair<label,label>, label>::const_iterator
+                iter=edgeUse.begin();
+            iter!=edgeUse.end();
+            ++iter
+        )
+        {
+            if( iter->second != 2 )
+            {
+                bad = true;
+                ++badEdgesThisChild;
+            }
+        }
+
+        if( bad )
+        {
+            ++nGeneratedChildrenBad;
+            nGeneratedBadEdges += badEdgesThisChild;
+            nGeneratedMalformedFaces += malformedThisChild;
+
+            if( childRefType == 1 )
+                ++nGeneratedBadType1;
+            else if( childRefType == 2 )
+                ++nGeneratedBadType2;
+            else if( childRefType == 3 )
+                ++nGeneratedBadType3;
+
+            if( nGeneratedChildrenBad <= 50 )
+            {
+                Info << "REFINE_CHILD_CLOSURE_BAD"
+                     << " parent=" << parentCellI
+                     << " childLocal=" << localChildI
+                     << " refType=" << childRefType
+                     << " nFaces=" << childFaces.size()
+                     << " badEdges=" << badEdgesThisChild
+                     << " malformedFaces=" << malformedThisChild
+                     << endl;
+            }
+        }
+
+        return !bad;
+    };
+
+    // ==================================================================
+    // CFMITCH V2.9a PROSPECTIVE FRONT OPTIMIZER
+    //
+    // Birth-time quality control for type-1 BL refinement.
+    //
+    // IMPORTANT:
+    //
+    //   * splitEdges_[seI].start() and .end() remain FIXED.
+    //   * Only newly-created interior split-row points move.
+    //   * This runs after generateNewFaces(), so prospective child topology
+    //     is available, but before generateNewCells() commits those children.
+    //
+    // The objective differs fundamentally from the post-construction V1C/
+    // V1D repair:
+    //
+    //   - zero negative prospective cells is mandatory;
+    //   - fewer bad prospective pyramids wins;
+    //   - at equal bad-pyramid count, a better worst pyramid margin wins.
+    //
+    // A seed transaction is rejected if its moved generated points touch
+    // a refType-2/3 parent.  Those junction/intersection topologies require
+    // their own prospective evaluator and are deliberately fail-closed here.
+    // ==================================================================
+    {
+        pointFieldPMG& v29Points =
+            mesh_.points();
+
+        const labelList& v29Owner =
+            mesh_.owner();
+
+        const labelList& v29Neighbour =
+            mesh_.neighbour();
+
+        const label v29StartBoundary =
+            mesh_.boundaries()[0].patchStart();
+
+
+        struct V29Score
+        {
+            label invalid;
+            label negative;
+            label badPyr;
+
+            scalar negMag;
+            scalar minPyr;
+            scalar minPositiveVol;
+
+            V29Score()
+            :
+                invalid(0),
+                negative(0),
+                badPyr(0),
+                negMag(0),
+                minPyr(GREAT),
+                minPositiveVol(GREAT)
+            {}
+        };
+
+
+        // --------------------------------------------------------------
+        // OpenFOAM-parity polygon face centre and area, but operating on
+        // temporary DynList faces rather than committed mesh faces.
+        // --------------------------------------------------------------
+
+        auto v29FaceCentreArea =
+        [&]
+        (
+            const auto& f,
+            vector& fCtr,
+            vector& fArea
+        ) -> bool
+        {
+            const label nFp =
+                f.size();
+
+            if( nFp < 3 )
+                return false;
+
+            if( nFp == 3 )
+            {
+                const point& p0 =
+                    v29Points[f[0]];
+
+                const point& p1 =
+                    v29Points[f[1]];
+
+                const point& p2 =
+                    v29Points[f[2]];
+
+                fArea =
+                    scalar(0.5)
+                   *((p1-p0)^(p2-p0));
+
+                fCtr =
+                    (scalar(1)/scalar(3))
+                   *(p0+p1+p2);
+
+                return
+                    (
+                        !help::isnan(fCtr)
+                     && !help::isinf(fCtr)
+                     && !help::isnan(fArea)
+                     && !help::isinf(fArea)
+                    );
+            }
+
+            point pAvg(vector::zero);
+
+            for(label fpI=0; fpI<nFp; ++fpI)
+                pAvg += v29Points[f[fpI]];
+
+            pAvg /= scalar(nFp);
+
+            vector sumA(vector::zero);
+
+            for(label fpI=0; fpI<nFp; ++fpI)
+            {
+                const label nextI =
+                    (fpI+1)%nFp;
+
+                const point& fp =
+                    v29Points[f[fpI]];
+
+                const point& fpNext =
+                    v29Points[f[nextI]];
+
+                sumA +=
+                    (fpNext-fp)^(pAvg-fp);
+            }
+
+            const scalar magSumA =
+                mag(sumA);
+
+            if( magSumA <= VSMALL )
+                return false;
+
+            const vector sumAHat =
+                sumA/(magSumA + VSMALL);
+
+            scalar sumAn =
+                scalar(0);
+
+            vector sumAnc(vector::zero);
+
+            for(label fpI=0; fpI<nFp; ++fpI)
+            {
+                const label nextI =
+                    (fpI+1)%nFp;
+
+                const point& fp =
+                    v29Points[f[fpI]];
+
+                const point& fpNext =
+                    v29Points[f[nextI]];
+
+                const vector a =
+                    (fpNext-fp)^(pAvg-fp);
+
+                const vector c =
+                    fp + fpNext + pAvg;
+
+                const scalar an =
+                    a & sumAHat;
+
+                sumAn += an;
+                sumAnc += an*c;
+            }
+
+            fArea =
+                scalar(0.5)*sumA;
+
+            if( sumAn > VSMALL )
+            {
+                fCtr =
+                    (scalar(1)/scalar(3))
+                   *sumAnc/sumAn;
+            }
+            else
+            {
+                fCtr = pAvg;
+            }
+
+            return
+                (
+                    !help::isnan(fCtr)
+                 && !help::isinf(fCtr)
+                 && !help::isnan(fArea)
+                 && !help::isinf(fArea)
+                );
+        };
+
+
+        // --------------------------------------------------------------
+        // Prospective cell quality.
+        //
+        // childFaces are face POINT LABELS, already oriented relative to
+        // the prospective cell by generateNewCellsPrism() or by the type-0
+        // builder below.
+        //
+        // The centre calculation mirrors primitiveMesh:
+        //
+        //       cEst = average(face centres)
+        //       pyr3 = Sf & (Cf-cEst)
+        //       C = sum(pyr3*(.75Cf+.25cEst))/sum(pyr3)
+        //
+        // A positive outward-oriented face pyramid has:
+        //
+        //       Sf & (Cf-C) > 0
+        //
+        // so this directly provides the checkMesh-facing pyramid margin.
+        // --------------------------------------------------------------
+
+        auto v29EvaluateChild =
+        [&]
+        (
+            const auto& childFaces,
+            V29Score& score
+        ) -> bool
+        {
+            const label nCf =
+                childFaces.size();
+
+            if( nCf < 4 )
+            {
+                ++score.invalid;
+                return false;
+            }
+
+            List<vector> faceCtr(nCf);
+            List<vector> faceArea(nCf);
+
+            point cEst(vector::zero);
+
+            for(label cfI=0; cfI<nCf; ++cfI)
+            {
+                if
+                (
+                    !v29FaceCentreArea
+                    (
+                        childFaces[cfI],
+                        faceCtr[cfI],
+                        faceArea[cfI]
+                    )
+                )
+                {
+                    ++score.invalid;
+                    return false;
+                }
+
+                cEst += faceCtr[cfI];
+            }
+
+            cEst /= scalar(nCf);
+
+            // ------------------------------------------------------
+            // TOPOLOGICALLY ORIENTED prospective cell evaluation.
+            //
+            // childFaces MUST already be oriented outward relative to THIS
+            // prospective cell.  Orientation is never inferred from the
+            // candidate geometry here.
+            //
+            // For type-1 cells v29BuildOrientedType1Children() below fixes
+            // the two cross-layer faces using layer topology while retaining
+            // generateNewCellsPrism()'s exact lateral polygons.
+            //
+            // For type-0 cells v29BuildType0Cell() already reverses every
+            // derived source face according to the original owner relation.
+            //
+            // With cell-local outward faces, this is directly equivalent to
+            // primitiveMesh::makeCellCentresAndVols() after applying the
+            // owner/neighbour sign for the cell.
+            // ------------------------------------------------------
+
+            vector weightedCentre(vector::zero);
+            scalar vol3 = scalar(0);
+
+            for(label cfI=0; cfI<nCf; ++cfI)
+            {
+                const scalar pyr3 =
+                    faceArea[cfI]
+                  & (
+                        faceCtr[cfI]
+                       -cEst
+                    );
+
+                const vector pc =
+                    scalar(0.75)*faceCtr[cfI]
+                  + scalar(0.25)*cEst;
+
+                weightedCentre +=
+                    pyr3*pc;
+
+                vol3 += pyr3;
+            }
+
+            point cellCtr(cEst);
+
+            if( Foam::mag(vol3) > VSMALL )
+                cellCtr = weightedCentre/vol3;
+
+            if
+            (
+                help::isnan(cellCtr)
+             || help::isinf(cellCtr)
+            )
+            {
+                ++score.invalid;
+                return false;
+            }
+
+            const scalar cellVol =
+                vol3/scalar(3);
+
+            if( cellVol <= scalar(0) )
+            {
+                ++score.negative;
+
+                score.negMag +=
+                    Foam::mag(cellVol);
+            }
+            else
+            {
+                score.minPositiveVol =
+                    Foam::min
+                    (
+                        score.minPositiveVol,
+                        cellVol
+                    );
+            }
+
+
+            // With outward cell-local orientation:
+            //
+            //     Sf & (Cf-C) / 3
+            //
+            // is the positive pyramid margin.  This is equivalent to
+            // -pyramidPointFaceRef(...).mag() for an OpenFOAM owner cell.
+            for(label cfI=0; cfI<nCf; ++cfI)
+            {
+                const scalar pyrMargin =
+                    (
+                        faceArea[cfI]
+                      & (
+                            faceCtr[cfI]
+                           -cellCtr
+                        )
+                    )
+                   /scalar(3);
+
+                score.minPyr =
+                    Foam::min
+                    (
+                        score.minPyr,
+                        pyrMargin
+                    );
+
+                if( pyrMargin < -SMALL )
+                    ++score.badPyr;
+            }
+
+            return true;
+        };
+
+
+        // --------------------------------------------------------------
+        // Exact split-edge set used by a type-1 parent.
+        //
+        // This deliberately mirrors generateNewCellsPrism().
+        // --------------------------------------------------------------
+
+        auto v29Type1Edges =
+        [&]
+        (
+            const label parentCellI,
+            DynList<label, 16>& parentEdges
+        ) -> bool
+        {
+            parentEdges.clear();
+
+            if
+            (
+                parentCellI < 0
+             || parentCellI >= nCells
+             || refType[parentCellI] != 1
+            )
+                return false;
+
+            const cell& ac =
+                cells[parentCellI];
+
+            label baseFace = -1;
+            label nLayers = 1;
+
+            forAll(ac, fI)
+            {
+                const label bfI =
+                    ac[fI] - v29StartBoundary;
+
+                if
+                (
+                    bfI < 0
+                 || bfI >= label(nLayersAtBndFace_.size())
+                )
+                    continue;
+
+                if( nLayersAtBndFace_[bfI] < 2 )
+                    continue;
+
+                nLayers =
+                    nLayersAtBndFace_[bfI];
+
+                baseFace = fI;
+            }
+
+            if
+            (
+                baseFace < 0
+             || nLayers < 2
+            )
+                return false;
+
+            label otherBaseFace = -1;
+
+            forAll(ac, fI)
+            {
+                if( fI == baseFace )
+                    continue;
+
+                if
+                (
+                    facesFromFace_.sizeOfRow
+                    (
+                        ac[fI]
+                    ) == 1
+                )
+                    otherBaseFace = fI;
+            }
+
+            if( otherBaseFace < 0 )
+                return false;
+
+            const face& bf =
+                faces[ac[baseFace]];
+
+            const face& obf =
+                faces[ac[otherBaseFace]];
+
+            if( bf.size() < 3 )
+                return false;
+
+            forAll(bf, pI)
+            {
+                const label pointI =
+                    bf[pI];
+
+                if
+                (
+                    pointI < 0
+                 || pointI >=
+                    label(splitEdgesAtPoint_.size())
+                )
+                    return false;
+
+                label seI = -1;
+
+                if
+                (
+                    splitEdgesAtPoint_.
+                        sizeOfRow(pointI) == 1
+                )
+                {
+                    seI =
+                        splitEdgesAtPoint_
+                        (
+                            pointI,
+                            0
+                        );
+                }
+                else
+                {
+                    forAllRow
+                    (
+                        splitEdgesAtPoint_,
+                        pointI,
+                        sepI
+                    )
+                    {
+                        const label seJ =
+                            splitEdgesAtPoint_
+                            (
+                                pointI,
+                                sepI
+                            );
+
+                        if
+                        (
+                            seJ < 0
+                         || seJ >= label(splitEdges_.size())
+                        )
+                            continue;
+
+                        const edge& se =
+                            splitEdges_[seJ];
+
+                        if
+                        (
+                            obf.which(se.end()) >= 0
+                         || obf.which(se.start()) >= 0
+                        )
+                        {
+                            seI = seJ;
+                            break;
+                        }
+                    }
+                }
+
+                if
+                (
+                    seI < 0
+                 || seI >= label(splitEdges_.size())
+                 || newVerticesForSplitEdge_.
+                    sizeOfRow(seI) < 3
+                )
+                    return false;
+
+                parentEdges.appendIfNotIn(seI);
+            }
+
+            return
+                (
+                    parentEdges.size()
+                 == bf.size()
+                );
+        };
+
+
+        // --------------------------------------------------------------
+        // Exact type-1 prospective child topology with CELL-LOCAL
+        // topological orientation.
+        //
+        // generateNewCellsPrism() is still used to obtain the exact lateral
+        // polygons, including NONQUAD_EDGE_CONFORM / inserted vertices.
+        //
+        // Its two cross-layer face orderings cannot be trusted directly:
+        // the same ordering is deliberately appended to both adjacent
+        // children.  Recover those two orientations from the known
+        // CORE<->WALL layer topology instead of candidate geometry.
+        //
+        // Also impose a hard triangle-fan sweep/Jacobian guard using the
+        // existing childSweepState().  Any sign change or singular triangle
+        // rejects the prospective state before pyramid scoring.
+        // --------------------------------------------------------------
+
+        auto v29BuildOrientedType1Children =
+        [&]
+        (
+            const label parentCellI,
+            DynList
+            <
+                DynList
+                <
+                    DynList<label,8>,
+                    10
+                >,
+                64
+            >& children
+        ) -> bool
+        {
+            children.clear();
+
+            DynList<label,16> parentEdges;
+
+            if
+            (
+                !v29Type1Edges
+                (
+                    parentCellI,
+                    parentEdges
+                )
+            )
+                return false;
+
+            const label nHairs =
+                parentEdges.size();
+
+            if( nHairs < 3 )
+                return false;
+
+            const label firstEdgeI =
+                parentEdges[0];
+
+            if
+            (
+                firstEdgeI < 0
+             || firstEdgeI >= label(splitEdges_.size())
+            )
+                return false;
+
+            const label nLayers =
+                newVerticesForSplitEdge_.
+                    sizeOfRow(firstEdgeI) - 1;
+
+            if( nLayers < 2 )
+                return false;
+
+
+            // All hairs of one type-1 parent must use the same number of
+            // rows.  Otherwise the ordinary prism constructor itself is
+            // not a legal model for this prospective parent.
+            forAll(parentEdges, peI)
+            {
+                const label seI =
+                    parentEdges[peI];
+
+                if
+                (
+                    seI < 0
+                 || seI >= label(splitEdges_.size())
+                 || newVerticesForSplitEdge_.
+                    sizeOfRow(seI) != nLayers + 1
+                )
+                    return false;
+            }
+
+
+            auto rowPointLabel =
+            [&]
+            (
+                const label hairI,
+                const label rowI
+            ) -> label
+            {
+                return
+                    newVerticesForSplitEdge_
+                    (
+                        parentEdges[hairI],
+                        rowI
+                    );
+            };
+
+
+            auto rowPoint =
+            [&]
+            (
+                const label hairI,
+                const label rowI
+            ) -> const point&
+            {
+                return
+                    v29Points
+                    [
+                        rowPointLabel
+                        (
+                            hairI,
+                            rowI
+                        )
+                    ];
+            };
+
+
+            // ----------------------------------------------------------
+            // HARD SWEEP/JACOBIAN GUARD.
+            //
+            // Fan triangulation is tied to the base-face/hair ordering:
+            //
+            //     (0,1,2), (0,2,3), (0,3,4), ...
+            //
+            // For each fan triangle, every discrete child interval must
+            // retain the orientation of the complete original sweep.
+            // ----------------------------------------------------------
+
+            for
+            (
+                label fanI=1;
+                fanI<nHairs-1;
+                ++fanI
+            )
+            {
+                scalar parentMargin =
+                    scalar(0);
+
+                const label parentState =
+                    childSweepState
+                    (
+                        rowPoint(0,    0),
+                        rowPoint(fanI, 0),
+                        rowPoint(fanI+1, 0),
+
+                        rowPoint(0,    nLayers),
+                        rowPoint(fanI, nLayers),
+                        rowPoint(fanI+1, nLayers),
+
+                        parentMargin
+                    );
+
+                if( parentState == 0 )
+                    return false;
+
+
+                for
+                (
+                    label layerI=0;
+                    layerI<nLayers;
+                    ++layerI
+                )
+                {
+                    scalar childMargin =
+                        scalar(0);
+
+                    const label childState =
+                        childSweepState
+                        (
+                            rowPoint(0,    layerI),
+                            rowPoint(fanI, layerI),
+                            rowPoint(fanI+1, layerI),
+
+                            rowPoint(0,    layerI+1),
+                            rowPoint(fanI, layerI+1),
+                            rowPoint(fanI+1, layerI+1),
+
+                            childMargin
+                        );
+
+                    if
+                    (
+                        childState == 0
+                     || childState != parentState
+                    )
+                        return false;
+                }
+            }
+
+
+            // Obtain the EXACT prospective polygons cfMesh will consume.
+            if
+            (
+                !generateNewCellsPrism
+                (
+                    parentCellI,
+                    children
+                )
+            )
+                return false;
+
+            if
+            (
+                children.size() != nLayers
+            )
+                return false;
+
+
+            // ----------------------------------------------------------
+            // Fix ONLY the two cross-layer face orientations.
+            //
+            // Type-1 child numbering:
+            //
+            //     child 0          = core-side child
+            //     child N-1        = wall-side child
+            //
+            // Therefore:
+            //
+            //     wallRow = N-1-child
+            //     coreRow = wallRow+1
+            //
+            // Base-face/hair ordering is outward at the wall side.
+            // Thus:
+            //
+            //     wall cross-face  = base ordering
+            //     core cross-face  = reversed base ordering
+            //
+            // Lateral polygons are left untouched because
+            // generateNewCellsPrism() already reverses them according to
+            // the original parent owner relation.
+            // ----------------------------------------------------------
+
+            forAll(children, childI)
+            {
+                const label wallRow =
+                    nLayers - 1 - childI;
+
+                const label coreRow =
+                    wallRow + 1;
+
+                if
+                (
+                    wallRow < 0
+                 || coreRow > nLayers
+                )
+                    return false;
+
+
+                DynList<label,8> wallFace;
+                DynList<label,8> coreFace;
+
+                for
+                (
+                    label hairI=0;
+                    hairI<nHairs;
+                    ++hairI
+                )
+                {
+                    wallFace.append
+                    (
+                        rowPointLabel
+                        (
+                            hairI,
+                            wallRow
+                        )
+                    );
+                }
+
+                for
+                (
+                    label hairI=nHairs-1;
+                    hairI>=0;
+                    --hairI
+                )
+                {
+                    coreFace.append
+                    (
+                        rowPointLabel
+                        (
+                            hairI,
+                            coreRow
+                        )
+                    );
+                }
+
+
+                label wallFaceI = -1;
+                label coreFaceI = -1;
+
+                forAll(children[childI], cfI)
+                {
+                    const DynList<label,8>& f =
+                        children[childI][cfI];
+
+                    if
+                    (
+                        help::areFacesEqual
+                        (
+                            f,
+                            wallFace
+                        )
+                    )
+                    {
+                        if( wallFaceI >= 0 )
+                            return false;
+
+                        wallFaceI = cfI;
+                    }
+
+                    if
+                    (
+                        help::areFacesEqual
+                        (
+                            f,
+                            coreFace
+                        )
+                    )
+                    {
+                        if( coreFaceI >= 0 )
+                            return false;
+
+                        coreFaceI = cfI;
+                    }
+                }
+
+
+                if
+                (
+                    wallFaceI < 0
+                 || coreFaceI < 0
+                 || wallFaceI == coreFaceI
+                )
+                    return false;
+
+
+                children[childI][wallFaceI] =
+                    wallFace;
+
+                children[childI][coreFaceI] =
+                    coreFace;
+            }
+
+
+            return true;
+        };
+
+
+        // --------------------------------------------------------------
+        // Prospective type-0 cell.
+        //
+        // facesFromFace_ has already been generated.  Preserve the
+        // original source-face orientation relative to this cell.
+        // --------------------------------------------------------------
+
+        auto v29BuildType0Cell =
+        [&]
+        (
+            const label cellI,
+            DynList<DynList<label,8>, 10>& childFaces
+        ) -> bool
+        {
+            childFaces.clear();
+
+            if
+            (
+                cellI < 0
+             || cellI >= nCells
+             || refType[cellI] != 0
+            )
+                return false;
+
+            const cell& c =
+                cells[cellI];
+
+            forAll(c, cfI)
+            {
+                const label sourceFaceI =
+                    c[cfI];
+
+                if
+                (
+                    sourceFaceI < 0
+                 || sourceFaceI >=
+                    label(facesFromFace_.size())
+                 || sourceFaceI >=
+                    label(v29Owner.size())
+                )
+                    return false;
+
+                if
+                (
+                    facesFromFace_.
+                        sizeOfRow(sourceFaceI) == 0
+                )
+                    return false;
+
+                forAllRow
+                (
+                    facesFromFace_,
+                    sourceFaceI,
+                    dfI
+                )
+                {
+                    const label newFaceI =
+                        facesFromFace_
+                        (
+                            sourceFaceI,
+                            dfI
+                        );
+
+                    if
+                    (
+                        newFaceI < 0
+                     || newFaceI >=
+                        label(newFaces_.size())
+                    )
+                        return false;
+
+                    DynList<label,8> f;
+
+                    f =
+                        newFaces_[newFaceI];
+
+                    if
+                    (
+                        v29Owner[sourceFaceI]
+                     != cellI
+                    )
+                    {
+                        f =
+                            help::reverseFace(f);
+                    }
+
+                    childFaces.append(f);
+                }
+            }
+
+            return
+                childFaces.size() >= 4;
+        };
+
+
+        // --------------------------------------------------------------
+        // Prospective quality of one ORIGINAL coarse parent.
+        //
+        // refType 0 => one replacement cell
+        // refType 1 => exact future BL children from generateNewCellsPrism
+        //
+        // refType 2/3 intentionally fail closed.
+        // --------------------------------------------------------------
+
+        auto v29EvaluateParent =
+        [&]
+        (
+            const label parentCellI,
+            V29Score& score
+        ) -> bool
+        {
+            if
+            (
+                parentCellI < 0
+             || parentCellI >= nCells
+            )
+            {
+                ++score.invalid;
+                return false;
+            }
+
+            if( refType[parentCellI] == 0 )
+            {
+                DynList
+                <
+                    DynList<label,8>,
+                    10
+                > childFaces;
+
+                if
+                (
+                    !v29BuildType0Cell
+                    (
+                        parentCellI,
+                        childFaces
+                    )
+                )
+                {
+                    ++score.invalid;
+                    return false;
+                }
+
+                return
+                    v29EvaluateChild
+                    (
+                        childFaces,
+                        score
+                    );
+            }
+
+            if( refType[parentCellI] == 1 )
+            {
+                DynList
+                <
+                    DynList
+                    <
+                        DynList<label,8>,
+                        10
+                    >,
+                    64
+                > children;
+
+                if
+                (
+                    !v29BuildOrientedType1Children
+                    (
+                        parentCellI,
+                        children
+                    )
+                )
+                {
+                    ++score.invalid;
+                    return false;
+                }
+
+                forAll(children, childI)
+                {
+                    if
+                    (
+                        !v29EvaluateChild
+                        (
+                            children[childI],
+                            score
+                        )
+                    )
+                        return false;
+                }
+
+                return true;
+            }
+
+            ++score.invalid;
+            return false;
+        };
+
+
+        // --------------------------------------------------------------
+        // Wall-adjacent prospective child seed predicate.
+        //
+        // Type-1 local child numbering is CORE -> WALL, therefore the last
+        // prospective child is the wall-adjacent child.
+        // --------------------------------------------------------------
+
+        auto v29WallChildScore =
+        [&]
+        (
+            const label parentCellI,
+            V29Score& score
+        ) -> bool
+        {
+            if
+            (
+                parentCellI < 0
+             || parentCellI >= nCells
+             || refType[parentCellI] != 1
+            )
+                return false;
+
+            DynList
+            <
+                DynList
+                <
+                    DynList<label,8>,
+                    10
+                >,
+                64
+            > children;
+
+            if
+            (
+                !v29BuildOrientedType1Children
+                (
+                    parentCellI,
+                    children
+                )
+            )
+                return false;
+
+            return
+                v29EvaluateChild
+                (
+                    children
+                    [
+                        children.size()-1
+                    ],
+                    score
+                );
+        };
+
+
+        // --------------------------------------------------------------
+        // newFace -> source original face.
+        // --------------------------------------------------------------
+
+        labelList v29NewFaceSource
+        (
+            newFaces_.size(),
+            -1
+        );
+
+        for
+        (
+            label sourceFaceI=0;
+            sourceFaceI<label(facesFromFace_.size());
+            ++sourceFaceI
+        )
+        {
+            forAllRow
+            (
+                facesFromFace_,
+                sourceFaceI,
+                dfI
+            )
+            {
+                const label newFaceI =
+                    facesFromFace_
+                    (
+                        sourceFaceI,
+                        dfI
+                    );
+
+                if
+                (
+                    newFaceI >= 0
+                 && newFaceI <
+                    label(v29NewFaceSource.size())
+                 && v29NewFaceSource[newFaceI] < 0
+                )
+                {
+                    v29NewFaceSource[newFaceI] =
+                        sourceFaceI;
+                }
+            }
+        }
+
+
+        // Point -> generated face reverse addressing.
+        VRWGraph v29PointNewFaces;
+
+        v29PointNewFaces.reverseAddressing
+        (
+            newFaces_
+        );
+
+
+        auto v29AffectedParents =
+        [&]
+        (
+            const DynList<label,16>& seedEdges,
+            std::set<label>& affected
+        ) -> bool
+        {
+            affected.clear();
+
+            forAll(seedEdges, eeI)
+            {
+                const label seI =
+                    seedEdges[eeI];
+
+                if
+                (
+                    seI < 0
+                 || seI >= label(splitEdges_.size())
+                )
+                    return false;
+
+                const label rowSize =
+                    newVerticesForSplitEdge_.
+                        sizeOfRow(seI);
+
+                if( rowSize < 3 )
+                    return false;
+
+                for
+                (
+                    label rowI=1;
+                    rowI<rowSize-1;
+                    ++rowI
+                )
+                {
+                    const label pointI =
+                        newVerticesForSplitEdge_
+                        (
+                            seI,
+                            rowI
+                        );
+
+                    if
+                    (
+                        pointI < 0
+                     || pointI >=
+                        label(v29PointNewFaces.size())
+                    )
+                        return false;
+
+                    forAllRow
+                    (
+                        v29PointNewFaces,
+                        pointI,
+                        pfI
+                    )
+                    {
+                        const label newFaceI =
+                            v29PointNewFaces
+                            (
+                                pointI,
+                                pfI
+                            );
+
+                        if
+                        (
+                            newFaceI < 0
+                         || newFaceI >=
+                            label(v29NewFaceSource.size())
+                        )
+                            continue;
+
+                        const label sourceFaceI =
+                            v29NewFaceSource[newFaceI];
+
+                        if
+                        (
+                            sourceFaceI < 0
+                         || sourceFaceI >=
+                            label(v29Owner.size())
+                        )
+                            continue;
+
+                        const label own =
+                            v29Owner[sourceFaceI];
+
+                        if
+                        (
+                            own >= 0
+                         && own < nCells
+                        )
+                            affected.insert(own);
+
+                        if
+                        (
+                            sourceFaceI <
+                            label(v29Neighbour.size())
+                        )
+                        {
+                            const label nei =
+                                v29Neighbour[sourceFaceI];
+
+                            if
+                            (
+                                nei >= 0
+                             && nei < nCells
+                            )
+                                affected.insert(nei);
+                        }
+                    }
+                }
+            }
+
+            return !affected.empty();
+        };
+
+
+        auto v29EvaluateSet =
+        [&]
+        (
+            const std::set<label>& affected,
+            V29Score& score
+        ) -> bool
+        {
+            for
+            (
+                std::set<label>::const_iterator
+                    cIt=affected.begin();
+                cIt!=affected.end();
+                ++cIt
+            )
+            {
+                const label cellI =
+                    *cIt;
+
+                if
+                (
+                    refType[cellI] != 0
+                 && refType[cellI] != 1
+                )
+                {
+                    ++score.invalid;
+                    return false;
+                }
+
+                if
+                (
+                    !v29EvaluateParent
+                    (
+                        cellI,
+                        score
+                    )
+                )
+                    return false;
+            }
+
+            return true;
+        };
+
+
+        // ==============================================================
+        // CFMITCH V5.2a -- PROSPECTIVE MARCHING CONTRACT CENSUS
+        //
+        // This is deliberately diagnostic-only.  It evaluates the exact
+        // type-1 children already staged by generateNewFaces(), before any
+        // child cell is committed.  Children are inspected from WALL to
+        // CORE, which is the order a prevention-first layer marcher will
+        // use.  The first unsafe interval defines the presently achievable
+        // prefix for the parent column.
+        //
+        // Hard prospective invariants:
+        //   * finite, positive child volume;
+        //   * non-negative face pyramids;
+        //   * exact OF13 face-plane concavity test;
+        //   * an admissible one-sided face-tet base on every child face;
+        //   * an admissible shared base on each completed layer interface;
+        //   * no >=90 degree completed layer interface.
+        //
+        // Severe non-orthogonality (>70 degrees) is measured but is NOT a
+        // hard validity failure.  It is an anisotropy-sensitive quality
+        // heuristic and belongs in the later bounded quality contract.
+        //
+        // A virtual backtrack moves only the proposed CORE row of the first
+        // failing interval toward its accepted WALL row.  Every point is
+        // restored immediately; V5.2a changes neither geometry nor topology.
+        // ==============================================================
+        if( cfmitchV52aFrontCensus_ )
+        {
+            if( Pstream::parRun() )
+            {
+                FatalErrorIn
+                (
+                    "refineBoundaryLayers::generateNewCells"
+                )
+                    << "CFMitch V5.2a currently requires a serial run"
+                    << exit(FatalError);
+            }
+
+            static label v52aInvocationCounter = 0;
+            const label v52aInvocation = ++v52aInvocationCounter;
+
+            Info
+                << "CFMITCH V5.2a MODE:"
+                << " invocation=" << v52aInvocation
+                << " stage=preV29Prospective"
+                << " marchOrder=wallToCore"
+                << " diagnosticOnly=true"
+                << " exactRollbackNotRequired=true"
+                << endl;
+
+            const scalar v52aTetTolerance = sqr(small);
+            const scalar v52aPlanarCosAngle = 1.0e-6;
+            const scalar v52aRootVSmall = Foam::sqrt(VSMALL);
+            const scalar v52aSevereCos =
+                Foam::cos(scalar(70.0)*M_PI/scalar(180.0));
+
+            enum V52aFailureBits
+            {
+                V52A_INVALID  = 1,
+                V52A_NEGATIVE = 2,
+                V52A_PYRAMID = 4,
+                V52A_CONCAVE = 8,
+                V52A_FACETET = 16,
+                V52A_NONORTH_ERROR = 32
+            };
+
+            // CFMitch V5.3 hard/soft prospective contract.
+            //
+            // Only truly inadmissible prospective geometry/topology may
+            // terminate a BL column. Concavity and tet-decomposition quality
+            // remain diagnostics and must not directly delete boundary layers.
+            const label v52aHardFailureBits =
+                V52A_INVALID
+              | V52A_NEGATIVE
+              | V52A_PYRAMID
+              | V52A_NONORTH_ERROR;
+
+            Info
+                << "CFMITCH V5.3 HARD-SOFT CONTRACT:"
+                << " hard=invalid|negative|pyramid|nonOrth90"
+                << " soft=concave|faceTet|sharedTet|severeNonOrth"
+                << " softCanTerminate=false"
+                << endl;
+
+            struct V52aChildMetrics
+            {
+                label invalid;
+                label negative;
+                label badPyramid;
+                label concave;
+                label badFaceTet;
+                scalar volume;
+                scalar minPyramid;
+                scalar minTetMargin;
+                point centre;
+
+                V52aChildMetrics()
+                :
+                    invalid(0),
+                    negative(0),
+                    badPyramid(0),
+                    concave(0),
+                    badFaceTet(0),
+                    volume(0),
+                    minPyramid(GREAT),
+                    minTetMargin(GREAT),
+                    centre(vector::zero)
+                {}
+            };
+
+            auto v52aMinFaceTetQuality =
+            [&]
+            (
+                const auto& f,
+                const point& cellCentre,
+                const bool ownerSide,
+                const label baseI
+            ) -> scalar
+            {
+                if( f.size() < 3 || baseI < 0 || baseI >= f.size() )
+                    return -GREAT;
+
+                const point& base = v29Points[f[baseI]];
+                scalar minQuality = GREAT;
+
+                for(label tetI=1; tetI<f.size()-1; ++tetI)
+                {
+                    const label facePtI = (tetI + baseI) % f.size();
+                    const label nextPtI = (facePtI + 1) % f.size();
+
+                    const label aI =
+                        ownerSide ? f[facePtI] : f[nextPtI];
+                    const label bI =
+                        ownerSide ? f[nextPtI] : f[facePtI];
+
+                    const scalar quality =
+                        tetPointRef
+                        (
+                            cellCentre,
+                            base,
+                            v29Points[aI],
+                            v29Points[bI]
+                        ).quality();
+
+                    if( !std::isfinite(quality) )
+                        return -GREAT;
+
+                    minQuality = Foam::min(minQuality, quality);
+                }
+
+                return minQuality;
+            };
+
+            auto v52aMeasureChild =
+            [&]
+            (
+                const auto& childFaces,
+                V52aChildMetrics& metrics
+            ) -> bool
+            {
+                metrics = V52aChildMetrics();
+
+                const label nChildFaces = childFaces.size();
+                if( nChildFaces < 4 )
+                {
+                    ++metrics.invalid;
+                    return false;
+                }
+
+                List<vector> faceCentres(nChildFaces);
+                List<vector> faceAreas(nChildFaces);
+                point centreEstimate(vector::zero);
+
+                for(label faceI=0; faceI<nChildFaces; ++faceI)
+                {
+                    if
+                    (
+                        !v29FaceCentreArea
+                        (
+                            childFaces[faceI],
+                            faceCentres[faceI],
+                            faceAreas[faceI]
+                        )
+                    )
+                    {
+                        ++metrics.invalid;
+                        return false;
+                    }
+                    centreEstimate += faceCentres[faceI];
+                }
+
+                centreEstimate /= scalar(nChildFaces);
+
+                vector weightedCentre(vector::zero);
+                scalar volume3 = scalar(0);
+
+                for(label faceI=0; faceI<nChildFaces; ++faceI)
+                {
+                    const scalar pyramid3 =
+                        faceAreas[faceI]
+                      & (faceCentres[faceI] - centreEstimate);
+
+                    weightedCentre +=
+                        pyramid3
+                       *(
+                            scalar(0.75)*faceCentres[faceI]
+                          + scalar(0.25)*centreEstimate
+                        );
+                    volume3 += pyramid3;
+                }
+
+                metrics.centre = centreEstimate;
+                if( Foam::mag(volume3) > VSMALL )
+                    metrics.centre = weightedCentre/volume3;
+
+                if
+                (
+                    help::isnan(metrics.centre)
+                 || help::isinf(metrics.centre)
+                )
+                {
+                    ++metrics.invalid;
+                    return false;
+                }
+
+                metrics.volume = volume3/scalar(3);
+                if( metrics.volume <= scalar(0) )
+                    ++metrics.negative;
+
+                // Exact OF13 face-pyramid and face-plane concavity tests.
+                for(label faceI=0; faceI<nChildFaces; ++faceI)
+                {
+                    const scalar pyramidMargin =
+                        (
+                            faceAreas[faceI]
+                          & (faceCentres[faceI] - metrics.centre)
+                        )/scalar(3);
+
+                    metrics.minPyramid =
+                        Foam::min(metrics.minPyramid, pyramidMargin);
+
+                    if( pyramidMargin < -SMALL )
+                        ++metrics.badPyramid;
+
+                    vector normal = faceAreas[faceI];
+                    normal /= Foam::max(mag(normal), scalar(VSMALL));
+
+                    for(label otherI=0; otherI<nChildFaces; ++otherI)
+                    {
+                        if( otherI == faceI )
+                            continue;
+
+                        vector displacement =
+                            faceCentres[otherI] - faceCentres[faceI];
+                        displacement /=
+                            Foam::max(mag(displacement), scalar(VSMALL));
+
+                        if
+                        (
+                            (displacement & normal)
+                          > -v52aPlanarCosAngle
+                        )
+                        {
+                            metrics.concave = 1;
+                            break;
+                        }
+                    }
+                }
+
+                // Necessary one-sided OF13 base-point condition for every
+                // prospective face of this child.
+                for(label faceI=0; faceI<nChildFaces; ++faceI)
+                {
+                    const auto& f = childFaces[faceI];
+                    scalar bestBase = -GREAT;
+                    bool badFaceTet = false;
+
+                    // Exact owner-side edge-tet branch from OF13
+                    // polyMeshTetDecomposition::checkFaceTets().  A face
+                    // stored outward from this prospective cell has the
+                    // owner-side sign convention (valid quality < -tol).
+                    forAll(f, facePointI)
+                    {
+                        const scalar edgeQuality =
+                            tetPointRef
+                            (
+                                v29Points[f[facePointI]],
+                                v29Points
+                                [
+                                    f[(facePointI + 1) % f.size()]
+                                ],
+                                faceCentres[faceI],
+                                metrics.centre
+                            ).quality();
+
+                        if
+                        (
+                            !std::isfinite(edgeQuality)
+                         || edgeQuality > -v52aTetTolerance
+                        )
+                        {
+                            badFaceTet = true;
+                            break;
+                        }
+                    }
+
+                    forAll(f, baseI)
+                    {
+                        bestBase = Foam::max
+                        (
+                            bestBase,
+                            v52aMinFaceTetQuality
+                            (
+                                f,
+                                metrics.centre,
+                                true,
+                                baseI
+                            )
+                        );
+                    }
+
+                    metrics.minTetMargin =
+                        Foam::min(metrics.minTetMargin, bestBase);
+
+                    if
+                    (
+                        badFaceTet
+                     || !(bestBase > v52aTetTolerance)
+                    )
+                        ++metrics.badFaceTet;
+                }
+
+                return metrics.invalid == 0;
+            };
+
+            auto v52aInterfaceMetrics =
+            [&]
+            (
+                const auto& coreChild,
+                const point& coreCentre,
+                const auto& wallChild,
+                const point& wallCentre,
+                label& invalid,
+                label& badSharedTet,
+                label& severeNonOrth,
+                label& nonOrthError,
+                scalar& angle,
+                scalar& bestShared
+            )
+            {
+                invalid = 0;
+                badSharedTet = 0;
+                severeNonOrth = 0;
+                nonOrthError = 0;
+                angle = scalar(0);
+                bestShared = -GREAT;
+
+                label coreFaceI = -1;
+                label matches = 0;
+
+                forAll(coreChild, cfI)
+                {
+                    forAll(wallChild, wfI)
+                    {
+                        if
+                        (
+                            help::areFacesEqual
+                            (
+                                coreChild[cfI],
+                                wallChild[wfI]
+                            )
+                        )
+                        {
+                            coreFaceI = cfI;
+                            ++matches;
+                        }
+                    }
+                }
+
+                if( matches != 1 || coreFaceI < 0 )
+                {
+                    invalid = 1;
+                    return;
+                }
+
+                const auto& f = coreChild[coreFaceI];
+                vector faceCentre(vector::zero);
+                vector faceArea(vector::zero);
+
+                if( !v29FaceCentreArea(f, faceCentre, faceArea) )
+                {
+                    invalid = 1;
+                    return;
+                }
+
+                forAll(f, baseI)
+                {
+                    const scalar commonQuality = Foam::min
+                    (
+                        v52aMinFaceTetQuality
+                        (
+                            f, coreCentre, true, baseI
+                        ),
+                        v52aMinFaceTetQuality
+                        (
+                            f, wallCentre, false, baseI
+                        )
+                    );
+
+                    bestShared = Foam::max(bestShared, commonQuality);
+                }
+
+                if( !(bestShared > v52aTetTolerance) )
+                    badSharedTet = 1;
+
+                const vector d = wallCentre - coreCentre;
+                const scalar orthogonality =
+                    (d & faceArea)
+                   /(mag(d)*mag(faceArea) + v52aRootVSmall);
+
+                const scalar clamped = Foam::min
+                (
+                    scalar(1),
+                    Foam::max(scalar(-1), orthogonality)
+                );
+                angle = Foam::acos(clamped)*scalar(180.0)/M_PI;
+
+                if( orthogonality <= SMALL )
+                    nonOrthError = 1;
+                else if( orthogonality < v52aSevereCos )
+                    severeNonOrth = 1;
+            };
+
+            auto v52aChildFailureMask =
+            [&](const V52aChildMetrics& metrics) -> label
+            {
+                label mask = 0;
+                if( metrics.invalid ) mask |= V52A_INVALID;
+                if( metrics.negative ) mask |= V52A_NEGATIVE;
+                if( metrics.badPyramid ) mask |= V52A_PYRAMID;
+                if( metrics.concave ) mask |= V52A_CONCAVE;
+                if( metrics.badFaceTet ) mask |= V52A_FACETET;
+                return mask;
+            };
+
+            auto v52aBaseContext =
+            [&]
+            (
+                const label bfI,
+                bool& touchesPeriodic,
+                bool& tripleJunction,
+                word& patchName,
+                word& patchType
+            )
+            {
+                touchesPeriodic = false;
+                tripleJunction = false;
+                patchName = word("unknown");
+                patchType = word("unknown");
+
+                const faceList::subList& boundaryFaces =
+                    mse.boundaryFaces();
+                const labelList& boundaryPointMap = mse.bp();
+                const VRWGraph& boundaryPointFaces = mse.pointFaces();
+                const labelList& boundaryFacePatch =
+                    mse.boundaryFacePatches();
+
+                if( bfI < 0 || bfI >= label(boundaryFaces.size()) )
+                    return;
+
+                const label basePatchI = boundaryFacePatch[bfI];
+                if
+                (
+                    basePatchI >= 0
+                 && basePatchI < label(childSweepBoundaries.size())
+                )
+                {
+                    patchName =
+                        childSweepBoundaries[basePatchI].patchName();
+                    patchType =
+                        childSweepBoundaries[basePatchI].patchType();
+                }
+
+                labelHashSet incidentPatches;
+                const face& bf = boundaryFaces[bfI];
+
+                forAll(bf, pointI)
+                {
+                    const label meshPointI = bf[pointI];
+                    if
+                    (
+                        meshPointI < 0
+                     || meshPointI >= label(boundaryPointMap.size())
+                    )
+                        continue;
+
+                    const label boundaryPointI =
+                        boundaryPointMap[meshPointI];
+                    if
+                    (
+                        boundaryPointI < 0
+                     || boundaryPointI >= label(boundaryPointFaces.size())
+                    )
+                        continue;
+
+                    forAllRow
+                    (
+                        boundaryPointFaces,
+                        boundaryPointI,
+                        pointFaceI
+                    )
+                    {
+                        const label incidentBfI =
+                            boundaryPointFaces
+                            (
+                                boundaryPointI,
+                                pointFaceI
+                            );
+                        if
+                        (
+                            incidentBfI < 0
+                         || incidentBfI >=
+                            label(boundaryFacePatch.size())
+                        )
+                            continue;
+
+                        const label patchI =
+                            boundaryFacePatch[incidentBfI];
+                        if
+                        (
+                            patchI < 0
+                         || patchI >= label(childSweepBoundaries.size())
+                        )
+                            continue;
+
+                        incidentPatches.insert(patchI);
+                        const word& name =
+                            childSweepBoundaries[patchI].patchName();
+                        const word& type =
+                            childSweepBoundaries[patchI].patchType();
+
+                        if
+                        (
+                            name.find("periodic") != std::string::npos
+                         || name.find("cyclic") != std::string::npos
+                         || type.find("periodic") != std::string::npos
+                         || type.find("cyclic") != std::string::npos
+                        )
+                            touchesPeriodic = true;
+                    }
+                }
+
+                tripleJunction = incidentPatches.size() >= 3;
+            };
+
+            const fileName v52aCsvName
+            (
+                "cfmitchV52a_front_contract_"
+              + Foam::name(v52aInvocation)
+              + ".csv"
+            );
+            OFstream v52aCsv(v52aCsvName);
+            v52aCsv
+                << "parentCell,baseFace,patch,patchType,requestedLayers,"
+                << "safeLayers,firstUnsafeLayer,failureMask,invalid,negative,"
+                << "badPyramid,concave,badFaceTet,badSharedTet,"
+                << "nonOrthError,severeNonOrth,interfaceAngle,bestSharedTet,"
+                << "childVolume,minPyramid,minChildTet,backtrackRecoverable,"
+                << "backtrackFactor,touchesPeriodic,tripleJunction" << nl;
+
+            label requestedColumns = 0;
+            label supportedColumns = 0;
+            label unsupportedColumns = 0;
+            label safeFullDepth = 0;
+            label terminatedEarly = 0;
+            label noValidFirstLayer = 0;
+            label backtracked = 0;
+            label backtrackAttempts = 0;
+            label periodicColumns = 0;
+            label tripleJunctionColumns = 0;
+            label evaluatedChildren = 0;
+            label evaluatedInterfaces = 0;
+            label severeInterfaces = 0;
+            label nonOrthErrorInterfaces = 0;
+            label invalidColumns = 0;
+            label negativeColumns = 0;
+            label pyramidColumns = 0;
+            label concaveColumns = 0;
+            label faceTetColumns = 0;
+            label nonOrthColumns = 0;
+            label safe0 = 0;
+            label safe1to3 = 0;
+            label safe4to7 = 0;
+            label safe8to14 = 0;
+            label safe15plus = 0;
+
+            Map<label> v52bDirectCaps;
+
+            // CFMitch V5.2b diagnostic isolation controls.
+            //
+            // These are intentionally local to this experiment.  They do not
+            // change the public meshDict contract.
+            //
+            // skipZero=true:
+            //   preserve every positive prospective safe-depth cap while
+            //   withholding explicit zero-layer/dropout caps.
+            //
+            // maxDirectCaps=-1:
+            //   no population limit.  A non-negative value deterministically
+            //   limits the number of newly admitted direct-cap faces.
+            const bool v52bDiagnosticSkipZeroCaps = false;
+            const label v52bDiagnosticMaxDirectCaps = -1;
+
+            label v52bDiagnosticSkippedZero = 0;
+            label v52bDiagnosticSkippedLimit = 0;
+            label v53UnsupportedNoCap = 0;
+
+            auto v52bRecordCap =
+            [&](const label bfI, const label cap)
+            {
+                if
+                (
+                    !cfmitchV52bApplyFrontCaps_
+                 || bfI < 0
+                 || cap < 0
+                )
+                    return;
+
+                if( v52bDiagnosticSkipZeroCaps && cap == 0 )
+                {
+                    ++v52bDiagnosticSkippedZero;
+                    return;
+                }
+
+                if
+                (
+                    v52bDiagnosticMaxDirectCaps >= 0
+                 && !v52bDirectCaps.found(bfI)
+                 && label(v52bDirectCaps.size())
+                    >= v52bDiagnosticMaxDirectCaps
+                )
+                {
+                    ++v52bDiagnosticSkippedLimit;
+                    return;
+                }
+
+                if( v52bDirectCaps.found(bfI) )
+                {
+                    v52bDirectCaps[bfI] =
+                        Foam::min(v52bDirectCaps[bfI], cap);
+                }
+                else
+                {
+                    v52bDirectCaps.insert(bfI, cap);
+                }
+            };
+
+            const scalar v52aBacktrackFactors[] =
+            {
+                scalar(0.75), scalar(0.50), scalar(0.25)
+            };
+            const label nV52aBacktrackFactors =
+                sizeof(v52aBacktrackFactors)
+               /sizeof(v52aBacktrackFactors[0]);
+
+            // ==========================================================
+            // CFMitch V5.9a -- ITERATIVE TRANSACTIONAL ROW REPAIR
+            //
+            // This is the first COMMITTED upstream face-tet geometry
+            // repair.
+            //
+            // Evidence leading here:
+            //
+            //   V5.8a next-core-row motion:
+            //       zero shared-base recovery.
+            //
+            //   V5.8b failed-row coherent motion:
+            //       material recovery (~12.5% in the final invocation).
+            //
+            //   V5.8c one-hair axial motion:
+            //       weak recovery.
+            //
+            //   V5.8d one-vertex planarization:
+            //       weak recovery and frequent hard/soft regressions.
+            //
+            // Therefore:
+            //
+            //   * preserve row 0 and row 1/h1;
+            //   * move an entire failed layer row coherently;
+            //   * require the target interface to become shared-base clean;
+            //   * require the SEED column shared-failure population to fall;
+            //   * require the complete affected-parent shared-failure
+            //     population to fall;
+            //   * permit no increase in concavity, one-sided face-tet
+            //     failures or >70-degree BL interfaces;
+            //   * preserve positive child volume;
+            //   * pass the existing V2.9 full affected-parent
+            //     volume/pyramid hard gate;
+            //   * commit only after every gate passes;
+            //   * rescan and repeat, making shared-failure count monotonic.
+            //
+            // Topology is unchanged here. V5.7 remains downstream as the
+            // topology escape for survivors.
+            // ==========================================================
+
+            const scalar v59aFractions[] =
+            {
+                scalar(0.02),
+                scalar(0.05),
+                scalar(0.10),
+                scalar(0.20),
+                scalar(0.35),
+                scalar(0.50)
+            };
+
+            const label nV59aFractions =
+                sizeof(v59aFractions)
+               /sizeof(v59aFractions[0]);
+
+            labelList v59aFractionHits
+            (
+                nV59aFractions,
+                label(0)
+            );
+
+            label v59aColumnsSeen = 0;
+            label v59aColumnsEligible = 0;
+            label v59aColumnsChanged = 0;
+            label v59aColumnsFullyCleaned = 0;
+
+            label v59aH1Protected = 0;
+            label v59aAffectedUnsupported = 0;
+            label v59aBaselineHardReject = 0;
+
+            label v59aPasses = 0;
+            label v59aAttempts = 0;
+            label v59aLocalPromising = 0;
+            label v59aAccepted = 0;
+
+            label v59aWallwardAccepted = 0;
+            label v59aCorewardAccepted = 0;
+
+            label v59aRejectRowInvalid = 0;
+            label v59aRejectLocalHard = 0;
+            label v59aRejectLocalSoft = 0;
+            label v59aRejectLocalNoGain = 0;
+            label v59aRejectAffectedHard = 0;
+            label v59aRejectAffectedSoft = 0;
+            label v59aRejectVolumeFloor = 0;
+
+            label v59aNoProgress = 0;
+            label v59aAcceptedMaxColumn = 0;
+
+            label v59aSeedSharedBefore = 0;
+            label v59aSeedSharedAfter = 0;
+
+            label v59aAffectedSharedBefore = 0;
+            label v59aAffectedSharedAfter = 0;
+
+
+            struct V59aSoftScore
+            {
+                label invalid;
+                label concave;
+                label faceTet;
+                label sharedTet;
+                label severe;
+                label nonOrthError;
+
+                V59aSoftScore()
+                :
+                    invalid(0),
+                    concave(0),
+                    faceTet(0),
+                    sharedTet(0),
+                    severe(0),
+                    nonOrthError(0)
+                {}
+            };
+
+
+            // ----------------------------------------------------------
+            // Complete BL-soft quality of every coarse parent touched by
+            // the candidate seed edges.
+            //
+            // Type-0:
+            //   one exact replacement cell.
+            //
+            // Type-1:
+            //   all exact prospective BL children plus every completed
+            //   cross-layer shared interface.
+            //
+            // Type-2/3:
+            //   fail closed.
+            // ----------------------------------------------------------
+            auto v59aEvaluateAffectedSoft =
+            [&]
+            (
+                const std::set<label>& affected,
+                V59aSoftScore& score
+            ) -> bool
+            {
+                score = V59aSoftScore();
+
+                for
+                (
+                    std::set<label>::const_iterator
+                        cIt=affected.begin();
+                    cIt!=affected.end();
+                    ++cIt
+                )
+                {
+                    const label cellI = *cIt;
+
+                    if
+                    (
+                        cellI < 0
+                     || cellI >= nCells
+                    )
+                    {
+                        ++score.invalid;
+                        return false;
+                    }
+
+                    if( refType[cellI] == 0 )
+                    {
+                        DynList
+                        <
+                            DynList<label,8>,
+                            10
+                        > childFaces;
+
+                        if
+                        (
+                            !v29BuildType0Cell
+                            (
+                                cellI,
+                                childFaces
+                            )
+                        )
+                        {
+                            ++score.invalid;
+                            return false;
+                        }
+
+                        V52aChildMetrics metrics;
+
+                        if
+                        (
+                            !v52aMeasureChild
+                            (
+                                childFaces,
+                                metrics
+                            )
+                        )
+                        {
+                            ++score.invalid;
+                            return false;
+                        }
+
+                        score.concave += metrics.concave;
+                        score.faceTet += metrics.badFaceTet;
+
+                        continue;
+                    }
+
+                    if( refType[cellI] != 1 )
+                    {
+                        ++score.invalid;
+                        return false;
+                    }
+
+                    DynList
+                    <
+                        DynList
+                        <
+                            DynList<label,8>,
+                            10
+                        >,
+                        64
+                    > children;
+
+                    if
+                    (
+                        !v29BuildOrientedType1Children
+                        (
+                            cellI,
+                            children
+                        )
+                     || children.size() == 0
+                    )
+                    {
+                        ++score.invalid;
+                        return false;
+                    }
+
+                    List<V52aChildMetrics>
+                        metrics(children.size());
+
+                    forAll(children, childI)
+                    {
+                        if
+                        (
+                            !v52aMeasureChild
+                            (
+                                children[childI],
+                                metrics[childI]
+                            )
+                        )
+                        {
+                            ++score.invalid;
+                            return false;
+                        }
+
+                        score.concave +=
+                            metrics[childI].concave;
+
+                        score.faceTet +=
+                            metrics[childI].badFaceTet;
+                    }
+
+                    for
+                    (
+                        label childI=0;
+                        childI<label(children.size())-1;
+                        ++childI
+                    )
+                    {
+                        label invalid = 0;
+                        label badShared = 0;
+                        label severe = 0;
+                        label nonOrthError = 0;
+                        scalar angle = scalar(0);
+                        scalar bestShared = -GREAT;
+
+                        v52aInterfaceMetrics
+                        (
+                            children[childI],
+                            metrics[childI].centre,
+                            children[childI+1],
+                            metrics[childI+1].centre,
+                            invalid,
+                            badShared,
+                            severe,
+                            nonOrthError,
+                            angle,
+                            bestShared
+                        );
+
+                        score.invalid += invalid;
+                        score.sharedTet += badShared;
+                        score.severe += severe;
+                        score.nonOrthError += nonOrthError;
+
+                        if
+                        (
+                            invalid
+                         || nonOrthError
+                        )
+                            return false;
+                    }
+                }
+
+                return score.invalid == 0;
+            };
+
+
+            // ==========================================================
+            // COMMITTED REPAIR PASS
+            // ==========================================================
+
+            for
+            (
+                label parentCellI=0;
+                parentCellI<nCells;
+                ++parentCellI
+            )
+            {
+                if( refType[parentCellI] != 1 )
+                    continue;
+
+                ++v59aColumnsSeen;
+
+                DynList
+                <
+                    DynList<DynList<label,8>,10>,
+                    64
+                > children;
+
+                DynList<label,16> parentEdges;
+
+                if
+                (
+                    !v29Type1Edges
+                    (
+                        parentCellI,
+                        parentEdges
+                    )
+                 || !v29BuildOrientedType1Children
+                    (
+                        parentCellI,
+                        children
+                    )
+                 || children.size() < 2
+                )
+                    continue;
+
+                const label requestedLayers =
+                    children.size();
+
+                std::set<label> affected;
+
+                if
+                (
+                    !v29AffectedParents
+                    (
+                        parentEdges,
+                        affected
+                    )
+                )
+                {
+                    ++v59aAffectedUnsupported;
+                    continue;
+                }
+
+                V29Score initialHard;
+
+                if
+                (
+                    !v29EvaluateSet
+                    (
+                        affected,
+                        initialHard
+                    )
+                 || initialHard.invalid != 0
+                 || initialHard.negative != 0
+                 || initialHard.badPyr != 0
+                )
+                {
+                    ++v59aBaselineHardReject;
+                    continue;
+                }
+
+                ++v59aColumnsEligible;
+
+                label acceptedThisColumn = 0;
+
+                // Shared-tet count is strictly monotonic downward for every
+                // accepted transaction, therefore more passes than twice the
+                // number of layer interfaces should never be necessary.
+                const label maxPasses =
+                    2*requestedLayers + 2;
+
+                for
+                (
+                    label repairPass=0;
+                    repairPass<maxPasses;
+                    ++repairPass
+                )
+                {
+                    ++v59aPasses;
+
+                    List<V52aChildMetrics>
+                        baseMetrics(requestedLayers);
+
+                    bool seedHardClean = true;
+
+                    label baseConcave = 0;
+                    label baseFaceTet = 0;
+                    label baseShared = 0;
+                    label baseSevere = 0;
+
+                    DynList<label,32> badRows;
+
+                    forAll(children, childI)
+                    {
+                        if
+                        (
+                            !v52aMeasureChild
+                            (
+                                children[childI],
+                                baseMetrics[childI]
+                            )
+                        )
+                        {
+                            seedHardClean = false;
+                            break;
+                        }
+
+                        if
+                        (
+                            v52aChildFailureMask
+                            (
+                                baseMetrics[childI]
+                            )
+                          & v52aHardFailureBits
+                        )
+                        {
+                            seedHardClean = false;
+                            break;
+                        }
+
+                        baseConcave +=
+                            baseMetrics[childI].concave;
+
+                        baseFaceTet +=
+                            baseMetrics[childI].badFaceTet;
+                    }
+
+                    bool h1Bad = false;
+
+                    if( seedHardClean )
+                    {
+                        for
+                        (
+                            label wallStep=1;
+                            wallStep<requestedLayers;
+                            ++wallStep
+                        )
+                        {
+                            const label coreChildI =
+                                requestedLayers
+                              - 1
+                              - wallStep;
+
+                            const label wallChildI =
+                                coreChildI + 1;
+
+                            label invalid = 0;
+                            label badShared = 0;
+                            label severe = 0;
+                            label nonOrthError = 0;
+                            scalar angle = scalar(0);
+                            scalar bestShared = -GREAT;
+
+                            v52aInterfaceMetrics
+                            (
+                                children[coreChildI],
+                                baseMetrics[coreChildI].centre,
+                                children[wallChildI],
+                                baseMetrics[wallChildI].centre,
+                                invalid,
+                                badShared,
+                                severe,
+                                nonOrthError,
+                                angle,
+                                bestShared
+                            );
+
+                            if
+                            (
+                                invalid
+                             || nonOrthError
+                            )
+                            {
+                                seedHardClean = false;
+                                break;
+                            }
+
+                            baseShared += badShared;
+                            baseSevere += severe;
+
+                            if( badShared )
+                            {
+                                if( wallStep == 1 )
+                                    h1Bad = true;
+                                else
+                                    badRows.append(wallStep);
+                            }
+                        }
+                    }
+
+                    if( h1Bad )
+                        ++v59aH1Protected;
+
+                    if( !seedHardClean )
+                    {
+                        ++v59aBaselineHardReject;
+                        break;
+                    }
+
+                    if( badRows.size() == 0 )
+                    {
+                        if( acceptedThisColumn > 0 )
+                            ++v59aColumnsFullyCleaned;
+
+                        break;
+                    }
+
+                    v59aSeedSharedBefore += baseShared;
+
+                    V29Score baseAffectedHard;
+
+                    if
+                    (
+                        !v29EvaluateSet
+                        (
+                            affected,
+                            baseAffectedHard
+                        )
+                     || baseAffectedHard.invalid != 0
+                     || baseAffectedHard.negative != 0
+                     || baseAffectedHard.badPyr != 0
+                    )
+                    {
+                        ++v59aBaselineHardReject;
+                        break;
+                    }
+
+                    V59aSoftScore baseAffectedSoft;
+
+                    if
+                    (
+                        !v59aEvaluateAffectedSoft
+                        (
+                            affected,
+                            baseAffectedSoft
+                        )
+                     || baseAffectedSoft.nonOrthError != 0
+                    )
+                    {
+                        ++v59aBaselineHardReject;
+                        break;
+                    }
+
+                    v59aAffectedSharedBefore +=
+                        baseAffectedSoft.sharedTet;
+
+                    bool acceptedPass = false;
+
+                    for
+                    (
+                        label badRowI=0;
+                        badRowI<label(badRows.size())
+                     && !acceptedPass;
+                        ++badRowI
+                    )
+                    {
+                        const label failedRow =
+                            badRows[badRowI];
+
+                        const label coreChildI =
+                            requestedLayers
+                          - 1
+                          - failedRow;
+
+                        const label wallChildI =
+                            coreChildI + 1;
+
+                        if
+                        (
+                            failedRow < 2
+                         || coreChildI < 0
+                         || wallChildI < 0
+                         || coreChildI >= requestedLayers
+                         || wallChildI >= requestedLayers
+                        )
+                        {
+                            ++v59aRejectRowInvalid;
+                            continue;
+                        }
+
+                        std::map<label,point>
+                            originalRow;
+
+                        bool rowValid = true;
+
+                        forAll(parentEdges, edgeI)
+                        {
+                            const label seI =
+                                parentEdges[edgeI];
+
+                            if
+                            (
+                                seI < 0
+                             || seI >= label(splitEdges_.size())
+                             || seI >=
+                                label
+                                (
+                                    newVerticesForSplitEdge_.
+                                        size()
+                                )
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            const label rowSize =
+                                newVerticesForSplitEdge_.
+                                    sizeOfRow(seI);
+
+                            if
+                            (
+                                failedRow <= 1
+                             || failedRow >= rowSize-1
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            const label movingPointI =
+                                newVerticesForSplitEdge_
+                                (
+                                    seI,
+                                    failedRow
+                                );
+
+                            if
+                            (
+                                movingPointI < 0
+                             || movingPointI >=
+                                label(v29Points.size())
+                             || movingPointI ==
+                                splitEdges_[seI].start()
+                             || movingPointI ==
+                                splitEdges_[seI].end()
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            originalRow[movingPointI] =
+                                v29Points[movingPointI];
+                        }
+
+                        if
+                        (
+                            !rowValid
+                         || originalRow.empty()
+                        )
+                        {
+                            ++v59aRejectRowInvalid;
+                            continue;
+                        }
+
+                        for
+                        (
+                            label fractionI=0;
+                            fractionI<nV59aFractions
+                         && !acceptedPass;
+                            ++fractionI
+                        )
+                        {
+                            const scalar fraction =
+                                v59aFractions[fractionI];
+
+                            // 0 = wallward
+                            // 1 = coreward
+                            for
+                            (
+                                label direction=0;
+                                direction<2;
+                                ++direction
+                            )
+                            {
+                                ++v59aAttempts;
+
+                                forAll(parentEdges, edgeI)
+                                {
+                                    const label seI =
+                                        parentEdges[edgeI];
+
+                                    const label movingPointI =
+                                        newVerticesForSplitEdge_
+                                        (
+                                            seI,
+                                            failedRow
+                                        );
+
+                                    const label targetPointI =
+                                        newVerticesForSplitEdge_
+                                        (
+                                            seI,
+                                            direction == 0
+                                          ? failedRow-1
+                                          : failedRow+1
+                                        );
+
+                                    const point oldP =
+                                        originalRow.at
+                                        (
+                                            movingPointI
+                                        );
+
+                                    v29Points[movingPointI] =
+                                        oldP
+                                      + fraction
+                                       *(
+                                            v29Points[targetPointI]
+                                          - oldP
+                                        );
+                                }
+
+
+                                // --------------------------------------
+                                // Cheap/seed-local screening first.
+                                // --------------------------------------
+                                List<V52aChildMetrics>
+                                    trialMetrics(requestedLayers);
+
+                                bool localHardOK = true;
+
+                                label trialConcave = 0;
+                                label trialFaceTet = 0;
+                                label trialShared = 0;
+                                label trialSevere = 0;
+
+                                bool targetStillBad = false;
+                                bool volumeFloorOK = true;
+
+                                forAll(children, childI)
+                                {
+                                    if
+                                    (
+                                        !v52aMeasureChild
+                                        (
+                                            children[childI],
+                                            trialMetrics[childI]
+                                        )
+                                    )
+                                    {
+                                        localHardOK = false;
+                                        break;
+                                    }
+
+                                    if
+                                    (
+                                        v52aChildFailureMask
+                                        (
+                                            trialMetrics[childI]
+                                        )
+                                      & v52aHardFailureBits
+                                    )
+                                    {
+                                        localHardOK = false;
+                                        break;
+                                    }
+
+                                    if
+                                    (
+                                        trialMetrics[childI].volume
+                                          < scalar(0.50)
+                                           *baseMetrics[childI].volume
+                                    )
+                                        volumeFloorOK = false;
+
+                                    trialConcave +=
+                                        trialMetrics[childI].concave;
+
+                                    trialFaceTet +=
+                                        trialMetrics[childI].badFaceTet;
+                                }
+
+                                if( localHardOK )
+                                {
+                                    for
+                                    (
+                                        label wallStep=1;
+                                        wallStep<requestedLayers;
+                                        ++wallStep
+                                    )
+                                    {
+                                        const label trialCoreI =
+                                            requestedLayers
+                                          - 1
+                                          - wallStep;
+
+                                        const label trialWallI =
+                                            trialCoreI + 1;
+
+                                        label invalid = 0;
+                                        label badShared = 0;
+                                        label severe = 0;
+                                        label nonOrthError = 0;
+                                        scalar angle = scalar(0);
+                                        scalar bestShared = -GREAT;
+
+                                        v52aInterfaceMetrics
+                                        (
+                                            children[trialCoreI],
+                                            trialMetrics
+                                            [
+                                                trialCoreI
+                                            ].centre,
+                                            children[trialWallI],
+                                            trialMetrics
+                                            [
+                                                trialWallI
+                                            ].centre,
+                                            invalid,
+                                            badShared,
+                                            severe,
+                                            nonOrthError,
+                                            angle,
+                                            bestShared
+                                        );
+
+                                        if
+                                        (
+                                            invalid
+                                         || nonOrthError
+                                        )
+                                        {
+                                            localHardOK = false;
+                                            break;
+                                        }
+
+                                        trialShared += badShared;
+                                        trialSevere += severe;
+
+                                        if
+                                        (
+                                            wallStep == failedRow
+                                         && badShared
+                                        )
+                                            targetStillBad = true;
+                                    }
+                                }
+
+                                if( !localHardOK )
+                                {
+                                    ++v59aRejectLocalHard;
+                                }
+                                else if( !volumeFloorOK )
+                                {
+                                    ++v59aRejectVolumeFloor;
+                                }
+                                else if
+                                (
+                                    trialConcave > baseConcave
+                                 || trialFaceTet > baseFaceTet
+                                 || trialSevere > baseSevere
+                                )
+                                {
+                                    ++v59aRejectLocalSoft;
+                                }
+                                else if
+                                (
+                                    targetStillBad
+                                 || trialShared >= baseShared
+                                )
+                                {
+                                    ++v59aRejectLocalNoGain;
+                                }
+                                else
+                                {
+                                    ++v59aLocalPromising;
+
+                                    // ----------------------------------
+                                    // Full affected-parent HARD gate.
+                                    // ----------------------------------
+                                    V29Score trialAffectedHard;
+
+                                    bool affectedHardOK =
+                                    (
+                                        v29EvaluateSet
+                                        (
+                                            affected,
+                                            trialAffectedHard
+                                        )
+                                     && trialAffectedHard.invalid == 0
+                                     && trialAffectedHard.negative == 0
+                                     && trialAffectedHard.badPyr == 0
+                                    );
+
+                                    if
+                                    (
+                                        affectedHardOK
+                                     && baseAffectedHard.minPositiveVol
+                                        < GREAT/scalar(2)
+                                     && trialAffectedHard.minPositiveVol
+                                        < scalar(0.50)
+                                         *baseAffectedHard.minPositiveVol
+                                    )
+                                    {
+                                        affectedHardOK = false;
+                                    }
+
+                                    if( !affectedHardOK )
+                                    {
+                                        ++v59aRejectAffectedHard;
+                                    }
+                                    else
+                                    {
+                                        // ------------------------------
+                                        // Full affected-parent SOFT gate.
+                                        // ------------------------------
+                                        V59aSoftScore
+                                            trialAffectedSoft;
+
+                                        const bool affectedSoftEval =
+                                            v59aEvaluateAffectedSoft
+                                            (
+                                                affected,
+                                                trialAffectedSoft
+                                            );
+
+                                        const bool affectedSoftOK =
+                                        (
+                                            affectedSoftEval
+                                         && trialAffectedSoft.invalid == 0
+                                         && trialAffectedSoft.nonOrthError == 0
+                                         && trialAffectedSoft.sharedTet
+                                                < baseAffectedSoft.sharedTet
+                                         && trialAffectedSoft.concave
+                                                <= baseAffectedSoft.concave
+                                         && trialAffectedSoft.faceTet
+                                                <= baseAffectedSoft.faceTet
+                                         && trialAffectedSoft.severe
+                                                <= baseAffectedSoft.severe
+                                        );
+
+                                        if( !affectedSoftOK )
+                                        {
+                                            ++v59aRejectAffectedSoft;
+                                        }
+                                        else
+                                        {
+                                            // ==========================
+                                            // COMMIT.
+                                            //
+                                            // Do NOT restore originalRow.
+                                            // Next repair pass starts from
+                                            // this accepted geometry.
+                                            // ==========================
+                                            ++v59aAccepted;
+                                            ++acceptedThisColumn;
+
+                                            ++v59aFractionHits
+                                            [
+                                                fractionI
+                                            ];
+
+                                            if( direction == 0 )
+                                                ++v59aWallwardAccepted;
+                                            else
+                                                ++v59aCorewardAccepted;
+
+                                            v59aSeedSharedAfter +=
+                                                trialShared;
+
+                                            v59aAffectedSharedAfter +=
+                                                trialAffectedSoft.sharedTet;
+
+                                            acceptedPass = true;
+                                        }
+                                    }
+                                }
+
+
+                                if( acceptedPass )
+                                    break;
+
+
+                                // Exact prospective rollback.
+                                for
+                                (
+                                    std::map<label,point>::
+                                        const_iterator
+                                        pIt=originalRow.begin();
+                                    pIt!=originalRow.end();
+                                    ++pIt
+                                )
+                                {
+                                    v29Points[pIt->first] =
+                                        pIt->second;
+                                }
+                            }
+                        }
+                    }
+
+
+                    if( !acceptedPass )
+                    {
+                        ++v59aNoProgress;
+                        break;
+                    }
+                }
+
+
+                if( acceptedThisColumn > 0 )
+                {
+                    ++v59aColumnsChanged;
+
+                    v59aAcceptedMaxColumn =
+                        Foam::max
+                        (
+                            v59aAcceptedMaxColumn,
+                            acceptedThisColumn
+                        );
+                }
+            }
+
+
+            Info
+                << "CFMITCH V5.9a ITERATIVE ROW REPAIR:"
+                << " columnsSeen=" << v59aColumnsSeen
+                << " eligible=" << v59aColumnsEligible
+                << " columnsChanged=" << v59aColumnsChanged
+                << " columnsFullyCleaned=" << v59aColumnsFullyCleaned
+                << " h1Protected=" << v59aH1Protected
+                << " affectedUnsupported="
+                << v59aAffectedUnsupported
+                << " baselineHardReject="
+                << v59aBaselineHardReject
+                << " passes=" << v59aPasses
+                << " attempts=" << v59aAttempts
+                << " localPromising=" << v59aLocalPromising
+                << " accepted=" << v59aAccepted
+                << " maxAcceptedPerColumn="
+                << v59aAcceptedMaxColumn
+                << " wallwardAccepted="
+                << v59aWallwardAccepted
+                << " corewardAccepted="
+                << v59aCorewardAccepted
+                << " fractionHits=" << v59aFractionHits
+                << " rejectRowInvalid="
+                << v59aRejectRowInvalid
+                << " rejectLocalHard="
+                << v59aRejectLocalHard
+                << " rejectLocalSoft="
+                << v59aRejectLocalSoft
+                << " rejectLocalNoGain="
+                << v59aRejectLocalNoGain
+                << " rejectVolumeFloor="
+                << v59aRejectVolumeFloor
+                << " rejectAffectedHard="
+                << v59aRejectAffectedHard
+                << " rejectAffectedSoft="
+                << v59aRejectAffectedSoft
+                << " noProgress=" << v59aNoProgress
+                << " seedSharedBefore="
+                << v59aSeedSharedBefore
+                << " seedSharedAfter="
+                << v59aSeedSharedAfter
+                << " affectedSharedBefore="
+                << v59aAffectedSharedBefore
+                << " affectedSharedAfter="
+                << v59aAffectedSharedAfter
+                << " h1Moved=false"
+                << " topologyChanged=false"
+                << " committed=true"
+                << endl;
+
+
+            for(label parentCellI=0; parentCellI<nCells; ++parentCellI)
+            {
+                if( refType[parentCellI] != 1 )
+                    continue;
+
+                ++requestedColumns;
+
+                DynList
+                <
+                    DynList<DynList<label,8>,10>,
+                    64
+                > children;
+                DynList<label,16> parentEdges;
+
+                const bool topologyValid =
+                    v29Type1Edges(parentCellI, parentEdges)
+                 && v29BuildOrientedType1Children(parentCellI, children);
+
+                const label bfI = cellToBfI[parentCellI];
+                bool touchesPeriodic = false;
+                bool tripleJunction = false;
+                word patchName;
+                word patchType;
+                v52aBaseContext
+                (
+                    bfI,
+                    touchesPeriodic,
+                    tripleJunction,
+                    patchName,
+                    patchType
+                );
+
+                if( touchesPeriodic ) ++periodicColumns;
+                if( tripleJunction ) ++tripleJunctionColumns;
+
+                if( !topologyValid || children.size() == 0 )
+                {
+                    ++unsupportedColumns;
+                    ++terminatedEarly;
+                    ++noValidFirstLayer;
+                    ++invalidColumns;
+                    ++safe0;
+                    v52aCsv
+                        << parentCellI << ',' << bfI << ','
+                        << patchName << ',' << patchType << ','
+                        << children.size() << ",0,0,"
+                        << V52A_INVALID
+                        << ",1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+                        << label(touchesPeriodic) << ','
+                        << label(tripleJunction) << nl;
+
+                    // CFMitch V5.3b:
+                    // Unsupported prospective reconstruction is not evidence
+                    // that the requested physical BL depth is zero.  Preserve
+                    // the existing requested/planned layer count and leave
+                    // this face unresolved for a later local topology repair.
+                    ++v53UnsupportedNoCap;
+                    continue;
+                }
+
+                ++supportedColumns;
+                const label requestedLayers = children.size();
+                label safeLayers = 0;
+                label firstUnsafeLayer = -1;
+                label firstFailureMask = 0;
+                V52aChildMetrics firstFailureMetrics;
+                label firstBadSharedTet = 0;
+                label firstSevere = 0;
+                label firstNonOrthError = 0;
+                scalar firstAngle = scalar(0);
+                scalar firstBestShared = GREAT;
+                bool backtrackRecoverable = false;
+                scalar backtrackFactor = scalar(0);
+
+                List<V52aChildMetrics> childMetrics(requestedLayers);
+                forAll(children, childI)
+                {
+                    if
+                    (
+                        !v52aMeasureChild
+                        (
+                            children[childI],
+                            childMetrics[childI]
+                        )
+                    )
+                        childMetrics[childI].invalid = 1;
+                    ++evaluatedChildren;
+                }
+
+                for(label wallStep=0; wallStep<requestedLayers; ++wallStep)
+                {
+                    const label childI =
+                        requestedLayers - 1 - wallStep;
+                    // Preserve the complete observed state for diagnostics,
+                    // but use only hard failures to control BL depth.
+                    label observedMask =
+                        v52aChildFailureMask(childMetrics[childI]);
+
+                    label failureMask =
+                        observedMask & v52aHardFailureBits;
+
+                    label interfaceInvalid = 0;
+                    label badSharedTet = 0;
+                    label severeNonOrth = 0;
+                    label nonOrthError = 0;
+                    scalar interfaceAngle = scalar(0);
+                    scalar bestSharedTet = GREAT;
+
+                    if( wallStep > 0 )
+                    {
+                        const label wallChildI = childI + 1;
+                        v52aInterfaceMetrics
+                        (
+                            children[childI],
+                            childMetrics[childI].centre,
+                            children[wallChildI],
+                            childMetrics[wallChildI].centre,
+                            interfaceInvalid,
+                            badSharedTet,
+                            severeNonOrth,
+                            nonOrthError,
+                            interfaceAngle,
+                            bestSharedTet
+                        );
+                        ++evaluatedInterfaces;
+                        severeInterfaces += severeNonOrth;
+                        nonOrthErrorInterfaces += nonOrthError;
+
+                        if( interfaceInvalid )
+                        {
+                            observedMask |= V52A_INVALID;
+                            failureMask |= V52A_INVALID;
+                        }
+
+                        // Shared-tet quality is soft in V5.3.
+                        if( badSharedTet )
+                            observedMask |= V52A_FACETET;
+
+                        // A completed >=90-degree interface remains hard.
+                        if( nonOrthError )
+                        {
+                            observedMask |= V52A_NONORTH_ERROR;
+                            failureMask |= V52A_NONORTH_ERROR;
+                        }
+                    }
+
+                    if( failureMask == 0 )
+                    {
+                        ++safeLayers;
+                        continue;
+                    }
+
+                    firstUnsafeLayer = wallStep;
+                    firstFailureMask = observedMask;
+                    firstFailureMetrics = childMetrics[childI];
+                    firstBadSharedTet = badSharedTet;
+                    firstSevere = severeNonOrth;
+                    firstNonOrthError = nonOrthError;
+                    firstAngle = interfaceAngle;
+                    firstBestShared = bestSharedTet;
+
+                    // Virtual local line search.  The fixed core endpoint is
+                    // never moved.  This reports recoverability only.
+                    const label coreRow = wallStep + 1;
+                    const label wallRow = wallStep;
+
+                    if( coreRow < requestedLayers )
+                    {
+                        std::map<label,point> originalCoreRow;
+                        bool rowValid = true;
+
+                        forAll(parentEdges, edgeI)
+                        {
+                            const label seI = parentEdges[edgeI];
+                            if
+                            (
+                                seI < 0
+                             || seI >=
+                                label(newVerticesForSplitEdge_.size())
+                             || newVerticesForSplitEdge_.sizeOfRow(seI)
+                                <= coreRow
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            const label pointI =
+                                newVerticesForSplitEdge_(seI, coreRow);
+                            if
+                            (
+                                pointI == splitEdges_[seI].start()
+                             || pointI == splitEdges_[seI].end()
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+                            originalCoreRow[pointI] = v29Points[pointI];
+                        }
+
+                        if( rowValid && !originalCoreRow.empty() )
+                        {
+                            for
+                            (
+                                label factorI=0;
+                                factorI<nV52aBacktrackFactors;
+                                ++factorI
+                            )
+                            {
+                                ++backtrackAttempts;
+                                const scalar factor =
+                                    v52aBacktrackFactors[factorI];
+
+                                forAll(parentEdges, edgeI)
+                                {
+                                    const label seI = parentEdges[edgeI];
+                                    const label wallPointI =
+                                        newVerticesForSplitEdge_(seI, wallRow);
+                                    const label corePointI =
+                                        newVerticesForSplitEdge_(seI, coreRow);
+                                    v29Points[corePointI] =
+                                        v29Points[wallPointI]
+                                      + factor
+                                       *(
+                                            originalCoreRow.at(corePointI)
+                                          - v29Points[wallPointI]
+                                        );
+                                }
+
+                                V52aChildMetrics trialMetrics;
+                                label trialMask = 0;
+                                if
+                                (
+                                    !v52aMeasureChild
+                                    (
+                                        children[childI],
+                                        trialMetrics
+                                    )
+                                )
+                                    trialMask |= V52A_INVALID;
+
+                                trialMask |=
+                                (
+                                    v52aChildFailureMask(trialMetrics)
+                                  & v52aHardFailureBits
+                                );
+
+                                if( wallStep > 0 )
+                                {
+                                    label trialInvalid = 0;
+                                    label trialBadTet = 0;
+                                    label trialSevere = 0;
+                                    label trialNonOrth = 0;
+                                    scalar trialAngle = scalar(0);
+                                    scalar trialBest = -GREAT;
+                                    const label wallChildI = childI + 1;
+                                    v52aInterfaceMetrics
+                                    (
+                                        children[childI],
+                                        trialMetrics.centre,
+                                        children[wallChildI],
+                                        childMetrics[wallChildI].centre,
+                                        trialInvalid,
+                                        trialBadTet,
+                                        trialSevere,
+                                        trialNonOrth,
+                                        trialAngle,
+                                        trialBest
+                                    );
+                                    if( trialInvalid )
+                                        trialMask |= V52A_INVALID;
+
+                                    // trialBadTet is deliberately soft in V5.3.
+
+                                    if( trialNonOrth )
+                                        trialMask |= V52A_NONORTH_ERROR;
+                                }
+
+                                for
+                                (
+                                    std::map<label,point>::const_iterator
+                                        pointIt=originalCoreRow.begin();
+                                    pointIt!=originalCoreRow.end();
+                                    ++pointIt
+                                )
+                                    v29Points[pointIt->first] = pointIt->second;
+
+                                if( trialMask == 0 )
+                                {
+                                    backtrackRecoverable = true;
+                                    backtrackFactor = factor;
+                                    ++backtracked;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    break;
+                }
+
+                if( safeLayers == requestedLayers )
+                    ++safeFullDepth;
+                else
+                {
+                    ++terminatedEarly;
+                    if( safeLayers == 0 ) ++noValidFirstLayer;
+                    if( firstFailureMask & V52A_INVALID ) ++invalidColumns;
+                    if( firstFailureMask & V52A_NEGATIVE ) ++negativeColumns;
+                    if( firstFailureMask & V52A_PYRAMID ) ++pyramidColumns;
+                    if( firstFailureMask & V52A_CONCAVE ) ++concaveColumns;
+                    if( firstFailureMask & V52A_FACETET ) ++faceTetColumns;
+                    if( firstFailureMask & V52A_NONORTH_ERROR )
+                        ++nonOrthColumns;
+                }
+
+                if( safeLayers == 0 ) ++safe0;
+                else if( safeLayers <= 3 ) ++safe1to3;
+                else if( safeLayers <= 7 ) ++safe4to7;
+                else if( safeLayers <= 14 ) ++safe8to14;
+                else ++safe15plus;
+
+                if( safeLayers < requestedLayers )
+                    v52bRecordCap(bfI, safeLayers);
+
+                v52aCsv
+                    << parentCellI << ',' << bfI << ','
+                    << patchName << ',' << patchType << ','
+                    << requestedLayers << ',' << safeLayers << ','
+                    << firstUnsafeLayer << ',' << firstFailureMask << ','
+                    << firstFailureMetrics.invalid << ','
+                    << firstFailureMetrics.negative << ','
+                    << firstFailureMetrics.badPyramid << ','
+                    << firstFailureMetrics.concave << ','
+                    << firstFailureMetrics.badFaceTet << ','
+                    << firstBadSharedTet << ','
+                    << firstNonOrthError << ',' << firstSevere << ','
+                    << firstAngle << ',' << firstBestShared << ','
+                    << firstFailureMetrics.volume << ','
+                    << firstFailureMetrics.minPyramid << ','
+                    << firstFailureMetrics.minTetMargin << ','
+                    << label(backtrackRecoverable) << ','
+                    << backtrackFactor << ','
+                    << label(touchesPeriodic) << ','
+                    << label(tripleJunction) << nl;
+            }
+
+            if( cfmitchV52bApplyFrontCaps_ )
+            {
+                label zeroCaps = 0;
+                label minCap = labelMax;
+                label maxCap = -1;
+
+                forAllConstIter
+                (
+                    Map<label>,
+                    v52bDirectCaps,
+                    capIt
+                )
+                {
+                    const label cap = capIt();
+
+                    if( cap == 0 )
+                        ++zeroCaps;
+
+                    minCap = Foam::min(minCap, cap);
+                    maxCap = Foam::max(maxCap, cap);
+                }
+
+                if( v52bDirectCaps.size() == 0 )
+                    minCap = -1;
+
+                setQualityMaxLayersAtFaces(v52bDirectCaps);
+
+                Info
+                    << "CFMITCH V5.2b DIRECT CAPS:"
+                    << " invocation=" << v52aInvocation
+                    << " faces=" << v52bDirectCaps.size()
+                    << " zero=" << zeroCaps
+                    << " min=" << minCap
+                    << " max=" << maxCap
+                    << " exported="
+                    << qualityMaxLayersAtFace_.size()
+                    << " diagnosticSkipZero="
+                    << v52bDiagnosticSkipZeroCaps
+                    << " diagnosticMaxDirectCaps="
+                    << v52bDiagnosticMaxDirectCaps
+                    << " skippedZero="
+                    << v52bDiagnosticSkippedZero
+                    << " skippedLimit="
+                    << v52bDiagnosticSkippedLimit
+                    << " unsupportedNoCap="
+                    << v53UnsupportedNoCap
+                    << " appliesOnNextFreshBuild=true"
+                    << endl;
+            }
+
+            Info
+                << "CFMITCH V5.2a FRONT CONTRACT:"
+                << " invocation=" << v52aInvocation
+                << " stage=preV29Prospective"
+                << " requestedColumns=" << requestedColumns
+                << " supported=" << supportedColumns
+                << " unsupported=" << unsupportedColumns
+                << " safeFullDepth=" << safeFullDepth
+                << " terminatedEarly=" << terminatedEarly
+                << " noValidFirstLayer=" << noValidFirstLayer
+                << " backtrackRecoverable=" << backtracked
+                << " backtrackAttempts=" << backtrackAttempts
+                << " periodicColumns=" << periodicColumns
+                << " tripleJunctionColumns=" << tripleJunctionColumns
+                << " evaluatedChildren=" << evaluatedChildren
+                << " evaluatedInterfaces=" << evaluatedInterfaces
+                << " csvGood=" << v52aCsv.good()
+                << " csv=" << v52aCsvName
+                << endl;
+
+            Info
+                << "CFMITCH V5.2a TERMINATION HISTOGRAM:"
+                << " invocation=" << v52aInvocation
+                << " invalid=" << invalidColumns
+                << " negativeVolume=" << negativeColumns
+                << " badPyramid=" << pyramidColumns
+                << " concaveCell=" << concaveColumns
+                << " faceTetFailure=" << faceTetColumns
+                << " nonOrthError=" << nonOrthColumns
+                << " safe0=" << safe0
+                << " safe1to3=" << safe1to3
+                << " safe4to7=" << safe4to7
+                << " safe8to14=" << safe8to14
+                << " safe15plus=" << safe15plus
+                << endl;
+
+            Info
+                << "CFMITCH V5.2a QUALITY HEURISTICS:"
+                << " invocation=" << v52aInvocation
+                << " severeNonOrthInterfaces=" << severeInterfaces
+                << " nonOrthErrorInterfaces=" << nonOrthErrorInterfaces
+                << " severeIsHardFailure=false"
+                << " exactConcavity=true"
+                << " exactFaceTet=true"
+                << " topologyChanged=false"
+                << " pointsChanged=false"
+                << endl;
+
+            Info
+                << "CFMITCH V5.2a NEXT PLAN:"
+                << " invocation=" << v52aInvocation
+                << " consumeSafeDepths="
+                << cfmitchV52bApplyFrontCaps_
+                << " propagateCapsOnNextFreshBuild="
+                << cfmitchV52bApplyFrontCaps_
+                << " commitCurrentTopology=false"
+                << " diagnosticOnly="
+                << !cfmitchV52bApplyFrontCaps_
+                << endl;
+        }
+
+
+        // --------------------------------------------------------------
+        // Quality comparison.
+        //
+        // Negative prospective cells are never introduced.
+        //
+        // A lower bad-pyramid count wins, provided:
+        //
+        //   * minimum positive cell volume retains >= 50% baseline;
+        //   * worst pyramid margin is not made >2x worse.
+        //
+        // At equal bad-pyramid count the worst margin must improve.
+        // --------------------------------------------------------------
+
+        auto v29CandidateBetter =
+        [&]
+        (
+            const V29Score& trial,
+            const V29Score& base
+        ) -> bool
+        {
+            // v2.9a is intentionally strict:
+            //
+            //   * never introduce a prospective negative cell;
+            //   * retain at least half the baseline minimum raw volume;
+            //   * MUST remove at least one prospective bad pyramid.
+            //
+            // Equal bad-pyramid count is NOT an improvement in v2.9a.
+            // This prevents large row deformations being accepted for
+            // numerically insignificant margin changes.
+
+            if
+            (
+                trial.invalid != 0
+             || base.invalid != 0
+            )
+                return false;
+
+            if
+            (
+                base.negative != 0
+             || trial.negative != 0
+            )
+                return false;
+
+            if
+            (
+                base.minPositiveVol < GREAT/scalar(2)
+             && trial.minPositiveVol <
+                scalar(0.50)*base.minPositiveVol
+            )
+                return false;
+
+            if( trial.badPyr >= base.badPyr )
+                return false;
+
+            // Permit a lower total bad-pyramid count to win, but prevent
+            // trading it for an extreme worsening of the worst survivor.
+            if
+            (
+                base.minPyr < scalar(0)
+             && trial.minPyr <
+                scalar(2.0)*base.minPyr
+            )
+                return false;
+
+            return true;
+        };
+
+
+        label v29Seeds = 0;
+        label v29Attempted = 0;
+        label v29Accepted = 0;
+        label v29SkippedMixed = 0;
+        label v29SkippedInvalid = 0;
+        label v29Trials = 0;
+
+        label v29Reported = 0;
+
+
+        const scalar v29Amplitudes[] =
+        {
+            scalar(-0.01), scalar( 0.01),
+            scalar(-0.02), scalar( 0.02),
+            scalar(-0.03), scalar( 0.03),
+            scalar(-0.05), scalar( 0.05),
+            scalar(-0.08), scalar( 0.08),
+            scalar(-0.12), scalar( 0.12),
+            scalar(-0.16), scalar( 0.16),
+            scalar(-0.20), scalar( 0.20)
+        };
+
+        const label nV29Amplitudes =
+            sizeof(v29Amplitudes)
+           /sizeof(v29Amplitudes[0]);
+
+
+        for
+        (
+            label parentCellI=0;
+            parentCellI<nCells;
+            ++parentCellI
+        )
+        {
+            if( refType[parentCellI] != 1 )
+                continue;
+
+
+            // Seed only on a positive-volume prospective WALL child whose
+            // baseline geometry contains a bad pyramid.
+            V29Score wallScore;
+
+            if
+            (
+                !v29WallChildScore
+                (
+                    parentCellI,
+                    wallScore
+                )
+            )
+                continue;
+
+            if
+            (
+                wallScore.invalid != 0
+             || wallScore.negative != 0
+             || wallScore.badPyr == 0
+            )
+                continue;
+
+            ++v29Seeds;
+
+
+            DynList<label,16> seedEdges;
+
+            if
+            (
+                !v29Type1Edges
+                (
+                    parentCellI,
+                    seedEdges
+                )
+            )
+            {
+                ++v29SkippedInvalid;
+                continue;
+            }
+
+
+            std::set<label> affected;
+
+            if
+            (
+                !v29AffectedParents
+                (
+                    seedEdges,
+                    affected
+                )
+            )
+            {
+                ++v29SkippedInvalid;
+                continue;
+            }
+
+            affected.insert(parentCellI);
+
+
+            bool mixedUnsupported = false;
+
+            for
+            (
+                std::set<label>::const_iterator
+                    cIt=affected.begin();
+                cIt!=affected.end();
+                ++cIt
+            )
+            {
+                if
+                (
+                    refType[*cIt] != 0
+                 && refType[*cIt] != 1
+                )
+                {
+                    mixedUnsupported = true;
+                    break;
+                }
+            }
+
+            if( mixedUnsupported )
+            {
+                ++v29SkippedMixed;
+                continue;
+            }
+
+
+            V29Score baseline;
+
+            if
+            (
+                !v29EvaluateSet
+                (
+                    affected,
+                    baseline
+                )
+             || baseline.invalid != 0
+             || baseline.negative != 0
+            )
+            {
+                ++v29SkippedInvalid;
+                continue;
+            }
+
+
+            // Snapshot every unique interior split-row point.
+            std::map<label,point> originalPositions;
+
+            bool snapshotValid = true;
+
+            forAll(seedEdges, eeI)
+            {
+                const label seI =
+                    seedEdges[eeI];
+
+                const edge& se =
+                    splitEdges_[seI];
+
+                const label rowSize =
+                    newVerticesForSplitEdge_.
+                        sizeOfRow(seI);
+
+                if( rowSize < 3 )
+                {
+                    snapshotValid = false;
+                    break;
+                }
+
+                for
+                (
+                    label rowI=1;
+                    rowI<rowSize-1;
+                    ++rowI
+                )
+                {
+                    const label pointI =
+                        newVerticesForSplitEdge_
+                        (
+                            seI,
+                            rowI
+                        );
+
+                    if
+                    (
+                        pointI == se.start()
+                     || pointI == se.end()
+                    )
+                    {
+                        snapshotValid = false;
+                        break;
+                    }
+
+                    std::map<label,point>::const_iterator
+                        oldIt =
+                            originalPositions.find(pointI);
+
+                    if
+                    (
+                        oldIt != originalPositions.end()
+                    )
+                    {
+                        // A generated point participating in more than one
+                        // seed hair is not a legal v2.9a scalar variable.
+                        snapshotValid = false;
+                        break;
+                    }
+
+                    originalPositions.insert
+                    (
+                        std::make_pair
+                        (
+                            pointI,
+                            v29Points[pointI]
+                        )
+                    );
+                }
+
+                if( !snapshotValid )
+                    break;
+            }
+
+            if
+            (
+                !snapshotValid
+             || originalPositions.empty()
+            )
+            {
+                ++v29SkippedInvalid;
+                continue;
+            }
+
+
+            auto restoreOriginal =
+            [&]()
+            {
+                for
+                (
+                    std::map<label,point>::const_iterator
+                        pIt=originalPositions.begin();
+                    pIt!=originalPositions.end();
+                    ++pIt
+                )
+                {
+                    v29Points[pIt->first] =
+                        pIt->second;
+                }
+            };
+
+
+            auto applyAmplitude =
+            [&]
+            (
+                const scalar amplitude
+            ) -> bool
+            {
+                restoreOriginal();
+
+                forAll(seedEdges, eeI)
+                {
+                    const label seI =
+                        seedEdges[eeI];
+
+                    const edge& se =
+                        splitEdges_[seI];
+
+                    const vector edgeVec =
+                        v29Points[se.end()]
+                       -v29Points[se.start()];
+
+                    const scalar edgeMagSqr =
+                        edgeVec & edgeVec;
+
+                    if( edgeMagSqr <= VSMALL )
+                    {
+                        restoreOriginal();
+                        return false;
+                    }
+
+                    const label rowSize =
+                        newVerticesForSplitEdge_.
+                            sizeOfRow(seI);
+
+                    const label firstPointI =
+                        newVerticesForSplitEdge_
+                        (
+                            seI,
+                            1
+                        );
+
+                    std::map<label,point>::const_iterator
+                        firstIt =
+                            originalPositions.find
+                            (
+                                firstPointI
+                            );
+
+                    if
+                    (
+                        firstIt ==
+                        originalPositions.end()
+                    )
+                    {
+                        restoreOriginal();
+                        return false;
+                    }
+
+                    const scalar firstT =
+                        (
+                            (
+                                firstIt->second
+                               -v29Points[se.start()]
+                            )
+                          & edgeVec
+                        )
+                       /(edgeMagSqr + VSMALL);
+
+                    if
+                    (
+                        firstT <= scalar(0)
+                     || firstT >= scalar(1)
+                    )
+                    {
+                        restoreOriginal();
+                        return false;
+                    }
+
+                    scalar prevOriginalT =
+                        scalar(0);
+
+                    scalar prevWarpedT =
+                        scalar(0);
+
+                    for
+                    (
+                        label rowI=1;
+                        rowI<rowSize-1;
+                        ++rowI
+                    )
+                    {
+                        const label pointI =
+                            newVerticesForSplitEdge_
+                            (
+                                seI,
+                                rowI
+                            );
+
+                        std::map<label,point>::const_iterator
+                            pIt =
+                                originalPositions.find
+                                (
+                                    pointI
+                                );
+
+                        if
+                        (
+                            pIt ==
+                            originalPositions.end()
+                        )
+                        {
+                            restoreOriginal();
+                            return false;
+                        }
+
+                        const scalar t =
+                            (
+                                (
+                                    pIt->second
+                                   -v29Points[se.start()]
+                                )
+                              & edgeVec
+                            )
+                           /(edgeMagSqr + VSMALL);
+
+                        if
+                        (
+                            !(t > prevOriginalT)
+                         || !(t < scalar(1))
+                        )
+                        {
+                            restoreOriginal();
+                            return false;
+                        }
+
+                        const scalar decayBase =
+                            Foam::max
+                            (
+                                scalar(0),
+                                (
+                                    scalar(1)-t
+                                )
+                               /(
+                                    scalar(1)
+                                   -firstT
+                                   +VSMALL
+                                )
+                            );
+
+                        const scalar deltaT =
+                            amplitude
+                           *firstT
+                           *Foam::pow
+                            (
+                                decayBase,
+                                scalar(4)
+                            );
+
+                        const scalar warpedT =
+                            t + deltaT;
+
+                        if
+                        (
+                            !(warpedT > prevWarpedT)
+                         || !(warpedT < scalar(1))
+                        )
+                        {
+                            restoreOriginal();
+                            return false;
+                        }
+
+                        v29Points[pointI] =
+                            v29Points[se.start()]
+                          + warpedT*edgeVec;
+
+                        prevOriginalT = t;
+                        prevWarpedT = warpedT;
+                    }
+                }
+
+                return true;
+            };
+
+
+            ++v29Attempted;
+
+            bool foundBetter = false;
+
+            V29Score bestScore =
+                baseline;
+
+            scalar bestAmplitude =
+                scalar(0);
+
+            std::map<label,point> bestPositions;
+
+
+            for
+            (
+                label ampI=0;
+                ampI<nV29Amplitudes;
+                ++ampI
+            )
+            {
+                const scalar amplitude =
+                    v29Amplitudes[ampI];
+
+                if
+                (
+                    !applyAmplitude
+                    (
+                        amplitude
+                    )
+                )
+                    continue;
+
+                ++v29Trials;
+
+                V29Score trial;
+
+                if
+                (
+                    !v29EvaluateSet
+                    (
+                        affected,
+                        trial
+                    )
+                )
+                    continue;
+
+                if
+                (
+                    !v29CandidateBetter
+                    (
+                        trial,
+                        bestScore
+                    )
+                )
+                    continue;
+
+                foundBetter = true;
+
+                bestScore =
+                    trial;
+
+                bestAmplitude =
+                    amplitude;
+
+                bestPositions.clear();
+
+                for
+                (
+                    std::map<label,point>::const_iterator
+                        pIt=originalPositions.begin();
+                    pIt!=originalPositions.end();
+                    ++pIt
+                )
+                {
+                    bestPositions.insert
+                    (
+                        std::make_pair
+                        (
+                            pIt->first,
+                            v29Points[pIt->first]
+                        )
+                    );
+                }
+            }
+
+
+            restoreOriginal();
+
+
+            if( foundBetter )
+            {
+                for
+                (
+                    std::map<label,point>::const_iterator
+                        pIt=bestPositions.begin();
+                    pIt!=bestPositions.end();
+                    ++pIt
+                )
+                {
+                    v29Points[pIt->first] =
+                        pIt->second;
+                }
+
+                ++v29Accepted;
+
+                if( v29Reported < 50 )
+                {
+                    ++v29Reported;
+
+                    Info
+                        << "CFMITCH V2.9a.1 FRONT ACCEPT"
+                        << " parent=" << parentCellI
+                        << " hairs=" << seedEdges.size()
+                        << " affectedParents="
+                        << affected.size()
+                        << " amplitude="
+                        << bestAmplitude
+                        << " badPyr="
+                        << baseline.badPyr
+                        << "->"
+                        << bestScore.badPyr
+                        << " minPyr="
+                        << baseline.minPyr
+                        << "->"
+                        << bestScore.minPyr
+                        << " minPositiveVol="
+                        << baseline.minPositiveVol
+                        << "->"
+                        << bestScore.minPositiveVol
+                        << endl;
+                }
+            }
+        }
+
+
+        Info
+            << "CFMITCH V2.9a.1 PROSPECTIVE FRONT SUMMARY:"
+            << " seeds=" << v29Seeds
+            << " attempted=" << v29Attempted
+            << " accepted=" << v29Accepted
+            << " trials=" << v29Trials
+            << " skippedMixed=" << v29SkippedMixed
+            << " skippedInvalid=" << v29SkippedInvalid
+            << endl;
+    }
+
+
+    //- provenance map: newCellI -> bfI that generated it (-1 if not a BL cell)
+    cellToBaseBndFace_.setSize(nCells+nNewCells, -1);
+    forAll(cellToBfI, cI)
+        if( cellToBfI[cI] >= 0 )
+            cellToBaseBndFace_[cI] = cellToBfI[cI];
+
     //- start creating new cells
     //- store the information which new cells were generated from
     //- an existing cell
@@ -1392,6 +6825,198 @@ void refineBoundaryLayers::generateNewCells()
 
     VRWGraph pointNewFaces;
     pointNewFaces.reverseAddressing(newFaces_);
+
+    auto checkedNewCellLabel =
+    [&]
+    (
+        const label parentCellI,
+        const label localChildI,
+        const label parentRefType
+    ) -> label
+    {
+        const label newCellI =
+            localChildI == 0 ? parentCellI : nCells++;
+
+        if
+        (
+            newCellI < 0
+         || newCellI >= label(cells.size())
+        )
+        {
+            refinementValid_ = false;
+
+            FatalErrorIn("void refineBoundaryLayers::generateNewCells()")
+                << "CFMITCH CHILD CELL ALLOCATION OVERFLOW:"
+                << " newCellI=" << newCellI
+                << " allocated=" << cells.size()
+                << " parent=" << parentCellI
+                << " localChild=" << localChildI
+                << " refType=" << parentRefType
+                << " runningNextCell=" << nCells
+                << exit(FatalError);
+        }
+
+        return newCellI;
+    };
+
+    // ============================================================
+    // CFMITCH V10I TYPE2 BIRTH LINEAGE
+    //
+    // Diagnostic only.
+    //
+    // Record final child-cell labels at the exact moment they are
+    // allocated by generateNewCells().  Cell labels remain stable
+    // through the later face reconstruction, so this can be joined
+    // directly against V10F owner/neighbour cell labels.
+    //
+    // One CSV is written per generateNewCells() invocation so a
+    // rejected construction attempt can never overwrite provenance
+    // belonging to another candidate.
+    //
+    // No points, faces, topology, layer counts, or acceptance
+    // decisions are changed.
+    // ============================================================
+    static label v10iInvocationCounter = 0;
+
+    const label v10iInvocation =
+        ++v10iInvocationCounter;
+
+    const fileName v10iCsvName
+    (
+        "CFMITCH_V10I_type2Birth_"
+      + Foam::name(v10iInvocation)
+      + ".csv"
+    );
+
+    OFstream v10iType2BirthCsv(v10iCsvName);
+
+    v10iType2BirthCsv
+        << "invocation,cell,parent,refType,localChild,"
+        << "bfI0,bfI1,patch0,patch1,layers0,layers1,"
+        << "generatedChildren,nFaces"
+        << nl;
+
+    label v10iType2Parents = 0;
+    label v10iType2Children = 0;
+
+    // ============================================================
+    // CFMITCH V10J TYPE1 CROSS-PATCH LINEAGE
+    //
+    // Diagnostic only.
+    //
+    // The V10I Rotor37 audit proved that the accepted BL contains
+    // zero refType-2 parents even though all 49 internal skew>4
+    // faces are BL_BL_CROSS_PATCH.
+    //
+    // Therefore identify neighbouring ORIGINAL refType-1 parents
+    // whose active BL boundary faces belong to different patches.
+    // Their children are the independent BL columns meeting at
+    // the suspected lateral seam.
+    //
+    // No geometry, topology, points, layer counts, or acceptance
+    // decisions are changed.
+    // ============================================================
+
+    labelList v10jParentPatch(refType.size(), -1);
+    boolList v10jCrossPatchParent(refType.size(), false);
+    labelList v10jCrossPatchDegree(refType.size(), 0);
+
+    forAll(refType, parentCellI)
+    {
+        if
+        (
+            refType[parentCellI] == 1
+         && cellToBfI[parentCellI] >= 0
+         && cellToBfI[parentCellI] <
+            label(exactVolumeFacePatch.size())
+        )
+        {
+            v10jParentPatch[parentCellI] =
+                exactVolumeFacePatch[cellToBfI[parentCellI]];
+        }
+    }
+
+    const labelList& v10jOwner =
+        mesh_.owner();
+
+    const labelList& v10jNeighbour =
+        mesh_.neighbour();
+
+    label v10jCrossPatchOriginalFaces = 0;
+    labelHashSet v10jCrossPatchOriginalParents;
+
+    for
+    (
+        label faceI=0;
+        faceI<label(v10jNeighbour.size());
+        ++faceI
+    )
+    {
+        const label own =
+            v10jOwner[faceI];
+
+        const label nei =
+            v10jNeighbour[faceI];
+
+        if
+        (
+            own < 0
+         || nei < 0
+         || own >= label(refType.size())
+         || nei >= label(refType.size())
+        )
+            continue;
+
+        if
+        (
+            refType[own] != 1
+         || refType[nei] != 1
+        )
+            continue;
+
+        const label op =
+            v10jParentPatch[own];
+
+        const label np =
+            v10jParentPatch[nei];
+
+        if
+        (
+            op < 0
+         || np < 0
+         || op == np
+        )
+            continue;
+
+        v10jCrossPatchParent[own] = true;
+        v10jCrossPatchParent[nei] = true;
+
+        ++v10jCrossPatchDegree[own];
+        ++v10jCrossPatchDegree[nei];
+
+        v10jCrossPatchOriginalParents.insert(own);
+        v10jCrossPatchOriginalParents.insert(nei);
+
+        ++v10jCrossPatchOriginalFaces;
+    }
+
+    const fileName v10jCsvName
+    (
+        "CFMITCH_V10J_type1CrossPatchBirth_"
+      + Foam::name(v10iInvocation)
+      + ".csv"
+    );
+
+    OFstream v10jCsv(v10jCsvName);
+
+    v10jCsv
+        << "invocation,cell,parent,localChild,"
+        << "bfI,patch,patchName,nLayers,wallLayer,"
+        << "generatedChildren,nFaces,crossPatchDegree"
+        << nl;
+
+    label v10jRecordedParents = 0;
+    label v10jRecordedChildren = 0;
 
     forAll(nCellsFromCell, cellI)
     {
@@ -1411,6 +7036,269 @@ void refineBoundaryLayers::generateNewCells()
                     newC.append(facesFromFace_(c[fI], cfI));
             }
 
+            // TYPE0_PROVENANCE_AUDIT
+            //
+            // Target the first simple bad cell and one larger bad cell
+            // previously identified by REFINE_PRE_RELABEL_CLOSURE.
+            // At this point:
+            //
+            //   c     = original cell face labels
+            //   newC  = replacement newFaces_ labels
+            //
+            // Nothing has yet been written back to c.
+            if( cellI == 951557 || cellI == 951730 )
+            {
+                std::map<std::pair<label,label>, label> edgeUse;
+
+                forAll(newC, nfLocalI)
+                {
+                    const label nfI = newC[nfLocalI];
+
+                    if
+                    (
+                        nfI < 0
+                     || nfI >= label(newFaces_.size())
+                    )
+                    {
+                        Info << "TYPE0_PROVENANCE_BAD_REF"
+                             << " cell=" << cellI
+                             << " newFace=" << nfI
+                             << endl;
+                        continue;
+                    }
+
+                    const label nPts = newFaces_.sizeOfRow(nfI);
+
+                    for(label pI=0; pI<nPts; ++pI)
+                    {
+                        const label a = newFaces_(nfI, pI);
+                        const label b =
+                            newFaces_(nfI, (pI+1)%nPts);
+
+                        ++edgeUse
+                        [
+                            std::make_pair
+                            (
+                                Foam::min(a,b),
+                                Foam::max(a,b)
+                            )
+                        ];
+                    }
+                }
+
+                label nBadEdges = 0;
+                for
+                (
+                    std::map<std::pair<label,label>, label>::const_iterator
+                        iter=edgeUse.begin();
+                    iter!=edgeUse.end();
+                    ++iter
+                )
+                {
+                    if( iter->second != 2 )
+                        ++nBadEdges;
+                }
+
+                Info << "TYPE0_PROVENANCE_BEGIN"
+                     << " cell=" << cellI
+                     << " originalFaces=" << c.size()
+                     << " replacementFaces=" << newC.size()
+                     << " badEdges=" << nBadEdges
+                     << endl;
+
+                // Print every original face and every replacement face
+                // originating from it.  These cells are tiny, so this is
+                // deliberately exhaustive.
+                forAll(c, oldLocalI)
+                {
+                    const label oldFaceI = c[oldLocalI];
+
+                    Info << "TYPE0_PROVENANCE_OLD"
+                         << " cell=" << cellI
+                         << " local=" << oldLocalI
+                         << " oldFace=" << oldFaceI;
+
+                    if
+                    (
+                        oldFaceI >= 0
+                     && oldFaceI < label(faces.size())
+                    )
+                    {
+                        Info << " oldPts=" << faces[oldFaceI];
+                    }
+                    else
+                    {
+                        Info << " oldPts=OUT_OF_RANGE";
+                    }
+
+                    Info << " replacements=(";
+
+                    if
+                    (
+                        oldFaceI >= 0
+                     && oldFaceI < label(facesFromFace_.size())
+                    )
+                    {
+                        forAllRow
+                        (
+                            facesFromFace_,
+                            oldFaceI,
+                            repI
+                        )
+                        {
+                            Info << ' '
+                                 << facesFromFace_(oldFaceI, repI);
+                        }
+                    }
+
+                    Info << " )" << endl;
+
+                    if
+                    (
+                        oldFaceI < 0
+                     || oldFaceI >= label(facesFromFace_.size())
+                    )
+                        continue;
+
+                    forAllRow(facesFromFace_, oldFaceI, repI)
+                    {
+                        const label nfI =
+                            facesFromFace_(oldFaceI, repI);
+
+                        Info << "TYPE0_PROVENANCE_REP"
+                             << " cell=" << cellI
+                             << " oldFace=" << oldFaceI
+                             << " repLocal=" << repI
+                             << " newFace=" << nfI;
+
+                        if
+                        (
+                            nfI >= 0
+                         && nfI < label(newFaces_.size())
+                        )
+                        {
+                            Info << " newPts="
+                                 << newFaces_[nfI];
+                        }
+                        else
+                        {
+                            Info << " newPts=OUT_OF_RANGE";
+                        }
+
+                        Info << endl;
+                    }
+                }
+
+                // Print all unmatched edges and identify exactly which
+                // original/replacement face contributes each edge.
+                for
+                (
+                    std::map<std::pair<label,label>, label>::const_iterator
+                        iter=edgeUse.begin();
+                    iter!=edgeUse.end();
+                    ++iter
+                )
+                {
+                    if( iter->second == 2 )
+                        continue;
+
+                    const label ea = iter->first.first;
+                    const label eb = iter->first.second;
+
+                    Info << "TYPE0_PROVENANCE_BAD_EDGE"
+                         << " cell=" << cellI
+                         << " edge=(" << ea << ' ' << eb << ')'
+                         << " use=" << iter->second
+                         << endl;
+
+                    forAll(c, oldLocalI)
+                    {
+                        const label oldFaceI = c[oldLocalI];
+
+                        if
+                        (
+                            oldFaceI < 0
+                         || oldFaceI >= label(facesFromFace_.size())
+                        )
+                            continue;
+
+                        forAllRow
+                        (
+                            facesFromFace_,
+                            oldFaceI,
+                            repI
+                        )
+                        {
+                            const label nfI =
+                                facesFromFace_(oldFaceI, repI);
+
+                            if
+                            (
+                                nfI < 0
+                             || nfI >= label(newFaces_.size())
+                            )
+                                continue;
+
+                            const label nPts =
+                                newFaces_.sizeOfRow(nfI);
+
+                            bool containsBadEdge = false;
+
+                            for(label pI=0; pI<nPts; ++pI)
+                            {
+                                const label a =
+                                    newFaces_(nfI, pI);
+                                const label b =
+                                    newFaces_
+                                    (
+                                        nfI,
+                                        (pI+1)%nPts
+                                    );
+
+                                if
+                                (
+                                    Foam::min(a,b) == ea
+                                 && Foam::max(a,b) == eb
+                                )
+                                {
+                                    containsBadEdge = true;
+                                    break;
+                                }
+                            }
+
+                            if( containsBadEdge )
+                            {
+                                Info
+                                    << "TYPE0_PROVENANCE_EDGE_SOURCE"
+                                    << " cell=" << cellI
+                                    << " edge=("
+                                    << ea << ' ' << eb << ')'
+                                    << " oldFace=" << oldFaceI
+                                    << " replacementFace=" << nfI
+                                    << " oldPts=";
+
+                                if
+                                (
+                                    oldFaceI >= 0
+                                 && oldFaceI < label(faces.size())
+                                )
+                                    Info << faces[oldFaceI];
+                                else
+                                    Info << "OUT_OF_RANGE";
+
+                                Info << " newPts="
+                                     << newFaces_[nfI]
+                                     << endl;
+                            }
+                        }
+                    }
+                }
+
+                Info << "TYPE0_PROVENANCE_END"
+                     << " cell=" << cellI
+                     << endl;
+            }
+
             //- update the cell
             c.setSize(newC.size());
             forAll(c, fI)
@@ -1420,13 +7308,141 @@ void refineBoundaryLayers::generateNewCells()
         {
             //- generate new cells from this prism refined in one direction
             DynList<DynList<DynList<label, 8>, 10>, 64> cellsFromCell;
-            generateNewCellsPrism(cellI, cellsFromCell);
+
+            // Report-only audit of the exact discrete split geometry.
+            auditExactPrismChildren(cellI);
+
+            if
+            (
+                !generateNewCellsPrism
+                (
+                    cellI,
+                    cellsFromCell
+                )
+            )
+            {
+                refinementValid_ = false;
+
+                WarningIn
+                (
+                    "void refineBoundaryLayers::generateNewCells()"
+                )
+                    << "CFMitch V3.5 rejected structurally invalid "
+                    << "type-1 prism parent " << cellI
+                    << " -- aborting this refinement transaction"
+                    << endl;
+
+                return;
+            }
 
             forAll(cellsFromCell, cI)
             {
                 const DynList<DynList<label, 8>, 10>& nc = cellsFromCell[cI];
 
-                const label newCellI = cI==0?cellI:nCells++;
+                if( cellI == 1218619 && cI == 14 )
+                {
+                    Info
+                        << "BL_BAD_CHILD_SHELL"
+                        << " parent=" << cellI
+                        << " localChild=" << cI
+                        << " nFaces=" << nc.size()
+                        << endl;
+
+                    forAll(nc, badChildFI)
+                    {
+                        Info
+                            << "BL_BAD_CHILD_FACE"
+                            << " parent=" << cellI
+                            << " localChild=" << cI
+                            << " localFace=" << badChildFI
+                            << " pts=" << nc[badChildFI]
+                            << endl;
+                    }
+                }
+
+                auditGeneratedChild(nc, cellI, cI, refType[cellI]);
+
+                const label newCellI =
+                    checkedNewCellLabel(cellI, cI, refType[cellI]);
+                cellToBaseBndFace_[newCellI] = cellToBfI[cellI];
+
+                exactVolumeParent[newCellI] = cellI;
+                exactVolumeLocalChild[newCellI] = cI;
+                exactVolumeRefType[newCellI] = 1;
+
+                if
+                (
+                    cellI >= 0
+                 && cellI < label(v10jCrossPatchParent.size())
+                 && v10jCrossPatchParent[cellI]
+                )
+                {
+                    const label v10jBfI =
+                        cellToBfI[cellI];
+
+                    const label v10jPatch =
+                        (
+                            v10jBfI >= 0
+                         && v10jBfI <
+                            label(exactVolumeFacePatch.size())
+                        )
+                      ? exactVolumeFacePatch[v10jBfI]
+                      : -1;
+
+                    const label v10jNLayers =
+                        (
+                            v10jBfI >= 0
+                         && v10jBfI <
+                            label(nLayersAtBndFace_.size())
+                        )
+                      ? nLayersAtBndFace_[v10jBfI]
+                      : -1;
+
+                    // Type-1 child numbering is CORE -> WALL.
+                    // wallLayer=0 therefore means wall-adjacent.
+                    const label v10jWallLayer =
+                        (
+                            v10jNLayers > 0
+                        )
+                      ? v10jNLayers - 1 - cI
+                      : -1;
+
+                    word v10jPatchName("?");
+
+                    if
+                    (
+                        v10jPatch >= 0
+                     && v10jPatch <
+                        label(childSweepBoundaries.size())
+                    )
+                    {
+                        v10jPatchName =
+                            childSweepBoundaries
+                            [
+                                v10jPatch
+                            ].patchName();
+                    }
+
+                    if( cI == 0 )
+                        ++v10jRecordedParents;
+
+                    ++v10jRecordedChildren;
+
+                    v10jCsv
+                        << v10iInvocation << ','
+                        << newCellI << ','
+                        << cellI << ','
+                        << cI << ','
+                        << v10jBfI << ','
+                        << v10jPatch << ','
+                        << v10jPatchName << ','
+                        << v10jNLayers << ','
+                        << v10jWallLayer << ','
+                        << cellsFromCell.size() << ','
+                        << nc.size() << ','
+                        << v10jCrossPatchDegree[cellI]
+                        << nl;
+                }
 
                 newCellsFromCell.append(cellI, newCellI);
 
@@ -1463,22 +7479,761 @@ void refineBoundaryLayers::generateNewCells()
         }
         else if( refType[cellI] == 2 )
         {
-            //- generate new cell from a hex cell where two layers intersect
-            //- generate mostly hex cells;
+            // ---------------------------------------------------------
+            // CFMitch V3.6 -- type-2 edge-hex structural preflight.
+            //
+            // refType==2 only proves that two boundary faces request
+            // refinement.  It does NOT prove that the parent is the
+            // six-faced topological hex required by refineEdgeHexCell.
+            //
+            // Validate that assumption before the constructor indexes
+            // its FixedList<...,6> directional storage.
+            // ---------------------------------------------------------
+
+            // CFMitch V3.8: retain the original parent while generated
+            // child zero reuses and overwrites cells[cellI].
+            const cell type2Parent(cells[cellI]);
+
+            FixedList<label, 2> type2BfI(-1);
+            FixedList<label, 2> type2BoundaryLocalFace(-1);
+
+            label type2ActiveBoundaryFaces = 0;
+            bool type2ParentValid = true;
+            word type2FailureReason("none");
+
+            if( type2Parent.size() != 6 )
+            {
+                type2ParentValid = false;
+                type2FailureReason = "parentNotSixFaced";
+            }
+
+            const label type2StartBoundary =
+                childSweepBoundaries.size()
+              ? childSweepBoundaries[0].patchStart()
+              : -1;
+
+            std::map<std::pair<label,label>, label>
+                type2ParentEdgeUse;
+
+            if( type2ParentValid )
+            {
+                forAll(type2Parent, parentLocalFI)
+                {
+                    const label parentFaceI =
+                        type2Parent[parentLocalFI];
+
+                    if
+                    (
+                        parentFaceI < 0
+                     || parentFaceI >= label(faces.size())
+                    )
+                    {
+                        type2ParentValid = false;
+                        type2FailureReason =
+                            "parentFaceOutOfRange";
+                        break;
+                    }
+
+                    const face& parentFace =
+                        faces[parentFaceI];
+
+                    if( parentFace.size() < 3 )
+                    {
+                        type2ParentValid = false;
+                        type2FailureReason =
+                            "parentFaceTooSmall";
+                        break;
+                    }
+
+                    forAll(parentFace, parentPointI)
+                    {
+                        const label a =
+                            parentFace[parentPointI];
+
+                        const label b =
+                            parentFace
+                            [
+                                (parentPointI+1)
+                              % parentFace.size()
+                            ];
+
+                        if
+                        (
+                            a < 0
+                         || b < 0
+                         || a >= label(mesh_.points().size())
+                         || b >= label(mesh_.points().size())
+                         || a == b
+                        )
+                        {
+                            type2ParentValid = false;
+                            type2FailureReason =
+                                "parentFaceBadEdge";
+                            break;
+                        }
+
+                        ++type2ParentEdgeUse
+                        [
+                            std::make_pair
+                            (
+                                Foam::min(a,b),
+                                Foam::max(a,b)
+                            )
+                        ];
+                    }
+
+                    if( !type2ParentValid )
+                        break;
+
+                    const label bfI =
+                        parentFaceI - type2StartBoundary;
+
+                    if
+                    (
+                        bfI >= 0
+                     && bfI < label(nLayersAtBndFace_.size())
+                     && nLayersAtBndFace_[bfI] > 1
+                    )
+                    {
+                        if( type2ActiveBoundaryFaces < 2 )
+                        {
+                            type2BfI
+                            [
+                                type2ActiveBoundaryFaces
+                            ] = bfI;
+
+                            type2BoundaryLocalFace
+                            [
+                                type2ActiveBoundaryFaces
+                            ] = parentLocalFI;
+                        }
+
+                        ++type2ActiveBoundaryFaces;
+                    }
+                }
+            }
+
+            if
+            (
+                type2ParentValid
+             && type2ActiveBoundaryFaces != 2
+            )
+            {
+                type2ParentValid = false;
+                type2FailureReason =
+                    "activeBoundaryFaceCount";
+            }
+
+            if( type2ParentValid )
+            {
+                for
+                (
+                    std::map
+                    <
+                        std::pair<label,label>,
+                        label
+                    >::const_iterator edgeIt =
+                        type2ParentEdgeUse.begin();
+
+                    edgeIt != type2ParentEdgeUse.end();
+                    ++edgeIt
+                )
+                {
+                    if( edgeIt->second != 2 )
+                    {
+                        type2ParentValid = false;
+                        type2FailureReason =
+                            "parentShellOpen";
+                        break;
+                    }
+                }
+            }
+
+            label type2CommonEdgeCount = 0;
+
+            if( type2ParentValid )
+            {
+                const face& activeFace0 =
+                    faces
+                    [
+                        type2Parent
+                        [
+                            type2BoundaryLocalFace[0]
+                        ]
+                    ];
+
+                const face& activeFace1 =
+                    faces
+                    [
+                        type2Parent
+                        [
+                            type2BoundaryLocalFace[1]
+                        ]
+                    ];
+
+                forAll(activeFace0, edge0I)
+                {
+                    const label a0 =
+                        activeFace0[edge0I];
+
+                    const label b0 =
+                        activeFace0
+                        [
+                            (edge0I+1)
+                          % activeFace0.size()
+                        ];
+
+                    const label lo0 = Foam::min(a0,b0);
+                    const label hi0 = Foam::max(a0,b0);
+
+                    forAll(activeFace1, edge1I)
+                    {
+                        const label a1 =
+                            activeFace1[edge1I];
+
+                        const label b1 =
+                            activeFace1
+                            [
+                                (edge1I+1)
+                              % activeFace1.size()
+                            ];
+
+                        if
+                        (
+                            lo0 == Foam::min(a1,b1)
+                         && hi0 == Foam::max(a1,b1)
+                        )
+                        {
+                            ++type2CommonEdgeCount;
+                        }
+                    }
+                }
+
+                if( type2CommonEdgeCount != 1 )
+                {
+                    type2ParentValid = false;
+                    type2FailureReason =
+                        "refinedFacesDoNotShareOneEdge";
+                }
+            }
+
+            if( !type2ParentValid )
+            {
+                refinementValid_ = false;
+
+                WarningIn
+                (
+                    "void refineBoundaryLayers::generateNewCells()"
+                )
+                    << "CFMITCH V3.6 EDGEHEX PREFLIGHT FAIL:"
+                    << " parent=" << cellI
+                    << " nFaces=" << type2Parent.size()
+                    << " activeBoundaryFaces="
+                    << type2ActiveBoundaryFaces
+                    << " bfI=("
+                    << type2BfI[0] << " "
+                    << type2BfI[1] << ")"
+                    << " commonEdges="
+                    << type2CommonEdgeCount
+                    << " reason="
+                    << type2FailureReason
+                    << " -- rejecting refinement transaction"
+                    << endl;
+
+                return;
+            }
+
+            //- generate new cells from a topologically validated hex
+            //- where two boundary-layer directions intersect.
             refineEdgeHexCell refEdgeHex(cellI, *this);
-            const DynList<DynList<DynList<label, 4>, 6>, 256>& cellsFromCell =
+
+            const DynList
+            <
+                DynList<DynList<label, 4>, 6>,
+                256
+            >& cellsFromCell =
                 refEdgeHex.newCells();
+
+            // ----------------------------------------------------
+            // V10I: exact parent-side junction context.
+            //
+            // type2BfI[] was obtained from the two active boundary
+            // faces validated by the V3.6 preflight above.
+            // ----------------------------------------------------
+            const label v10iLayers0 =
+            (
+                type2BfI[0] >= 0
+             && type2BfI[0] < label(nLayersAtBndFace_.size())
+            )
+              ? nLayersAtBndFace_[type2BfI[0]]
+              : -1;
+
+            const label v10iLayers1 =
+            (
+                type2BfI[1] >= 0
+             && type2BfI[1] < label(nLayersAtBndFace_.size())
+            )
+              ? nLayersAtBndFace_[type2BfI[1]]
+              : -1;
+
+            const label v10iPatch0 =
+            (
+                type2BfI[0] >= 0
+             && type2BfI[0] < label(exactVolumeFacePatch.size())
+            )
+              ? exactVolumeFacePatch[type2BfI[0]]
+              : -1;
+
+            const label v10iPatch1 =
+            (
+                type2BfI[1] >= 0
+             && type2BfI[1] < label(exactVolumeFacePatch.size())
+            )
+              ? exactVolumeFacePatch[type2BfI[1]]
+              : -1;
+
+            ++v10iType2Parents;
 
             forAll(cellsFromCell, cI)
             {
-                const DynList<DynList<label, 4>, 6>& nc = cellsFromCell[cI];
+                const DynList<DynList<label, 4>, 6>& nc =
+                    cellsFromCell[cI];
+
+                if
+                (
+                    !auditGeneratedChild
+                    (
+                        nc,
+                        cellI,
+                        cI,
+                        refType[cellI]
+                    )
+                )
+                {
+                    // -------------------------------------------------
+                    // CFMitch V3.7 -- first-failure edge-hex forensic.
+                    //
+                    // Diagnostic only.  V3.6 still rejects the child
+                    // before commitment and restores Q0.
+                    // -------------------------------------------------
+
+                    const label forensicLayers0 =
+                        (
+                            type2BfI[0] >= 0
+                         && type2BfI[0] <
+                            label(nLayersAtBndFace_.size())
+                        )
+                      ? nLayersAtBndFace_[type2BfI[0]]
+                      : -1;
+
+                    const label forensicLayers1 =
+                        (
+                            type2BfI[1] >= 0
+                         && type2BfI[1] <
+                            label(nLayersAtBndFace_.size())
+                        )
+                      ? nLayersAtBndFace_[type2BfI[1]]
+                      : -1;
+
+                    Info
+                        << "CFMITCH V3.7 EDGEHEX FORENSIC BEGIN:"
+                        << " parent=" << cellI
+                        << " childLocal=" << cI
+                        << " parentFaces=" << type2Parent.size()
+                        << " generatedChildren="
+                        << cellsFromCell.size()
+                        << " bfI=("
+                        << type2BfI[0] << " "
+                        << type2BfI[1] << ")"
+                        << " localBoundaryFaces=("
+                        << type2BoundaryLocalFace[0] << " "
+                        << type2BoundaryLocalFace[1] << ")"
+                        << " layers=("
+                        << forensicLayers0 << " "
+                        << forensicLayers1 << ")"
+                        << endl;
+
+                    forAll(type2Parent, forensicParentLocalFI)
+                    {
+                        const label forensicSourceFaceI =
+                            type2Parent[forensicParentLocalFI];
+
+                        const label forensicBfI =
+                            forensicSourceFaceI
+                          - type2StartBoundary;
+
+                        label forensicRequestedLayers = -1;
+
+                        if
+                        (
+                            forensicBfI >= 0
+                         && forensicBfI <
+                            label(nLayersAtBndFace_.size())
+                        )
+                        {
+                            forensicRequestedLayers =
+                                nLayersAtBndFace_
+                                [
+                                    forensicBfI
+                                ];
+                        }
+
+                        Info
+                            << "CFMITCH V3.7 EDGEHEX PARENT FACE:"
+                            << " parent=" << cellI
+                            << " localFace="
+                            << forensicParentLocalFI
+                            << " sourceFace="
+                            << forensicSourceFaceI
+                            << " bfI=" << forensicBfI
+                            << " requestedLayers="
+                            << forensicRequestedLayers;
+
+                        if
+                        (
+                            forensicSourceFaceI >= 0
+                         && forensicSourceFaceI <
+                            label(faces.size())
+                        )
+                        {
+                            Info
+                                << " oldPoints="
+                                << faces[forensicSourceFaceI];
+                        }
+                        else
+                        {
+                            Info << " oldPoints=OUT_OF_RANGE";
+                        }
+
+                        label forensicDerivedCount = 0;
+
+                        if
+                        (
+                            forensicSourceFaceI >= 0
+                         && forensicSourceFaceI <
+                            label(facesFromFace_.size())
+                        )
+                        {
+                            forensicDerivedCount =
+                                facesFromFace_.sizeOfRow
+                                (
+                                    forensicSourceFaceI
+                                );
+                        }
+
+                        Info
+                            << " derivedCount="
+                            << forensicDerivedCount
+                            << endl;
+
+                        if
+                        (
+                            forensicSourceFaceI < 0
+                         || forensicSourceFaceI >=
+                            label(facesFromFace_.size())
+                        )
+                        {
+                            continue;
+                        }
+
+                        forAllRow
+                        (
+                            facesFromFace_,
+                            forensicSourceFaceI,
+                            forensicDerivedI
+                        )
+                        {
+                            const label forensicDerivedFaceI =
+                                facesFromFace_
+                                (
+                                    forensicSourceFaceI,
+                                    forensicDerivedI
+                                );
+
+                            Info
+                                << "CFMITCH V3.7 EDGEHEX DERIVED FACE:"
+                                << " parent=" << cellI
+                                << " sourceLocal="
+                                << forensicParentLocalFI
+                                << " sourceFace="
+                                << forensicSourceFaceI
+                                << " derivedLocal="
+                                << forensicDerivedI
+                                << " derivedFace="
+                                << forensicDerivedFaceI;
+
+                            if
+                            (
+                                forensicDerivedFaceI >= 0
+                             && forensicDerivedFaceI <
+                                label(newFaces_.size())
+                            )
+                            {
+                                Info
+                                    << " points="
+                                    << newFaces_
+                                       [
+                                           forensicDerivedFaceI
+                                       ];
+                            }
+                            else
+                            {
+                                Info << " points=OUT_OF_RANGE";
+                            }
+
+                            Info << endl;
+                        }
+                    }
+
+                    forAll(nc, forensicChildLocalFI)
+                    {
+                        label forensicMatchedSource = -1;
+                        label forensicMatchedDerived = -1;
+
+                        forAll(type2Parent, forensicParentLocalFI)
+                        {
+                            const label forensicSourceFaceI =
+                                type2Parent[forensicParentLocalFI];
+
+                            if
+                            (
+                                forensicSourceFaceI < 0
+                             || forensicSourceFaceI >=
+                                label(facesFromFace_.size())
+                            )
+                            {
+                                continue;
+                            }
+
+                            forAllRow
+                            (
+                                facesFromFace_,
+                                forensicSourceFaceI,
+                                forensicDerivedI
+                            )
+                            {
+                                const label forensicDerivedFaceI =
+                                    facesFromFace_
+                                    (
+                                        forensicSourceFaceI,
+                                        forensicDerivedI
+                                    );
+
+                                if
+                                (
+                                    forensicDerivedFaceI >= 0
+                                 && forensicDerivedFaceI <
+                                    label(newFaces_.size())
+                                 && help::areFacesEqual
+                                    (
+                                        nc[forensicChildLocalFI],
+                                        newFaces_
+                                        [
+                                            forensicDerivedFaceI
+                                        ]
+                                    )
+                                )
+                                {
+                                    forensicMatchedSource =
+                                        forensicSourceFaceI;
+
+                                    forensicMatchedDerived =
+                                        forensicDerivedFaceI;
+                                }
+                            }
+                        }
+
+                        Info
+                            << "CFMITCH V3.7 EDGEHEX CHILD FACE:"
+                            << " parent=" << cellI
+                            << " childLocal=" << cI
+                            << " faceLocal="
+                            << forensicChildLocalFI
+                            << " matchedSource="
+                            << forensicMatchedSource
+                            << " matchedDerived="
+                            << forensicMatchedDerived
+                            << " points="
+                            << nc[forensicChildLocalFI]
+                            << endl;
+                    }
+
+                    std::map
+                    <
+                        std::pair<label,label>,
+                        label
+                    > forensicEdgeUse;
+
+                    forAll(nc, forensicChildLocalFI)
+                    {
+                        const DynList<label, 4>& forensicFace =
+                            nc[forensicChildLocalFI];
+
+                        forAll(forensicFace, forensicPointI)
+                        {
+                            const label a =
+                                forensicFace[forensicPointI];
+
+                            const label b =
+                                forensicFace
+                                [
+                                    (forensicPointI+1)
+                                  % forensicFace.size()
+                                ];
+
+                            ++forensicEdgeUse
+                            [
+                                std::make_pair
+                                (
+                                    Foam::min(a,b),
+                                    Foam::max(a,b)
+                                )
+                            ];
+                        }
+                    }
+
+                    for
+                    (
+                        std::map
+                        <
+                            std::pair<label,label>,
+                            label
+                        >::const_iterator forensicEdgeIt =
+                            forensicEdgeUse.begin();
+
+                        forensicEdgeIt !=
+                            forensicEdgeUse.end();
+                        ++forensicEdgeIt
+                    )
+                    {
+                        if( forensicEdgeIt->second == 2 )
+                            continue;
+
+                        const label forensicA =
+                            forensicEdgeIt->first.first;
+
+                        const label forensicB =
+                            forensicEdgeIt->first.second;
+
+                        Info
+                            << "CFMITCH V3.7 EDGEHEX BAD EDGE:"
+                            << " parent=" << cellI
+                            << " childLocal=" << cI
+                            << " edge=("
+                            << forensicA << " "
+                            << forensicB << ")"
+                            << " use="
+                            << forensicEdgeIt->second;
+
+                        if
+                        (
+                            forensicA >= 0
+                         && forensicB >= 0
+                         && forensicA <
+                            label(mesh_.points().size())
+                         && forensicB <
+                            label(mesh_.points().size())
+                        )
+                        {
+                            Info
+                                << " p0="
+                                << mesh_.points()[forensicA]
+                                << " p1="
+                                << mesh_.points()[forensicB];
+                        }
+
+                        Info << " childFaces=(";
+
+                        forAll(nc, forensicChildLocalFI)
+                        {
+                            const DynList<label, 4>& forensicFace =
+                                nc[forensicChildLocalFI];
+
+                            bool forensicContainsEdge = false;
+
+                            forAll(forensicFace, forensicPointI)
+                            {
+                                const label a =
+                                    forensicFace[forensicPointI];
+
+                                const label b =
+                                    forensicFace
+                                    [
+                                        (forensicPointI+1)
+                                      % forensicFace.size()
+                                    ];
+
+                                if
+                                (
+                                    Foam::min(a,b) == forensicA
+                                 && Foam::max(a,b) == forensicB
+                                )
+                                {
+                                    forensicContainsEdge = true;
+                                    break;
+                                }
+                            }
+
+                            if( forensicContainsEdge )
+                            {
+                                Info << " "
+                                     << forensicChildLocalFI;
+                            }
+                        }
+
+                        Info << " )" << endl;
+                    }
+
+                    Info
+                        << "CFMITCH V3.7 EDGEHEX FORENSIC END:"
+                        << " parent=" << cellI
+                        << " childLocal=" << cI
+                        << endl;
+
+                    refinementValid_ = false;
+
+                    WarningIn
+                    (
+                        "void refineBoundaryLayers::generateNewCells()"
+                    )
+                        << "CFMITCH V3.6 EDGEHEX CHILD FAIL:"
+                        << " parent=" << cellI
+                        << " childLocal=" << cI
+                        << " bfI=("
+                        << type2BfI[0] << " "
+                        << type2BfI[1] << ")"
+                        << " -- rejecting before child commitment"
+                        << endl;
+
+                    return;
+                }
 
                 # ifdef DEBUGLayer
                 Pout << "Adding cell " << (cI==0?cellI:nCells)
                      << " originating from cell " << cellI << endl;
                 # endif
 
-                const label newCellI = cI==0?cellI:nCells++;
+                const label newCellI =
+                    checkedNewCellLabel(cellI, cI, refType[cellI]);
+                cellToBaseBndFace_[newCellI] = cellToBfI[cellI];
+
+                ++v10iType2Children;
+
+                v10iType2BirthCsv
+                    << v10iInvocation << ','
+                    << newCellI << ','
+                    << cellI << ','
+                    << refType[cellI] << ','
+                    << cI << ','
+                    << type2BfI[0] << ','
+                    << type2BfI[1] << ','
+                    << v10iPatch0 << ','
+                    << v10iPatch1 << ','
+                    << v10iLayers0 << ','
+                    << v10iLayers1 << ','
+                    << cellsFromCell.size() << ','
+                    << nc.size()
+                    << nl;
 
                 newCellsFromCell.append(cellI, newCellI);
 
@@ -1530,7 +8285,11 @@ void refineBoundaryLayers::generateNewCells()
             {
                 const DynList<DynList<label, 4>, 6>& nc = cellsFromCell[cI];
 
-                const label newCellI = cI==0?cellI:nCells++;
+                auditGeneratedChild(nc, cellI, cI, refType[cellI]);
+
+                const label newCellI =
+                    checkedNewCellLabel(cellI, cI, refType[cellI]);
+                cellToBaseBndFace_[newCellI] = cellToBfI[cellI];
 
                 newCellsFromCell.append(cellI, newCellI);
 
@@ -1572,6 +8331,202 @@ void refineBoundaryLayers::generateNewCells()
                 "void refineBoundaryLayers::generateNewCells()"
             ) << "Cannot refine boundary layer for cell "
               << cellI << abort(FatalError);
+        }
+    }
+
+    Info << "REFINE_CHILD_CLOSURE"
+         << " checked=" << nGeneratedChildrenChecked
+         << " bad=" << nGeneratedChildrenBad
+         << " badType1=" << nGeneratedBadType1
+         << " badType2=" << nGeneratedBadType2
+         << " badType3=" << nGeneratedBadType3
+         << " badEdges=" << nGeneratedBadEdges
+         << " malformedFaces=" << nGeneratedMalformedFaces
+         << endl;
+
+    if( nGeneratedChildrenBad > 0 )
+    {
+        refinementValid_ = false;
+
+        WarningIn
+        (
+            "void refineBoundaryLayers::generateNewCells()"
+        )
+            << "CFMITCH V4.4 GENERATED CHILD CLOSURE REJECT:"
+            << " badChildren=" << nGeneratedChildrenBad
+            << " badType1=" << nGeneratedBadType1
+            << " badType2=" << nGeneratedBadType2
+            << " badType3=" << nGeneratedBadType3
+            << " badEdges=" << nGeneratedBadEdges
+            << " malformedFaces=" << nGeneratedMalformedFaces
+            << " -- rejecting before face relabel"
+            << endl;
+
+        return;
+    }
+
+    // REFINE_PRE_RELABEL_CLOSURE_AUDIT
+    //
+    // Diagnostic only. At this point every cell already references
+    // newFaces_, but the final face-list reconstruction/newFaceLabel
+    // renumbering has NOT happened yet.
+    //
+    // This catches both:
+    //   - refined cells after face consolidation, and
+    //   - refType==0 cells reconstructed from facesFromFace_.
+    {
+        labelLongList badCellIds;
+
+        label nBadCellsType0 = 0;
+        label nBadCellsType1 = 0;
+        label nBadCellsType2 = 0;
+        label nBadCellsType3 = 0;
+        label nBadCellsAppended = 0;
+
+        label nBadEdgesTotal = 0;
+        label nBadFaceRefs = 0;
+        label nDegenerateFaces = 0;
+
+        forAll(cells, cellI)
+        {
+            const cell& c = cells[cellI];
+
+            std::map<std::pair<label,label>, label> edgeUse;
+
+            bool bad = false;
+            label badEdgesThisCell = 0;
+
+            forAll(c, cfI)
+            {
+                const label faceI = c[cfI];
+
+                if
+                (
+                    faceI < 0
+                 || faceI >= label(newFaces_.size())
+                )
+                {
+                    bad = true;
+                    ++nBadFaceRefs;
+                    continue;
+                }
+
+                const label nPts = newFaces_.sizeOfRow(faceI);
+
+                if( nPts < 3 )
+                {
+                    bad = true;
+                    ++nDegenerateFaces;
+                    continue;
+                }
+
+                for(label pI=0; pI<nPts; ++pI)
+                {
+                    const label a = newFaces_(faceI, pI);
+                    const label b =
+                        newFaces_(faceI, (pI+1)%nPts);
+
+                    if( a == b )
+                        bad = true;
+
+                    ++edgeUse
+                    [
+                        std::make_pair
+                        (
+                            Foam::min(a,b),
+                            Foam::max(a,b)
+                        )
+                    ];
+                }
+            }
+
+            for
+            (
+                std::map<std::pair<label,label>, label>::const_iterator
+                    iter=edgeUse.begin();
+                iter!=edgeUse.end();
+                ++iter
+            )
+            {
+                if( iter->second != 2 )
+                {
+                    bad = true;
+                    ++badEdgesThisCell;
+                }
+            }
+
+            if( bad )
+            {
+                badCellIds.append(cellI);
+                nBadEdgesTotal += badEdgesThisCell;
+
+                label rt = -1;
+
+                if( cellI < label(refType.size()) )
+                {
+                    rt = refType[cellI];
+
+                    if( rt == 0 )
+                        ++nBadCellsType0;
+                    else if( rt == 1 )
+                        ++nBadCellsType1;
+                    else if( rt == 2 )
+                        ++nBadCellsType2;
+                    else if( rt == 3 )
+                        ++nBadCellsType3;
+                }
+                else
+                {
+                    ++nBadCellsAppended;
+                }
+
+                if( badCellIds.size() <= 100 )
+                {
+                    Info << "REFINE_PRE_RELABEL_BAD"
+                         << " cell=" << cellI
+                         << " refType=" << rt
+                         << " nFaces=" << c.size()
+                         << " badEdges=" << badEdgesThisCell
+                         << endl;
+                }
+            }
+        }
+
+        Info << "REFINE_PRE_RELABEL_CLOSURE"
+             << " cells=" << cells.size()
+             << " badCells=" << badCellIds.size()
+             << " badType0=" << nBadCellsType0
+             << " badType1=" << nBadCellsType1
+             << " badType2=" << nBadCellsType2
+             << " badType3=" << nBadCellsType3
+             << " badAppended=" << nBadCellsAppended
+             << " badEdges=" << nBadEdgesTotal
+             << " badFaceRefs=" << nBadFaceRefs
+             << " degenerateFaces=" << nDegenerateFaces
+             << endl;
+
+        if( badCellIds.size() > 0 )
+        {
+            refinementValid_ = false;
+
+            WarningIn
+            (
+                "void refineBoundaryLayers::generateNewCells()"
+            )
+                << "CFMITCH V4.4 PRE-RELABEL CLOSURE REJECT:"
+                << " badCells=" << badCellIds.size()
+                << " badType0=" << nBadCellsType0
+                << " badType1=" << nBadCellsType1
+                << " badType2=" << nBadCellsType2
+                << " badType3=" << nBadCellsType3
+                << " badAppended=" << nBadCellsAppended
+                << " badEdges=" << nBadEdgesTotal
+                << " badFaceRefs=" << nBadFaceRefs
+                << " degenerateFaces=" << nDegenerateFaces
+                << " -- rejecting before owner/neighbour relabel"
+                << endl;
+
+            return;
         }
     }
 
@@ -1663,15 +8618,25 @@ void refineBoundaryLayers::generateNewCells()
     faces.setSize(newFaces_.size());
 
     label currFace = 0;
+    label nInternalRelabelMismatch = 0;
+
     for(label faceI=0;faceI<nOrigInternalFaces;++faceI)
     {
         forAllRow(facesFromFace_, faceI, ffI)
         {
-            face& f = faces[currFace];
-            newFaceLabel[currFace] = currFace;
-            ++currFace;
-
             const label newFaceI = facesFromFace_(faceI, ffI);
+
+            face& f = faces[currFace];
+
+            // newFaceLabel maps an index in newFaces_ to its final
+            // face index in the reconstructed mesh.  Using currFace
+            // as both key and value is only valid accidentally when
+            // newFaceI == currFace.
+            if( newFaceI != currFace )
+                ++nInternalRelabelMismatch;
+
+            newFaceLabel[newFaceI] = currFace;
+            ++currFace;
 
             f.setSize(newFaces_.sizeOfRow(newFaceI));
 
@@ -1679,6 +8644,11 @@ void refineBoundaryLayers::generateNewCells()
                 f[pI] = newFaces_(newFaceI, pI);
         }
     }
+
+    Info << "REFINE_RELABEL internalDerivedMismatch="
+         << nInternalRelabelMismatch
+         << " internalDerivedFaces=" << currFace
+         << endl;
 
     //- store newly-generated internal faces
     # ifdef DEBUGLayer
@@ -1812,13 +8782,9864 @@ void refineBoundaryLayers::generateNewCells()
             c[fI] = newFaceLabel[c[fI]];
     }
 
+    // =================================================================
+    // CFMITCH V5.7a QUAD-FAN ESCAPE
+    //
+    // Mechanism established by cfmitchTetLocationDiag:
+    //
+    //   * ordinary cross-layer quad shared-base failures are reproduced
+    //     exactly by physical owner/neighbour triangle-plane clearance;
+    //
+    //   * a four-triangle fan through the existing OpenFOAM face centre
+    //     virtually recovers ~96.56% of those failures;
+    //
+    //   * this topology escape requires zero movement of the four
+    //     existing BL vertices.
+    //
+    // IMPORTANT:
+    //
+    // This runs only AFTER the normal BL child cells and final face labels
+    // have been constructed.  Therefore four fan triangles are explicitly
+    // attached to the SAME two already-existing cells.  They are NOT put
+    // through facesFromFace_, whose row multiplicity has layer-position
+    // semantics in the ordinary child-cell generators.
+    //
+    // V5.7a is deliberately SERIAL-ONLY and capped at 2048 applied faces
+    // for the first topology-plumbing experiment.
+    // =================================================================
+
+    if( cfmitchV57QuadFanEscape_ )
+    {
+        const label v57ApplyCap = 2048;
+
+        if( Pstream::parRun() )
+        {
+            Info
+                << "CFMITCH V5.7a QUAD-FAN:"
+                << " enabled=yes"
+                << " applied=0"
+                << " reason=serialOnly"
+                << endl;
+        }
+        else
+        {
+            // The final faces/cells were just reconstructed above.
+            // Invalidate old addressing before asking polyMeshGen for
+            // owner/neighbour and geometric centres of THIS topology.
+            meshModifier.clearAll();
+
+            const label v57NInternal =
+                mesh_.nInternalFaces();
+
+            const label v57OldFaceCount =
+                faces.size();
+
+            const label v57OldPointCount =
+                mesh_.points().size();
+
+            const labelList v57Owner(mesh_.owner());
+            const labelList v57Neighbour(mesh_.neighbour());
+
+            const vectorField v57FaceCentres
+            (
+                mesh_.addressingData().faceCentres()
+            );
+
+            const vectorField v57FaceAreas
+            (
+                mesh_.addressingData().faceAreas()
+            );
+
+            const vectorField v57CellCentres
+            (
+                mesh_.addressingData().cellCentres()
+            );
+
+            pointFieldPMG& v57Points =
+                meshModifier.pointsAccess();
+
+            boolList v57Selected(v57NInternal, false);
+
+            label v57RegularColumnQuads = 0;
+            label v57PhysicalFail = 0;
+            label v57Recoverable = 0;
+            label v57SelectedCount = 0;
+
+            label v57Degenerate = 0;
+            label v57NotSix = 0;
+            label v57NotSameColumn = 0;
+
+            // CFMITCH V5.7b accumulated post-fan hard-admission telemetry.
+            label v57HardEvaluated = 0;
+            label v57HardSafe = 0;
+            label v57HardRejected = 0;
+            label v57HardRejectInvalid = 0;
+            label v57HardRejectVolume = 0;
+            label v57HardRejectPyramid = 0;
+            label v57HardRejectNonOrth = 0;
+
+            scalar v57SelectedClearMin = GREAT;
+            scalar v57SelectedClearMax = -GREAT;
+            scalar v57SelectedClearSum = scalar(0);
+
+            const label v57BoundaryStart =
+                boundaries.size()
+              ? boundaries[0].patchStart()
+              : label(faces.size());
+
+            bool v57LayoutOK =
+            (
+                v57BoundaryStart == v57NInternal
+             && v57Owner.size() == v57OldFaceCount
+             && v57Neighbour.size() == v57OldFaceCount
+             && v57FaceCentres.size() == v57OldFaceCount
+             && v57FaceAreas.size() == v57OldFaceCount
+             && v57CellCentres.size() == cells.size()
+             && v57Points.size() == v57OldPointCount
+            );
+
+            if( !v57LayoutOK )
+            {
+                Info
+                    << "CFMITCH V5.7a QUAD-FAN LAYOUT REJECT:"
+                    << " nInternal=" << v57NInternal
+                    << " boundaryStart=" << v57BoundaryStart
+                    << " faces=" << v57OldFaceCount
+                    << " owner=" << v57Owner.size()
+                    << " neighbour=" << v57Neighbour.size()
+                    << " faceCentres=" << v57FaceCentres.size()
+                    << " faceAreas=" << v57FaceAreas.size()
+                    << " cells=" << cells.size()
+                    << " cellCentres=" << v57CellCentres.size()
+                    << " points=" << v57Points.size()
+                    << endl;
+            }
+            else
+            {
+                // -----------------------------------------------------
+                // =====================================================
+            // CFMITCH V5.7b ACCUMULATED HARD ADMISSION
+            //
+            // V5.7a checked each prospective fan against PRE-FAN cached
+            // cell centres.  But replacing one quad by four triangles
+            // changes primitiveMesh's face-weighted cell-centre calculation.
+            //
+            // A cell may also contain more than one selected fan.  Therefore
+            // every tentative candidate below is evaluated against the full
+            // ACCUMULATED virtual topology represented by v57Selected.
+            //
+            // This is a read-only prospective transaction.  The real mesh
+            // topology is not changed until the existing V5.7 apply block.
+            // =====================================================
+
+            // ---------------------------------------------------------
+            // Exact OpenFOAM face::areaAndCentre() parity for an existing
+            // old face.  This mirrors v1OFFaceCentreArea below.
+            // ---------------------------------------------------------
+
+            auto v57OFFaceCentreArea =
+            [&]
+            (
+                const face& f,
+                point& fCtr,
+                vector& fArea
+            ) -> bool
+            {
+                const label nPoints =
+                    f.size();
+
+                if( nPoints < 3 )
+                    return false;
+
+                forAll(f, pi)
+                {
+                    const label pointI =
+                        f[pi];
+
+                    if
+                    (
+                        pointI < 0
+                     || pointI >= label(v57Points.size())
+                    )
+                        return false;
+                }
+
+                if( nPoints == 3 )
+                {
+                    const point& p0 =
+                        v57Points[f[0]];
+
+                    const point& p1 =
+                        v57Points[f[1]];
+
+                    const point& p2 =
+                        v57Points[f[2]];
+
+                    fArea =
+                        scalar(0.5)
+                       *((p1-p0)^(p2-p0));
+
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *(p0+p1+p2);
+
+                    return
+                    (
+                        !help::isnan(fCtr)
+                     && !help::isinf(fCtr)
+                     && std::isfinite(mag(fArea))
+                    );
+                }
+
+                point pAvg(vector::zero);
+
+                forAll(f, pi)
+                    pAvg += v57Points[f[pi]];
+
+                pAvg /= scalar(nPoints);
+
+                vector sumA(vector::zero);
+
+                forAll(f, pi)
+                {
+                    const point& fp =
+                        v57Points[f[pi]];
+
+                    const point& fpNext =
+                        v57Points[f.nextLabel(pi)];
+
+                    const vector a =
+                        (fpNext-fp)^(pAvg-fp);
+
+                    sumA += a;
+                }
+
+                const scalar sumAMag =
+                    mag(sumA);
+
+                if
+                (
+                    !std::isfinite(sumAMag)
+                 || sumAMag <= rootVSmall
+                )
+                    return false;
+
+                const vector sumAHat =
+                    normalised(sumA);
+
+                scalar sumAn = scalar(0);
+                vector sumAnc(vector::zero);
+
+                forAll(f, pi)
+                {
+                    const point& fp =
+                        v57Points[f[pi]];
+
+                    const point& fpNext =
+                        v57Points[f.nextLabel(pi)];
+
+                    const vector a =
+                        (fpNext-fp)^(pAvg-fp);
+
+                    const vector c =
+                        fp + fpNext + pAvg;
+
+                    const scalar an =
+                        a & sumAHat;
+
+                    sumAn += an;
+                    sumAnc += an*c;
+                }
+
+                fArea =
+                    scalar(0.5)*sumA;
+
+                if( sumAn > vSmall )
+                {
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *sumAnc/sumAn;
+                }
+                else
+                {
+                    fCtr = pAvg;
+                }
+
+                return
+                (
+                    !help::isnan(fCtr)
+                 && !help::isinf(fCtr)
+                 && std::isfinite(mag(fArea))
+                );
+            };
+
+
+            // ---------------------------------------------------------
+            // Geometry for one face in the virtual topology.
+            //
+            // pieceI=0 for an untouched old face.
+            //
+            // A selected old quad contributes:
+            //   piece 0 = p0 p1 x
+            //   piece 1 = p1 p2 x
+            //   piece 2 = p2 p3 x
+            //   piece 3 = p3 p0 x
+            //
+            // x is exactly the point the existing APPLY code will append:
+            // v57FaceCentres[oldFaceI].
+            // ---------------------------------------------------------
+
+            auto v57VirtualFaceCentreArea =
+            [&]
+            (
+                const label oldFaceI,
+                const label pieceI,
+                point& fCtr,
+                vector& fArea
+            ) -> bool
+            {
+                if
+                (
+                    oldFaceI < 0
+                 || oldFaceI >= v57OldFaceCount
+                )
+                    return false;
+
+                const bool split =
+                (
+                    oldFaceI < v57NInternal
+                 && v57Selected[oldFaceI]
+                );
+
+                if( !split )
+                {
+                    if( pieceI != 0 )
+                        return false;
+
+                    return
+                        v57OFFaceCentreArea
+                        (
+                            faces[oldFaceI],
+                            fCtr,
+                            fArea
+                        );
+                }
+
+                if( pieceI < 0 || pieceI >= 4 )
+                    return false;
+
+                const face& f =
+                    faces[oldFaceI];
+
+                if( f.size() != 4 )
+                    return false;
+
+                const label aI =
+                    f[pieceI];
+
+                const label bI =
+                    f[(pieceI+1)%4];
+
+                if
+                (
+                    aI < 0
+                 || bI < 0
+                 || aI >= label(v57Points.size())
+                 || bI >= label(v57Points.size())
+                )
+                    return false;
+
+                const point& a =
+                    v57Points[aI];
+
+                const point& b =
+                    v57Points[bI];
+
+                const point& x =
+                    v57FaceCentres[oldFaceI];
+
+                fCtr =
+                    (scalar(1)/scalar(3))
+                   *(a+b+x);
+
+                fArea =
+                    scalar(0.5)
+                   *((b-a)^(x-a));
+
+                const scalar areaMag =
+                    mag(fArea);
+
+                return
+                (
+                    !help::isnan(fCtr)
+                 && !help::isinf(fCtr)
+                 && std::isfinite(areaMag)
+                 && areaMag > rootVSmall
+                );
+            };
+
+
+            // ---------------------------------------------------------
+            // Exact signed OpenFOAM-style cell centre/volume under the
+            // accumulated virtual fan topology.
+            //
+            // Mirrors v1OFCellCentreVolume / primitiveMesh:
+            //
+            //   cEst = arithmetic mean of all virtual face centres
+            //   pyr3 = Sf & (Cf-cEst), outward for this cell
+            //   C    = sum(pyr3*Cp)/sum(pyr3)
+            // ---------------------------------------------------------
+
+            auto v57VirtualCellCentreVolume =
+            [&]
+            (
+                const label cellI,
+                point& cellCtr,
+                scalar& cellVol
+            ) -> bool
+            {
+                if
+                (
+                    cellI < 0
+                 || cellI >= label(cells.size())
+                )
+                    return false;
+
+                const cell& c =
+                    cells[cellI];
+
+                if( c.empty() )
+                    return false;
+
+                label nVirtualFaces = 0;
+
+                forAll(c, cfI)
+                {
+                    const label oldFaceI =
+                        c[cfI];
+
+                    if
+                    (
+                        oldFaceI < 0
+                     || oldFaceI >= v57OldFaceCount
+                    )
+                        return false;
+
+                    nVirtualFaces +=
+                    (
+                        oldFaceI < v57NInternal
+                     && v57Selected[oldFaceI]
+                    )
+                  ? label(4)
+                  : label(1);
+                }
+
+                if( nVirtualFaces <= 0 )
+                    return false;
+
+                point cEst(vector::zero);
+
+                forAll(c, cfI)
+                {
+                    const label oldFaceI =
+                        c[cfI];
+
+                    const label nPieces =
+                    (
+                        oldFaceI < v57NInternal
+                     && v57Selected[oldFaceI]
+                    )
+                  ? label(4)
+                  : label(1);
+
+                    for
+                    (
+                        label pieceI=0;
+                        pieceI<nPieces;
+                        ++pieceI
+                    )
+                    {
+                        point fc(vector::zero);
+                        vector fa(vector::zero);
+
+                        if
+                        (
+                            !v57VirtualFaceCentreArea
+                            (
+                                oldFaceI,
+                                pieceI,
+                                fc,
+                                fa
+                            )
+                        )
+                            return false;
+
+                        cEst += fc;
+                    }
+                }
+
+                cEst /= scalar(nVirtualFaces);
+
+                point weightedCentre(vector::zero);
+                scalar vol3 = scalar(0);
+
+                forAll(c, cfI)
+                {
+                    const label oldFaceI =
+                        c[cfI];
+
+                    const label nPieces =
+                    (
+                        oldFaceI < v57NInternal
+                     && v57Selected[oldFaceI]
+                    )
+                  ? label(4)
+                  : label(1);
+
+                    for
+                    (
+                        label pieceI=0;
+                        pieceI<nPieces;
+                        ++pieceI
+                    )
+                    {
+                        point fc(vector::zero);
+                        vector fa(vector::zero);
+
+                        if
+                        (
+                            !v57VirtualFaceCentreArea
+                            (
+                                oldFaceI,
+                                pieceI,
+                                fc,
+                                fa
+                            )
+                        )
+                            return false;
+
+                        scalar pyr3Vol =
+                            fa & (fc-cEst);
+
+                        if( v57Owner[oldFaceI] != cellI )
+                            pyr3Vol *= scalar(-1);
+
+                        const point pc =
+                            scalar(0.75)*fc
+                          + scalar(0.25)*cEst;
+
+                        weightedCentre +=
+                            pyr3Vol*pc;
+
+                        vol3 +=
+                            pyr3Vol;
+                    }
+                }
+
+                if( Foam::mag(vol3) > vSmall )
+                    cellCtr = weightedCentre/vol3;
+                else
+                    cellCtr = cEst;
+
+                cellVol =
+                    vol3/scalar(3);
+
+                return
+                (
+                    !help::isnan(cellCtr)
+                 && !help::isinf(cellCtr)
+                 && std::isfinite(cellVol)
+                );
+            };
+
+
+            // ---------------------------------------------------------
+            // Hard quality of one old face under the current accumulated
+            // virtual topology.
+            //
+            // For untouched polygon faces, use pyramidPointFaceRef exactly
+            // as the established V1 OF-parity evaluator does.
+            //
+            // For selected fan triangles, the exact signed pyramid volume
+            // is Sf & (Cf-C)/3.
+            // ---------------------------------------------------------
+
+            auto v57AuditOldFaceHard =
+            [&]
+            (
+                const label oldFaceI,
+                bool& badInvalid,
+                bool& badVolume,
+                bool& badPyramid,
+                bool& badNonOrth
+            )
+            {
+                if
+                (
+                    oldFaceI < 0
+                 || oldFaceI >= v57OldFaceCount
+                )
+                {
+                    badInvalid = true;
+                    return;
+                }
+
+                const label own =
+                    v57Owner[oldFaceI];
+
+                const label nei =
+                    v57Neighbour[oldFaceI];
+
+                if
+                (
+                    own < 0
+                 || own >= label(cells.size())
+                 || nei < -1
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return;
+                }
+
+                point ownCc(vector::zero);
+                scalar ownVol = scalar(0);
+
+                if
+                (
+                    !v57VirtualCellCentreVolume
+                    (
+                        own,
+                        ownCc,
+                        ownVol
+                    )
+                )
+                {
+                    badInvalid = true;
+                    return;
+                }
+
+                if( ownVol <= scalar(0) )
+                    badVolume = true;
+
+                point neiCc(vector::zero);
+                scalar neiVol = scalar(0);
+
+                if( nei >= 0 )
+                {
+                    if
+                    (
+                        !v57VirtualCellCentreVolume
+                        (
+                            nei,
+                            neiCc,
+                            neiVol
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    if( neiVol <= scalar(0) )
+                        badVolume = true;
+                }
+
+                const bool split =
+                (
+                    oldFaceI < v57NInternal
+                 && v57Selected[oldFaceI]
+                );
+
+                if( !split )
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            0,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    const scalar ownerPyrVol =
+                        pyramidPointFaceRef
+                        (
+                            faces[oldFaceI],
+                            ownCc
+                        ).mag(v57Points);
+
+                    if( !std::isfinite(ownerPyrVol) )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    if( ownerPyrVol > SMALL )
+                        badPyramid = true;
+
+                    if( nei >= 0 )
+                    {
+                        const scalar neighbourPyrVol =
+                            pyramidPointFaceRef
+                            (
+                                faces[oldFaceI],
+                                neiCc
+                            ).mag(v57Points);
+
+                        if( !std::isfinite(neighbourPyrVol) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( neighbourPyrVol < -SMALL )
+                            badPyramid = true;
+
+                        const vector d =
+                            neiCc-ownCc;
+
+                        const scalar orthogonality =
+                            (d & fa)
+                           /(
+                                mag(d)*mag(fa)
+                              + rootVSmall
+                            );
+
+                        if( !std::isfinite(orthogonality) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( orthogonality <= SMALL )
+                            badNonOrth = true;
+                    }
+
+                    return;
+                }
+
+                // Selected old quad: audit its four prospective triangles.
+                for(label pieceI=0; pieceI<4; ++pieceI)
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            pieceI,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    // Positive means correctly oriented for the owner.
+                    const scalar ownerMargin =
+                        (
+                            fa
+                          & (fc-ownCc)
+                        )/scalar(3);
+
+                    if( !std::isfinite(ownerMargin) )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    if( ownerMargin < -SMALL )
+                        badPyramid = true;
+
+                    if( nei >= 0 )
+                    {
+                        // Same stored winding is reversed relative to the
+                        // neighbour cell, so positive neighbour margin is:
+                        const scalar neighbourMargin =
+                           -(
+                                fa
+                              & (fc-neiCc)
+                            )/scalar(3);
+
+                        if( !std::isfinite(neighbourMargin) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( neighbourMargin < -SMALL )
+                            badPyramid = true;
+
+                        const vector d =
+                            neiCc-ownCc;
+
+                        const scalar orthogonality =
+                            (d & fa)
+                           /(
+                                mag(d)*mag(fa)
+                              + rootVSmall
+                            );
+
+                        if( !std::isfinite(orthogonality) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( orthogonality <= SMALL )
+                            badNonOrth = true;
+                    }
+                }
+            };
+
+
+            // ---------------------------------------------------------
+            // CFMITCH V5.7c INCREMENTAL SEVERE-NONORTH ADMISSION
+            //
+            // Exact OpenFOAM-13 checkMesh severe-face parity:
+            //
+            //     dDotS =
+            //         (d & S)/(mag(d)*mag(S) + vSmall)
+            //
+            // checkMesh default nonOrthThreshold = 70 degrees,
+            // and a face is severe when:
+            //
+            //     dDotS < cos(70 degrees)
+            //
+            // Do NOT reject a candidate merely because its local
+            // neighbourhood already contains a severe face.
+            //
+            // Instead count the exact local severe-face population
+            // before and after the tentative fan and reject only an
+            // INCREASE.
+            //
+            // An untouched old face contributes one prospective face.
+            // A selected old quad contributes its four prospective
+            // triangle faces exactly as written by V5.7.
+            // ---------------------------------------------------------
+
+            const scalar v57SevereNonOrthThreshold =
+                scalar(0.34202014332566873304);
+
+
+            auto v57CountOldFaceSevere =
+            [&]
+            (
+                const label oldFaceI,
+                label& severeCount,
+                bool& badInvalid
+            ) -> bool
+            {
+                if
+                (
+                    oldFaceI < 0
+                 || oldFaceI >= v57OldFaceCount
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                const label own =
+                    v57Owner[oldFaceI];
+
+                const label nei =
+                    v57Neighbour[oldFaceI];
+
+                if
+                (
+                    own < 0
+                 || own >= label(cells.size())
+                 || nei < -1
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                // Uncoupled boundary faces are not part of the
+                // internal-face non-orthogonality population.
+                if( nei < 0 )
+                    return true;
+
+                point ownCc(vector::zero);
+                point neiCc(vector::zero);
+
+                scalar ownVol = scalar(0);
+                scalar neiVol = scalar(0);
+
+                if
+                (
+                    !v57VirtualCellCentreVolume
+                    (
+                        own,
+                        ownCc,
+                        ownVol
+                    )
+                 || !v57VirtualCellCentreVolume
+                    (
+                        nei,
+                        neiCc,
+                        neiVol
+                    )
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                const vector d =
+                    neiCc-ownCc;
+
+                const bool split =
+                (
+                    oldFaceI < v57NInternal
+                 && v57Selected[oldFaceI]
+                );
+
+                if( !split )
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            0,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    const scalar dDotS =
+                        (d & fa)
+                       /(
+                            mag(d)*mag(fa)
+                          + vSmall
+                        );
+
+                    if( !std::isfinite(dDotS) )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    if
+                    (
+                        dDotS
+                      < v57SevereNonOrthThreshold
+                    )
+                    {
+                        ++severeCount;
+                    }
+
+                    return true;
+                }
+
+                // Selected old quad: four prospective triangles.
+                for(label pieceI=0; pieceI<4; ++pieceI)
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            pieceI,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    const scalar dDotS =
+                        (d & fa)
+                       /(
+                            mag(d)*mag(fa)
+                          + vSmall
+                        );
+
+                    if( !std::isfinite(dDotS) )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    if
+                    (
+                        dDotS
+                      < v57SevereNonOrthThreshold
+                    )
+                    {
+                        ++severeCount;
+                    }
+                }
+
+                return true;
+            };
+
+
+            auto v57CountLocalSevere =
+            [&]
+            (
+                const label own,
+                const label nei,
+                label& severeCount,
+                bool& badInvalid
+            ) -> bool
+            {
+                severeCount = 0;
+                badInvalid = false;
+
+                if
+                (
+                    own < 0
+                 || nei < 0
+                 || own >= label(cells.size())
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                const cell& ownCell =
+                    cells[own];
+
+                const cell& neiCell =
+                    cells[nei];
+
+                // Count all old faces incident on owner.
+                forAll(ownCell, cfI)
+                {
+                    if
+                    (
+                        !v57CountOldFaceSevere
+                        (
+                            ownCell[cfI],
+                            severeCount,
+                            badInvalid
+                        )
+                    )
+                    {
+                        return false;
+                    }
+                }
+
+                // Count neighbour-cell faces not already present in
+                // ownerCell.  This prevents counting their shared
+                // interface twice.
+                forAll(neiCell, cfI)
+                {
+                    const label oldFaceI =
+                        neiCell[cfI];
+
+                    bool alreadyCounted = false;
+
+                    forAll(ownCell, ownCfI)
+                    {
+                        if
+                        (
+                            ownCell[ownCfI]
+                         == oldFaceI
+                        )
+                        {
+                            alreadyCounted = true;
+                            break;
+                        }
+                    }
+
+                    if( alreadyCounted )
+                        continue;
+
+                    if
+                    (
+                        !v57CountOldFaceSevere
+                        (
+                            oldFaceI,
+                            severeCount,
+                            badInvalid
+                        )
+                    )
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            };
+
+
+            label v57SoftEvaluated = 0;
+            label v57SoftAccepted = 0;
+            label v57SoftRejected = 0;
+            label v57SoftRejectInvalid = 0;
+            label v57SoftRejectSevereIncrease = 0;
+
+            label v57SoftRejectAddedSevereFaces = 0;
+            label v57SoftRejectMaxAddedSevere = 0;
+
+
+            // ---------------------------------------------------------
+            // Exact local transaction for a tentative candidate.
+            //
+            // The caller has already set v57Selected[faceI]=true.
+            //
+            // Auditing every old face incident on owner and neighbour is
+            // important: changing either cell centre can make an UNCHANGED
+            // neighbouring face fail a pyramid or non-orthogonality test.
+            //
+            // Previously selected fans on these cells are automatically
+            // re-evaluated using the updated accumulated virtual centres.
+            // ---------------------------------------------------------
+
+            auto v57CandidateHardSafe =
+            [&]
+            (
+                const label own,
+                const label nei,
+                bool& badInvalid,
+                bool& badVolume,
+                bool& badPyramid,
+                bool& badNonOrth
+            ) -> bool
+            {
+                badInvalid = false;
+                badVolume = false;
+                badPyramid = false;
+                badNonOrth = false;
+
+                if
+                (
+                    own < 0
+                 || nei < 0
+                 || own >= label(cells.size())
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                point ownCc(vector::zero);
+                point neiCc(vector::zero);
+
+                scalar ownVol = scalar(0);
+                scalar neiVol = scalar(0);
+
+                if
+                (
+                    !v57VirtualCellCentreVolume
+                    (
+                        own,
+                        ownCc,
+                        ownVol
+                    )
+                 || !v57VirtualCellCentreVolume
+                    (
+                        nei,
+                        neiCc,
+                        neiVol
+                    )
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                if
+                (
+                    ownVol <= scalar(0)
+                 || neiVol <= scalar(0)
+                )
+                    badVolume = true;
+
+                const cell& ownCell =
+                    cells[own];
+
+                forAll(ownCell, cfI)
+                {
+                    v57AuditOldFaceHard
+                    (
+                        ownCell[cfI],
+                        badInvalid,
+                        badVolume,
+                        badPyramid,
+                        badNonOrth
+                    );
+
+                    if( badInvalid )
+                        break;
+                }
+
+                if( !badInvalid )
+                {
+                    const cell& neiCell =
+                        cells[nei];
+
+                    forAll(neiCell, cfI)
+                    {
+                        v57AuditOldFaceHard
+                        (
+                            neiCell[cfI],
+                            badInvalid,
+                            badVolume,
+                            badPyramid,
+                            badNonOrth
+                        );
+
+                        if( badInvalid )
+                            break;
+                    }
+                }
+
+                return
+                (
+                    !badInvalid
+                 && !badVolume
+                 && !badPyramid
+                 && !badNonOrth
+                );
+            };
+
+
+            // Selection pass against the frozen pre-fan topology.
+                //
+                // Restriction to equal cellToBaseBndFace_ provenance
+                // isolates successive children of the same BL column,
+                // rather than side faces between neighbouring columns.
+                // -----------------------------------------------------
+
+                for
+                (
+                    label faceI = 0;
+                    faceI < v57NInternal;
+                    ++faceI
+                )
+                {
+                    const face& f = faces[faceI];
+
+                    if( f.size() != 4 )
+                        continue;
+
+                    const label own = v57Owner[faceI];
+                    const label nei = v57Neighbour[faceI];
+
+                    if
+                    (
+                        own < 0
+                     || nei < 0
+                     || own >= label(cells.size())
+                     || nei >= label(cells.size())
+                    )
+                        continue;
+
+                    if
+                    (
+                        cells[own].size() != 6
+                     || cells[nei].size() != 6
+                    )
+                    {
+                        ++v57NotSix;
+                        continue;
+                    }
+
+                    if
+                    (
+                        own >= label(cellToBaseBndFace_.size())
+                     || nei >= label(cellToBaseBndFace_.size())
+                    )
+                    {
+                        ++v57NotSameColumn;
+                        continue;
+                    }
+
+                    const label ownBf =
+                        cellToBaseBndFace_[own];
+
+                    const label neiBf =
+                        cellToBaseBndFace_[nei];
+
+                    if
+                    (
+                        ownBf < 0
+                     || neiBf < 0
+                     || ownBf != neiBf
+                    )
+                    {
+                        ++v57NotSameColumn;
+                        continue;
+                    }
+
+                    ++v57RegularColumnQuads;
+
+                    const point& p0 = v57Points[f[0]];
+                    const point& p1 = v57Points[f[1]];
+                    const point& p2 = v57Points[f[2]];
+                    const point& p3 = v57Points[f[3]];
+
+                    const vector n012 =
+                        (p1-p0) ^ (p2-p0);
+
+                    const vector n023 =
+                        (p2-p0) ^ (p3-p0);
+
+                    const vector n013 =
+                        (p1-p0) ^ (p3-p0);
+
+                    const vector n123 =
+                        (p2-p1) ^ (p3-p1);
+
+                    const scalar m012 = mag(n012);
+                    const scalar m023 = mag(n023);
+                    const scalar m013 = mag(n013);
+                    const scalar m123 = mag(n123);
+
+                    if
+                    (
+                        m012 <= rootVSmall
+                     || m023 <= rootVSmall
+                     || m013 <= rootVSmall
+                     || m123 <= rootVSmall
+                    )
+                    {
+                        ++v57Degenerate;
+                        continue;
+                    }
+
+                    // -------------------------------------------------
+                    // Exact physical sign analogue of the OpenFOAM
+                    // shared-base test for the two quad diagonals.
+                    //
+                    // Face winding is owner -> neighbour.
+                    // Correct owner side     => negative signed distance.
+                    // Correct neighbour side => positive signed distance.
+                    // -------------------------------------------------
+
+                    const scalar own012 =
+                        (
+                            (v57CellCentres[own]-p0)
+                          & n012
+                        ) / m012;
+
+                    const scalar own023 =
+                        (
+                            (v57CellCentres[own]-p0)
+                          & n023
+                        ) / m023;
+
+                    const scalar nei012 =
+                        (
+                            (v57CellCentres[nei]-p0)
+                          & n012
+                        ) / m012;
+
+                    const scalar nei023 =
+                        (
+                            (v57CellCentres[nei]-p0)
+                          & n023
+                        ) / m023;
+
+                    const scalar diag02Owner =
+                        Foam::min(-own012, -own023);
+
+                    const scalar diag02Neighbour =
+                        Foam::min(nei012, nei023);
+
+                    const scalar diag02Common =
+                        Foam::min
+                        (
+                            diag02Owner,
+                            diag02Neighbour
+                        );
+
+                    const scalar own013 =
+                        (
+                            (v57CellCentres[own]-p0)
+                          & n013
+                        ) / m013;
+
+                    const scalar own123 =
+                        (
+                            (v57CellCentres[own]-p1)
+                          & n123
+                        ) / m123;
+
+                    const scalar nei013 =
+                        (
+                            (v57CellCentres[nei]-p0)
+                          & n013
+                        ) / m013;
+
+                    const scalar nei123 =
+                        (
+                            (v57CellCentres[nei]-p1)
+                          & n123
+                        ) / m123;
+
+                    const scalar diag13Owner =
+                        Foam::min(-own013, -own123);
+
+                    const scalar diag13Neighbour =
+                        Foam::min(nei013, nei123);
+
+                    const scalar diag13Common =
+                        Foam::min
+                        (
+                            diag13Owner,
+                            diag13Neighbour
+                        );
+
+                    const scalar originalBestCommon =
+                        Foam::max
+                        (
+                            diag02Common,
+                            diag13Common
+                        );
+
+                    // Existing quad already has a physical shared base.
+                    if( originalBestCommon > scalar(0) )
+                        continue;
+
+                    ++v57PhysicalFail;
+
+                    // -------------------------------------------------
+                    // Virtual four-triangle fan through the EXISTING
+                    // OpenFOAM face centre.
+                    // -------------------------------------------------
+
+                    const point fc =
+                        v57FaceCentres[faceI];
+
+                    scalar fanCommon = GREAT;
+                    bool fanValid = true;
+
+                    for(label fp=0; fp<4; ++fp)
+                    {
+                        const point& a =
+                            v57Points[f[fp]];
+
+                        const point& b =
+                            v57Points[f[(fp+1)%4]];
+
+                        const vector fn =
+                            (b-a) ^ (fc-a);
+
+                        const scalar fm =
+                            mag(fn);
+
+                        if( fm <= rootVSmall )
+                        {
+                            fanValid = false;
+                            break;
+                        }
+
+                        const scalar ownSigned =
+                            (
+                                (v57CellCentres[own]-a)
+                              & fn
+                            ) / fm;
+
+                        const scalar neiSigned =
+                            (
+                                (v57CellCentres[nei]-a)
+                              & fn
+                            ) / fm;
+
+                        const scalar thisCommon =
+                            Foam::min
+                            (
+                                -ownSigned,
+                                neiSigned
+                            );
+
+                        fanCommon =
+                            Foam::min
+                            (
+                                fanCommon,
+                                thisCommon
+                            );
+                    }
+
+                    if
+                    (
+                        !fanValid
+                     || !(fanCommon > scalar(0))
+                    )
+                        continue;
+
+                    ++v57Recoverable;
+
+                    // -------------------------------------------------
+                    // V5.7c accumulated hard + incremental severe
+                    // non-orthogonality admission.
+                    //
+                    // Candidate sequence:
+                    //
+                    //   current accumulated topology
+                    //       -> tentative fan
+                    //       -> existing V5.7b hard audit
+                    //       -> severe count before/after
+                    //
+                    // Reject the candidate only if it creates a net
+                    // increase in the exact local OpenFOAM >70-degree
+                    // face population.
+                    // -------------------------------------------------
+                    if( v57SelectedCount < v57ApplyCap )
+                    {
+                        ++v57HardEvaluated;
+
+                        // Tentative transaction.  No actual mesh topology
+                        // has changed yet.
+                        v57Selected[faceI] = true;
+
+                        bool hardInvalid = false;
+                        bool hardVolume = false;
+                        bool hardPyramid = false;
+                        bool hardNonOrth = false;
+
+                        const bool hardSafe =
+                            v57CandidateHardSafe
+                            (
+                                own,
+                                nei,
+                                hardInvalid,
+                                hardVolume,
+                                hardPyramid,
+                                hardNonOrth
+                            );
+
+                        if( !hardSafe )
+                        {
+                            // Exact prospective rollback.
+                            v57Selected[faceI] = false;
+
+                            ++v57HardRejected;
+
+                            if( hardInvalid )
+                                ++v57HardRejectInvalid;
+
+                            if( hardVolume )
+                                ++v57HardRejectVolume;
+
+                            if( hardPyramid )
+                                ++v57HardRejectPyramid;
+
+                            if( hardNonOrth )
+                                ++v57HardRejectNonOrth;
+
+                            continue;
+                        }
+
+                        ++v57HardSafe;
+                        ++v57SoftEvaluated;
+
+                        // -------------------------------------------------
+                        // Baseline accumulated state BEFORE this fan.
+                        //
+                        // Previously accepted fans remain selected.
+                        // Only this candidate is temporarily rolled back.
+                        // -------------------------------------------------
+                        v57Selected[faceI] = false;
+
+                        label severeBefore = 0;
+                        bool severeBeforeInvalid = false;
+
+                        const bool severeBeforeOk =
+                            v57CountLocalSevere
+                            (
+                                own,
+                                nei,
+                                severeBefore,
+                                severeBeforeInvalid
+                            );
+
+                        if
+                        (
+                            !severeBeforeOk
+                         || severeBeforeInvalid
+                        )
+                        {
+                            ++v57SoftRejected;
+                            ++v57SoftRejectInvalid;
+
+                            // Candidate remains rolled back.
+                            continue;
+                        }
+
+                        // -------------------------------------------------
+                        // Exact accumulated state AFTER this fan.
+                        // -------------------------------------------------
+                        v57Selected[faceI] = true;
+
+                        label severeAfter = 0;
+                        bool severeAfterInvalid = false;
+
+                        const bool severeAfterOk =
+                            v57CountLocalSevere
+                            (
+                                own,
+                                nei,
+                                severeAfter,
+                                severeAfterInvalid
+                            );
+
+                        if
+                        (
+                            !severeAfterOk
+                         || severeAfterInvalid
+                        )
+                        {
+                            v57Selected[faceI] = false;
+
+                            ++v57SoftRejected;
+                            ++v57SoftRejectInvalid;
+
+                            continue;
+                        }
+
+                        if( severeAfter > severeBefore )
+                        {
+                            const label addedSevere =
+                                severeAfter-severeBefore;
+
+                            v57Selected[faceI] = false;
+
+                            ++v57SoftRejected;
+                            ++v57SoftRejectSevereIncrease;
+
+                            v57SoftRejectAddedSevereFaces +=
+                                addedSevere;
+
+                            v57SoftRejectMaxAddedSevere =
+                                Foam::max
+                                (
+                                    v57SoftRejectMaxAddedSevere,
+                                    addedSevere
+                                );
+
+                            continue;
+                        }
+
+                        ++v57SoftAccepted;
+                        ++v57SelectedCount;
+
+                        v57SelectedClearMin =
+                            Foam::min
+                            (
+                                v57SelectedClearMin,
+                                fanCommon
+                            );
+
+                        v57SelectedClearMax =
+                            Foam::max
+                            (
+                                v57SelectedClearMax,
+                                fanCommon
+                            );
+
+                        v57SelectedClearSum += fanCommon;
+                    }
+                }
+
+                Info
+                    << "CFMITCH V5.7c QUAD-FAN SELECT:"
+                    << " regularColumnQuads="
+                    << v57RegularColumnQuads
+                    << " physicalFail=" << v57PhysicalFail
+                    << " recoverable=" << v57Recoverable
+                    << " hardEvaluated=" << v57HardEvaluated
+                    << " hardSafe=" << v57HardSafe
+                    << " hardRejected=" << v57HardRejected
+                    << " hardRejectInvalid=" << v57HardRejectInvalid
+                    << " hardRejectVolume=" << v57HardRejectVolume
+                    << " hardRejectPyramid=" << v57HardRejectPyramid
+                    << " hardRejectNonOrth=" << v57HardRejectNonOrth
+                    << " softEvaluated=" << v57SoftEvaluated
+                    << " softAccepted=" << v57SoftAccepted
+                    << " softRejected=" << v57SoftRejected
+                    << " softRejectInvalid=" << v57SoftRejectInvalid
+                    << " softRejectSevereIncrease="
+                    << v57SoftRejectSevereIncrease
+                    << " softRejectAddedSevereFaces="
+                    << v57SoftRejectAddedSevereFaces
+                    << " softRejectMaxAddedSevere="
+                    << v57SoftRejectMaxAddedSevere
+                    << " selected=" << v57SelectedCount
+                    << " cap=" << v57ApplyCap
+                    << " degenerate=" << v57Degenerate
+                    << " notSix=" << v57NotSix
+                    << " notSameColumn=" << v57NotSameColumn
+                    << " selectedClearMin="
+                    << (
+                           v57SelectedCount
+                         ? v57SelectedClearMin
+                         : scalar(0)
+                       )
+                    << " selectedClearAvg="
+                    << (
+                           v57SelectedCount
+                         ? v57SelectedClearSum
+                          /scalar(v57SelectedCount)
+                         : scalar(0)
+                       )
+                    << " selectedClearMax="
+                    << (
+                           v57SelectedCount
+                         ? v57SelectedClearMax
+                         : scalar(0)
+                       )
+                    << endl;
+
+                if( v57SelectedCount > 0 )
+                {
+                    // -------------------------------------------------
+                    // Prefix number of selected old internal faces.
+                    //
+                    // An unsplit old face maps to:
+                    //
+                    //   oldI + 3*(number of selected faces before oldI)
+                    //
+                    // A split face maps to four consecutive positions
+                    // beginning at that same location.
+                    // -------------------------------------------------
+
+                    labelList v57Prefix
+                    (
+                        v57NInternal + 1,
+                        0
+                    );
+
+                    for
+                    (
+                        label faceI=0;
+                        faceI<v57NInternal;
+                        ++faceI
+                    )
+                    {
+                        v57Prefix[faceI+1] =
+                            v57Prefix[faceI]
+                          + (
+                                v57Selected[faceI]
+                              ? label(1)
+                              : label(0)
+                            );
+                    }
+
+                    const label v57NFan =
+                        v57Prefix[v57NInternal];
+
+                    if( v57NFan != v57SelectedCount )
+                    {
+                        refinementValid_ = false;
+
+                        WarningIn
+                        (
+                            "void refineBoundaryLayers::generateNewCells()"
+                        )
+                            << "CFMITCH V5.7a prefix mismatch:"
+                            << " selected=" << v57SelectedCount
+                            << " prefix=" << v57NFan
+                            << endl;
+
+                        return;
+                    }
+
+                    labelList v57OldToNew
+                    (
+                        v57OldFaceCount,
+                        -1
+                    );
+
+                    labelList v57FanBase
+                    (
+                        v57NInternal,
+                        -1
+                    );
+
+                    labelList v57FanPoint
+                    (
+                        v57NInternal,
+                        -1
+                    );
+
+                    // -------------------------------------------------
+                    // Append one fan point per selected quad.
+                    // -------------------------------------------------
+
+                    const label v57NewPointCount =
+                        v57OldPointCount + v57NFan;
+
+                    v57Points.setSize(v57NewPointCount);
+
+                    label v57PointCursor =
+                        v57OldPointCount;
+
+                    for
+                    (
+                        label faceI=0;
+                        faceI<v57NInternal;
+                        ++faceI
+                    )
+                    {
+                        if( !v57Selected[faceI] )
+                            continue;
+
+                        v57FanPoint[faceI] =
+                            v57PointCursor;
+
+                        v57Points[v57PointCursor] =
+                            v57FaceCentres[faceI];
+
+                        ++v57PointCursor;
+                    }
+
+                    if( v57PointCursor != v57NewPointCount )
+                    {
+                        refinementValid_ = false;
+
+                        WarningIn
+                        (
+                            "void refineBoundaryLayers::generateNewCells()"
+                        )
+                            << "CFMITCH V5.7a point allocation mismatch"
+                            << endl;
+
+                        return;
+                    }
+
+                    // -------------------------------------------------
+                    // Establish old -> new face labels.
+                    // -------------------------------------------------
+
+                    for
+                    (
+                        label faceI=0;
+                        faceI<v57NInternal;
+                        ++faceI
+                    )
+                    {
+                        const label base =
+                            faceI
+                          + 3*v57Prefix[faceI];
+
+                        v57OldToNew[faceI] = base;
+
+                        if( v57Selected[faceI] )
+                            v57FanBase[faceI] = base;
+                    }
+
+                    for
+                    (
+                        label faceI=v57NInternal;
+                        faceI<v57OldFaceCount;
+                        ++faceI
+                    )
+                    {
+                        v57OldToNew[faceI] =
+                            faceI + 3*v57NFan;
+                    }
+
+                    const label v57NewInternal =
+                        v57NInternal + 3*v57NFan;
+
+                    const label v57NewFaceCount =
+                        v57OldFaceCount + 3*v57NFan;
+
+                    // -------------------------------------------------
+                    // Resize face array.
+                    //
+                    // Move boundary block first, from the back, so no
+                    // source face is overwritten.
+                    // -------------------------------------------------
+
+                    faces.setSize(v57NewFaceCount);
+
+                    for
+                    (
+                        label oldFaceI=v57OldFaceCount-1;
+                        oldFaceI>=v57NInternal;
+                        --oldFaceI
+                    )
+                    {
+                        const label newFaceI =
+                            v57OldToNew[oldFaceI];
+
+                        if( newFaceI != oldFaceI )
+                        {
+                            faces[newFaceI].transfer
+                            (
+                                faces[oldFaceI]
+                            );
+                        }
+                    }
+
+                    // -------------------------------------------------
+                    // Rebuild internal face block from the back.
+                    // -------------------------------------------------
+
+                    for
+                    (
+                        label oldFaceI=v57NInternal-1;
+                        oldFaceI>=0;
+                        --oldFaceI
+                    )
+                    {
+                        const label newBase =
+                            v57OldToNew[oldFaceI];
+
+                        if( !v57Selected[oldFaceI] )
+                        {
+                            if( newBase != oldFaceI )
+                            {
+                                faces[newBase].transfer
+                                (
+                                    faces[oldFaceI]
+                                );
+                            }
+
+                            continue;
+                        }
+
+                        const face oldFace
+                        (
+                            faces[oldFaceI]
+                        );
+
+                        if( oldFace.size() != 4 )
+                        {
+                            refinementValid_ = false;
+
+                            WarningIn
+                            (
+                                "void refineBoundaryLayers::generateNewCells()"
+                            )
+                                << "CFMITCH V5.7a selected non-quad:"
+                                << " face=" << oldFaceI
+                                << " size=" << oldFace.size()
+                                << endl;
+
+                            return;
+                        }
+
+                        const label x =
+                            v57FanPoint[oldFaceI];
+
+                        // Triangle 0: p0 p1 x
+                        faces[newBase+0].setSize(3);
+                        faces[newBase+0][0] = oldFace[0];
+                        faces[newBase+0][1] = oldFace[1];
+                        faces[newBase+0][2] = x;
+
+                        // Triangle 1: p1 p2 x
+                        faces[newBase+1].setSize(3);
+                        faces[newBase+1][0] = oldFace[1];
+                        faces[newBase+1][1] = oldFace[2];
+                        faces[newBase+1][2] = x;
+
+                        // Triangle 2: p2 p3 x
+                        faces[newBase+2].setSize(3);
+                        faces[newBase+2][0] = oldFace[2];
+                        faces[newBase+2][1] = oldFace[3];
+                        faces[newBase+2][2] = x;
+
+                        // Triangle 3: p3 p0 x
+                        faces[newBase+3].setSize(3);
+                        faces[newBase+3][0] = oldFace[3];
+                        faces[newBase+3][1] = oldFace[0];
+                        faces[newBase+3][2] = x;
+                    }
+
+                    // -------------------------------------------------
+                    // Replace each selected old face by all four sibling
+                    // triangles in every incident cell.
+                    //
+                    // Cell count is unchanged.
+                    // -------------------------------------------------
+
+                    forAll(cells, cellI)
+                    {
+                        const cell oldCell
+                        (
+                            cells[cellI]
+                        );
+
+                        label nSelectedInCell = 0;
+
+                        forAll(oldCell, cfI)
+                        {
+                            const label oldFaceI =
+                                oldCell[cfI];
+
+                            if
+                            (
+                                oldFaceI >= 0
+                             && oldFaceI < v57NInternal
+                             && v57Selected[oldFaceI]
+                            )
+                            {
+                                ++nSelectedInCell;
+                            }
+                        }
+
+                        cell& c =
+                            cells[cellI];
+
+                        c.setSize
+                        (
+                            oldCell.size()
+                          + 3*nSelectedInCell
+                        );
+
+                        label writeI = 0;
+
+                        forAll(oldCell, cfI)
+                        {
+                            const label oldFaceI =
+                                oldCell[cfI];
+
+                            if
+                            (
+                                oldFaceI < 0
+                             || oldFaceI >= v57OldFaceCount
+                            )
+                            {
+                                refinementValid_ = false;
+
+                                WarningIn
+                                (
+                                    "void refineBoundaryLayers::generateNewCells()"
+                                )
+                                    << "CFMITCH V5.7a bad old face ref:"
+                                    << " cell=" << cellI
+                                    << " face=" << oldFaceI
+                                    << endl;
+
+                                return;
+                            }
+
+                            if
+                            (
+                                oldFaceI < v57NInternal
+                             && v57Selected[oldFaceI]
+                            )
+                            {
+                                const label base =
+                                    v57FanBase[oldFaceI];
+
+                                c[writeI++] = base+0;
+                                c[writeI++] = base+1;
+                                c[writeI++] = base+2;
+                                c[writeI++] = base+3;
+                            }
+                            else
+                            {
+                                c[writeI++] =
+                                    v57OldToNew[oldFaceI];
+                            }
+                        }
+
+                        if( writeI != c.size() )
+                        {
+                            refinementValid_ = false;
+
+                            WarningIn
+                            (
+                                "void refineBoundaryLayers::generateNewCells()"
+                            )
+                                << "CFMITCH V5.7a cell rewrite mismatch:"
+                                << " cell=" << cellI
+                                << " expected=" << c.size()
+                                << " wrote=" << writeI
+                                << endl;
+
+                            return;
+                        }
+                    }
+
+                    // -------------------------------------------------
+                    // Existing boundary faces were shifted en bloc by
+                    // +3*nFan.  Patch sizes remain unchanged.
+                    // -------------------------------------------------
+
+                    forAll(boundaries, patchI)
+                    {
+                        boundaries[patchI].patchStart() +=
+                            3*v57NFan;
+                    }
+
+                    // Existing face subsets must follow shifted labels.
+                    // For a split face, the original subset lineage maps
+                    // to the first sibling triangle in V5.7a.
+                    mesh_.updateFaceSubsets(v57OldToNew);
+
+                    // Existing V4.5 gate below checks this value as well.
+                    currFace = faces.size();
+
+                    // Invalidate owner/neighbour/geometric addressing for
+                    // the new point/face/cell topology.
+                    meshModifier.clearAll();
+
+                    Info
+                        << "CFMITCH V5.7a QUAD-FAN APPLY:"
+                        << " applied=" << v57NFan
+                        << " oldPoints=" << v57OldPointCount
+                        << " newPoints=" << v57Points.size()
+                        << " oldFaces=" << v57OldFaceCount
+                        << " newFaces=" << faces.size()
+                        << " oldInternal=" << v57NInternal
+                        << " newInternal=" << v57NewInternal
+                        << " cells=" << cells.size()
+                        << " expectedFaceDelta=" << 3*v57NFan
+                        << " expectedPointDelta=" << v57NFan
+                        << endl;
+                }
+                else
+                {
+                    // We invalidated addressing before selection.
+                    // No topology changed, but leave caches clean.
+                    meshModifier.clearAll();
+                }
+            }
+        }
+    }
+
+    // REFINE_POST_RELABEL_CLOSURE_AUDIT
+    // Diagnostic only. At this point cells reference the reconstructed
+    // mesh face list, so test the actual committed cell shells.
+    {
+        labelLongList badCellIds;
+        label nBadEdgesTotal = 0;
+        label nBadFaceRefs = 0;
+        label nDegenerateFaces = 0;
+
+        forAll(cells, cellI)
+        {
+            const cell& c = cells[cellI];
+
+            std::map<std::pair<label,label>, label> edgeUse;
+
+            bool bad = false;
+            label badEdgesThisCell = 0;
+
+            forAll(c, cfI)
+            {
+                const label faceI = c[cfI];
+
+                if( faceI < 0 || faceI >= faces.size() )
+                {
+                    bad = true;
+                    ++nBadFaceRefs;
+                    continue;
+                }
+
+                const face& f = faces[faceI];
+
+                if( f.size() < 3 )
+                {
+                    bad = true;
+                    ++nDegenerateFaces;
+                    continue;
+                }
+
+                forAll(f, pI)
+                {
+                    const label a = f[pI];
+                    const label b = f[(pI+1)%f.size()];
+
+                    if( a == b )
+                        bad = true;
+
+                    ++edgeUse
+                    [
+                        std::make_pair
+                        (
+                            Foam::min(a,b),
+                            Foam::max(a,b)
+                        )
+                    ];
+                }
+            }
+
+            for
+            (
+                std::map<std::pair<label,label>, label>::const_iterator
+                    iter=edgeUse.begin();
+                iter!=edgeUse.end();
+                ++iter
+            )
+            {
+                if( iter->second != 2 )
+                {
+                    bad = true;
+                    ++badEdgesThisCell;
+                }
+            }
+
+            if( bad )
+            {
+                badCellIds.append(cellI);
+                nBadEdgesTotal += badEdgesThisCell;
+            }
+        }
+
+        Info << "REFINE_POST_RELABEL_CLOSURE"
+             << " cells=" << cells.size()
+             << " badCells=" << badCellIds.size()
+             << " badEdges=" << nBadEdgesTotal
+             << " badFaceRefs=" << nBadFaceRefs
+             << " degenerateFaces=" << nDegenerateFaces
+             << endl;
+
+        if( badCellIds.size() )
+        {
+            Info << "REFINE_POST_RELABEL_BAD_IDS ids=(";
+
+            const label nPrint =
+                Foam::min(label(badCellIds.size()), label(100));
+
+            for(label i=0; i<nPrint; ++i)
+            {
+                if( i ) Info << ',';
+                Info << badCellIds[i];
+            }
+
+            if( badCellIds.size() > nPrint )
+                Info << ",...";
+
+            Info << ')' << endl;
+        }
+    }
+
     # ifdef DEBUGLayer
     Pout << "Cleaning mesh " << endl;
     # endif
 
     //- delete all adressing which is no longer up-to-date
+
+    Info
+        << "CFMITCH V10I TYPE2 BIRTH SUMMARY:"
+        << " invocation=" << v10iInvocation
+        << " file=" << v10iCsvName
+        << " parents=" << v10iType2Parents
+        << " children=" << v10iType2Children
+        << " finalCells=" << cells.size()
+        << endl;
+
+    Info
+        << "CFMITCH V10J TYPE1 CROSS_PATCH SUMMARY:"
+        << " invocation=" << v10iInvocation
+        << " file=" << v10jCsvName
+        << " originalInterfaces="
+        << v10jCrossPatchOriginalFaces
+        << " originalParents="
+        << v10jCrossPatchOriginalParents.size()
+        << " recordedParents="
+        << v10jRecordedParents
+        << " recordedChildren="
+        << v10jRecordedChildren
+        << " finalCells="
+        << cells.size()
+        << endl;
+
+    // ==================================================================
+    // CFMITCH V4.5 FINAL FACE-INCIDENCE GATE
+    //
+    // Cell-shell closure alone does not prove that the final global
+    // topology is valid.  Every final internal face must appear in
+    // exactly two cells and every boundary face in exactly one.
+    //
+    // This check runs after final face relabeling and cell-face remapping
+    // but before addressing caches are rebuilt from the committed mesh.
+    // ==================================================================
+    {
+        labelLongList finalFaceUse(faces.size());
+        labelLongList finalFirstCell(faces.size());
+
+        forAll(finalFaceUse, faceI)
+        {
+            finalFaceUse[faceI] = 0;
+            finalFirstCell[faceI] = -1;
+        }
+
+        label nBadCellFaceRefs = 0;
+
+        forAll(cells, cellI)
+        {
+            const cell& c = cells[cellI];
+
+            forAll(c, cfI)
+            {
+                const label faceI = c[cfI];
+
+                if
+                (
+                    faceI < 0
+                 || faceI >= label(faces.size())
+                )
+                {
+                    ++nBadCellFaceRefs;
+                    continue;
+                }
+
+                if( finalFaceUse[faceI] == 0 )
+                    finalFirstCell[faceI] = cellI;
+
+                ++finalFaceUse[faceI];
+            }
+        }
+
+        const label finalBoundaryStart =
+            boundaries.size()
+          ? boundaries[0].patchStart()
+          : label(faces.size());
+
+        label nInternalUseBad = 0;
+        label nBoundaryUseBad = 0;
+
+        label nUse0 = 0;
+        label nUse1 = 0;
+        label nUse2 = 0;
+        label nUse3Plus = 0;
+
+        label nBadPrinted = 0;
+        label firstBadInternalFace = -1;
+        label firstBadBoundaryFace = -1;
+
+        forAll(finalFaceUse, faceI)
+        {
+            const label nUse = finalFaceUse[faceI];
+
+            if( nUse == 0 )
+                ++nUse0;
+            else if( nUse == 1 )
+                ++nUse1;
+            else if( nUse == 2 )
+                ++nUse2;
+            else
+                ++nUse3Plus;
+
+            const label expectedUse =
+                faceI < finalBoundaryStart ? 2 : 1;
+
+            if( nUse == expectedUse )
+                continue;
+
+            if( faceI < finalBoundaryStart )
+            {
+                ++nInternalUseBad;
+
+                if( firstBadInternalFace < 0 )
+                    firstBadInternalFace = faceI;
+            }
+            else
+            {
+                ++nBoundaryUseBad;
+
+                if( firstBadBoundaryFace < 0 )
+                    firstBadBoundaryFace = faceI;
+            }
+
+            if( nBadPrinted < 40 )
+            {
+                Info
+                    << "CFMITCH V4.5 FACE INCIDENCE BAD:"
+                    << " face=" << faceI
+                    << " class="
+                    << (
+                           faceI < finalBoundaryStart
+                         ? "internal"
+                         : "boundary"
+                       )
+                    << " expectedUse=" << expectedUse
+                    << " actualUse=" << nUse
+                    << " firstCell=" << finalFirstCell[faceI]
+                    << " points=" << faces[faceI]
+                    << endl;
+
+                ++nBadPrinted;
+            }
+        }
+
+        const bool finalFaceIncidenceValid =
+            nBadCellFaceRefs == 0
+         && nInternalUseBad == 0
+         && nBoundaryUseBad == 0
+         && currFace == label(faces.size());
+
+        Info
+            << "CFMITCH V4.5 FINAL FACE INCIDENCE:"
+            << " valid="
+            << (finalFaceIncidenceValid ? "yes" : "no")
+            << " faces=" << faces.size()
+            << " currFace=" << currFace
+            << " boundaryStart=" << finalBoundaryStart
+            << " use0=" << nUse0
+            << " use1=" << nUse1
+            << " use2=" << nUse2
+            << " use3plus=" << nUse3Plus
+            << " badInternal=" << nInternalUseBad
+            << " badBoundary=" << nBoundaryUseBad
+            << " badCellFaceRefs=" << nBadCellFaceRefs
+            << " firstBadInternal=" << firstBadInternalFace
+            << " firstBadBoundary=" << firstBadBoundaryFace
+            << endl;
+
+        if( !finalFaceIncidenceValid )
+        {
+            refinementValid_ = false;
+
+            WarningIn
+            (
+                "void refineBoundaryLayers::generateNewCells()"
+            )
+                << "CFMITCH V4.5 FINAL FACE INCIDENCE REJECT:"
+                << " refusing to commit globally inconsistent "
+                << "owner/neighbour topology"
+                << endl;
+
+            return;
+        }
+    }
+
     meshModifier.clearAll();
     deleteDemandDrivenData(msePtr_);
+
+    // REFINE_EXACT_VOLUME_BIRTH_AUDIT
+    //
+    // Diagnostic only.
+    //
+    // Reproduce polyMeshGenChecks::checkCellVolumes() exactly, immediately
+    // after generateNewCells() has finalized face labels, winding, and
+    // owner/neighbour topology.
+    //
+    // This is deliberately NOT based on the positive/clamped addressing
+    // cellVolumes() cache.
+    {
+        const vectorField& exactFCtrs =
+            mesh_.addressingData().faceCentres();
+
+        const vectorField& exactFAreas =
+            mesh_.addressingData().faceAreas();
+
+        const labelList& exactOwner =
+            mesh_.owner();
+
+        const cellListPMG& exactCells =
+            mesh_.cells();
+
+        label nBelowVSmall = 0;
+        label nTrueNegative = 0;
+
+        label nType1Checked = 0;
+        label nType1BelowVSmall = 0;
+        label nType1TrueNegative = 0;
+
+        label nDetailedPrinted = 0;
+
+        // BL_VALIDITY_REPAIR_V1C
+        // True-negative generated type-1 children discovered by the
+        // existing exact-volume parity scan.
+        DynList<label, 32> blV1NegativeType1Cells;
+
+        scalar minVolume = GREAT;
+        scalar minType1Volume = GREAT;
+
+        forAll(exactCells, exactCellI)
+        {
+            const cell& ec = exactCells[exactCellI];
+
+            if( ec.size() == 0 )
+                continue;
+
+            vector cEst(vector::zero);
+
+            forAll(ec, fI)
+                cEst += exactFCtrs[ec[fI]];
+
+            cEst /= ec.size();
+
+            scalar cellVol = scalar(0);
+
+            forAll(ec, fI)
+            {
+                scalar pyr3Vol =
+                    exactFAreas[ec[fI]]
+                  & (exactFCtrs[ec[fI]] - cEst);
+
+                if( exactOwner[ec[fI]] != exactCellI )
+                    pyr3Vol *= scalar(-1);
+
+                cellVol += pyr3Vol;
+            }
+
+            cellVol /= scalar(3);
+
+            minVolume =
+                Foam::min(minVolume, cellVol);
+
+            if( cellVol < VSMALL )
+                ++nBelowVSmall;
+
+            if( cellVol < scalar(0) )
+                ++nTrueNegative;
+
+
+            const bool isGeneratedType1 =
+            (
+                exactCellI >= 0
+             && exactCellI < label(exactVolumeRefType.size())
+             && exactVolumeRefType[exactCellI] == 1
+            );
+
+            if( !isGeneratedType1 )
+                continue;
+
+            ++nType1Checked;
+
+            minType1Volume =
+                Foam::min(minType1Volume, cellVol);
+
+            if( cellVol < VSMALL )
+                ++nType1BelowVSmall;
+
+            if( cellVol < scalar(0) )
+            {
+                ++nType1TrueNegative;
+                blV1NegativeType1Cells.append(exactCellI);
+            }
+
+
+            if
+            (
+                cellVol < VSMALL
+             && nDetailedPrinted < 20
+            )
+            {
+                ++nDetailedPrinted;
+
+                const label parentCell =
+                    exactVolumeParent[exactCellI];
+
+                const label localChild =
+                    exactVolumeLocalChild[exactCellI];
+
+                label bfI = -1;
+
+                if
+                (
+                    exactCellI >= 0
+                 && exactCellI
+                    < label(cellToBaseBndFace_.size())
+                )
+                    bfI =
+                        cellToBaseBndFace_[exactCellI];
+
+                label patchI = -1;
+
+                if
+                (
+                    bfI >= 0
+                 && bfI < label(exactVolumeFacePatch.size())
+                )
+                    patchI =
+                        exactVolumeFacePatch[bfI];
+
+                word patchName("?");
+
+                if
+                (
+                    patchI >= 0
+                 && patchI
+                    < label(mesh_.boundaries().size())
+                )
+                    patchName =
+                        mesh_.boundaries()[patchI].patchName();
+
+
+                label nLayers = -1;
+
+                if
+                (
+                    bfI >= 0
+                 && bfI < label(nLayersAtBndFace_.size())
+                )
+                    nLayers =
+                        nLayersAtBndFace_[bfI];
+
+
+                Info
+                    << "REFINE_EXACT_VOLUME_BAD"
+                    << " cell=" << exactCellI
+                    << " parent=" << parentCell
+                    << " localChild=" << localChild
+                    << " refType=1"
+                    << " bfI=" << bfI
+                    << " patch=" << patchName
+                    << " nLayers=" << nLayers
+                    << " volume=" << cellVol
+                    << " nFaces=" << ec.size()
+                    << " cEst=" << cEst
+                    << endl;
+
+
+                // Print the exact signed 3*pyramid contributions used in
+                // checkCellVolumes().  Their sum / 3 is cellVol.
+                Info
+                    << "REFINE_EXACT_VOLUME_PYR3"
+                    << " cell=" << exactCellI
+                    << " contributions=(";
+
+                forAll(ec, fI)
+                {
+                    const label faceI = ec[fI];
+
+                    scalar pyr3Vol =
+                        exactFAreas[faceI]
+                      & (exactFCtrs[faceI] - cEst);
+
+                    if( exactOwner[faceI] != exactCellI )
+                        pyr3Vol *= scalar(-1);
+
+                    if( fI )
+                        Info << ' ';
+
+                    Info
+                        << faceI
+                        << ':'
+                        << pyr3Vol;
+                }
+
+                Info << ')' << endl;
+            }
+        }
+
+
+        // Match checkCellVolumes() parallel semantics for the summary.
+        reduce(minVolume, minOp<scalar>());
+        reduce(nBelowVSmall, sumOp<label>());
+        reduce(nTrueNegative, sumOp<label>());
+
+        reduce(minType1Volume, minOp<scalar>());
+        reduce(nType1Checked, sumOp<label>());
+        reduce(nType1BelowVSmall, sumOp<label>());
+        reduce(nType1TrueNegative, sumOp<label>());
+
+
+        Info
+            << "REFINE_EXACT_VOLUME_SUMMARY"
+            << " allCells=" << exactCells.size()
+            << " belowVSmall=" << nBelowVSmall
+            << " trueNegative=" << nTrueNegative
+            << " minVolume=" << minVolume
+            << " type1Checked=" << nType1Checked
+            << " type1BelowVSmall=" << nType1BelowVSmall
+            << " type1TrueNegative=" << nType1TrueNegative
+            << " minType1Volume=" << minType1Volume
+            << endl;
+
+
+        // ==============================================================
+        // BL_VALIDITY_REPAIR_V1C
+        //
+        // Coherent split-edge chain repair.
+        //
+        // v0 moved individual generated row points independently.  That
+        // can create a kink between adjacent BL rows and visually jagged
+        // contact lines.
+        //
+        // v1c retains the v1b first-row-focused coherent hair repair:
+        //
+        //     deltaT(row) =
+        //         amplitude * firstT
+        //       * ((1-t)/(1-firstT))^4
+        //
+        // Therefore:
+        //     wall endpoint t=0 is fixed
+        //     first generated row receives maximum displacement
+        //     deeper-row displacement monotonically decays
+        //     BL/core endpoint t=1 is fixed
+        //
+        // v1c additionally evaluates every candidate using OpenFOAM-parity
+        // face centres, face areas, signed cell centres, pyramids,
+        // orthogonality and skewness.  All admissible candidate hairs and
+        // amplitudes are searched before the best safe candidate is chosen.
+        //
+        // A complete split-edge chain is committed atomically.
+        // ==============================================================
+
+        label blV1InitialNegative =
+            blV1NegativeType1Cells.size();
+
+        label blV1Fixed = 0;
+        label blV1Unresolved = 0;
+        label blV1CommittedChains = 0;
+
+        // CFMitch v2.5:
+        //
+        // V1C was historically gated by true-negative type-1 children.
+        // That prevents positive-volume BL children with invalid oriented
+        // face pyramids from ever reaching the quality-aware hair solver.
+        //
+        // Enter unconditionally so a repair population can also be built
+        // from CURRENT bad-pyramid geometry once split-edge lineage exists.
+        label blV25PyramidAdditionalSeeds = 0;
+        label blV25RepairSeeds = 0;
+        label blV25TargetPyrRejects = 0;
+
+        // CFMitch v2.7 diagnostic:
+        // classify the bad OpenFOAM pyramid faces belonging to unresolved
+        // wall-adjacent type-1 children.
+        //
+        // No behaviour depends on these counters.
+        label blV27WallChildCells = 0;
+        label blV27WallChildBadFaces = 0;
+        label blV27WallChildWallBaseBad = 0;
+        label blV27WallChildInternalOuterBad = 0;
+        label blV27WallChildLateralBad = 0;
+        label blV27WallChildUnknownBad = 0;
+        label blV27WallChildMultiBad = 0;
+
+        // CFMitch v2.7.1:
+        // bounded coherent wall-face repair for positive-volume,
+        // type-1, wall-adjacent, WALL_BASE-only pyramid defects.
+        label blV271FaceBreathEligible = 0;
+        label blV271FaceBreathAttempted = 0;
+        label blV271FaceBreathSkipped = 0;
+        label blV271FaceBreathTrials = 0;
+        label blV271FaceBreathVolumePass = 0;
+        label blV271FaceBreathQualityPass = 0;
+        label blV271FaceBreathTargetReject = 0;
+        label blV271FaceBreathQualityReject = 0;
+        label blV271FaceBreathFixed = 0;
+
+        // Diagnostic-only quality-rejection classifier.
+        label blV271RejectNewPyramid = 0;
+        label blV271RejectWorsePyramid = 0;
+        label blV271RejectNewSkew = 0;
+        label blV271RejectWorseSkew = 0;
+        label blV271RejectNewNonOrtho90 = 0;
+        label blV271RejectWorseNonOrtho = 0;
+        label blV271RejectOFGeometry = 0;
+        label blV271RejectOther = 0;
+
+        label blV271RejectOnTargetCellFace = 0;
+        label blV271RejectOnOtherStarFace = 0;
+
+        // Diagnostic-only:
+        // one record for each unique
+        //
+        //     (repair target, moved split edge, worse pyramid face)
+        //
+        // No repair behavior depends on this state.
+        std::set
+        <
+            std::pair
+            <
+                label,
+                std::pair<label,label>
+            >
+        > blV1WorsePyrDiagSeen;
+
+        {
+            pointFieldPMG& v1Points =
+                mesh_.points();
+
+            const faceListPMG& v1Faces =
+                mesh_.faces();
+
+            const cellListPMG& v1Cells =
+                mesh_.cells();
+
+            const labelList& v1Neighbour =
+                mesh_.neighbour();
+
+
+            // ----------------------------------------------------------
+            // Exact local face-centre and area-vector calculation.
+            // Mirrors polyMeshGenAddressing::makeFaceCentresAndAreas().
+            // ----------------------------------------------------------
+
+            auto v1FaceCentreArea =
+            [&]
+            (
+                const face& f,
+                vector& fCtr,
+                vector& fArea
+            )
+            {
+                const label nPoints = f.size();
+
+                if( nPoints == 3 )
+                {
+                    const point& p0 = v1Points[f[0]];
+                    const point& p1 = v1Points[f[1]];
+                    const point& p2 = v1Points[f[2]];
+
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *(p0+p1+p2);
+
+                    fArea =
+                        scalar(0.5)
+                       *((p1-p0)^(p2-p0));
+
+                    return;
+                }
+
+                vector sumN(vector::zero);
+                scalar sumA = scalar(0);
+                vector sumAc(vector::zero);
+
+                point fCentre =
+                    v1Points[f[0]];
+
+                for(label pi=1; pi<nPoints; ++pi)
+                    fCentre += v1Points[f[pi]];
+
+                fCentre /= scalar(nPoints);
+
+                for(label pi=0; pi<nPoints; ++pi)
+                {
+                    const point& curr =
+                        v1Points[f[pi]];
+
+                    const point& next =
+                        v1Points[f.nextLabel(pi)];
+
+                    const vector c =
+                        curr + next + fCentre;
+
+                    const vector n =
+                        (next-curr)^(fCentre-curr);
+
+                    const scalar a =
+                        mag(n);
+
+                    sumN += n;
+                    sumA += a;
+                    sumAc += a*c;
+                }
+
+                fCtr =
+                    (scalar(1)/scalar(3))
+                   *sumAc
+                   /(sumA + VSMALL);
+
+                fArea =
+                    scalar(0.5)*sumN;
+            };
+
+
+            // ----------------------------------------------------------
+            // Exact local raw signed cell volume.
+            // Mirrors polyMeshGenChecks::checkCellVolumes().
+            // ----------------------------------------------------------
+
+            auto v1CellVolume =
+            [&]
+            (
+                const label cellI
+            ) -> scalar
+            {
+                if
+                (
+                    cellI < 0
+                 || cellI >= label(v1Cells.size())
+                )
+                    return -GREAT;
+
+                const cell& c =
+                    v1Cells[cellI];
+
+                if( c.size() == 0 )
+                    return -GREAT;
+
+                vector cEst(vector::zero);
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(v1Faces.size())
+                    )
+                        return -GREAT;
+
+                    vector fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    v1FaceCentreArea
+                    (
+                        v1Faces[faceI],
+                        fc,
+                        fa
+                    );
+
+                    cEst += fc;
+                }
+
+                cEst /= scalar(c.size());
+
+                scalar cellVol =
+                    scalar(0);
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    vector fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    v1FaceCentreArea
+                    (
+                        v1Faces[faceI],
+                        fc,
+                        fa
+                    );
+
+                    scalar pyr3Vol =
+                        fa & (fc-cEst);
+
+                    if( exactOwner[faceI] != cellI )
+                        pyr3Vol *= scalar(-1);
+
+                    cellVol += pyr3Vol;
+                }
+
+                return cellVol/scalar(3);
+            };
+
+
+            // ----------------------------------------------------------
+            // OpenFOAM-parity local face centre and area vector.
+            //
+            // Mirrors face::areaAndCentre() used by primitiveMesh.
+            //
+            // This deliberately differs from v1FaceCentreArea() for
+            // general polygon faces: OpenFOAM weights triangle centres
+            // using signed area projected onto the resultant face normal,
+            // not triangle-area magnitude.
+            // ----------------------------------------------------------
+
+            auto v1OFFaceCentreArea =
+            [&]
+            (
+                const face& f,
+                vector& fCtr,
+                vector& fArea
+            ) -> bool
+            {
+                const label nPoints = f.size();
+
+                if( nPoints < 3 )
+                    return false;
+
+                if( nPoints == 3 )
+                {
+                    const point& p0 = v1Points[f[0]];
+                    const point& p1 = v1Points[f[1]];
+                    const point& p2 = v1Points[f[2]];
+
+                    fArea =
+                        scalar(0.5)
+                       *((p1-p0)^(p2-p0));
+
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *(p0+p1+p2);
+
+                    return true;
+                }
+
+                point pAvg(vector::zero);
+
+                forAll(f, pi)
+                    pAvg += v1Points[f[pi]];
+
+                pAvg /= scalar(nPoints);
+
+                vector sumA(vector::zero);
+
+                forAll(f, pi)
+                {
+                    const point& fp =
+                        v1Points[f[pi]];
+
+                    const point& fpNext =
+                        v1Points[f.nextLabel(pi)];
+
+                    const vector a =
+                        (fpNext-fp)^(pAvg-fp);
+
+                    sumA += a;
+                }
+
+                const vector sumAHat =
+                    normalised(sumA);
+
+                scalar sumAn = scalar(0);
+                vector sumAnc(vector::zero);
+
+                forAll(f, pi)
+                {
+                    const point& fp =
+                        v1Points[f[pi]];
+
+                    const point& fpNext =
+                        v1Points[f.nextLabel(pi)];
+
+                    const vector a =
+                        (fpNext-fp)^(pAvg-fp);
+
+                    const vector c =
+                        fp + fpNext + pAvg;
+
+                    const scalar an =
+                        a & sumAHat;
+
+                    sumAn += an;
+                    sumAnc += an*c;
+                }
+
+                fArea =
+                    scalar(0.5)*sumA;
+
+                if( sumAn > vSmall )
+                {
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *sumAnc/sumAn;
+                }
+                else
+                {
+                    fCtr = pAvg;
+                }
+
+                return true;
+            };
+
+
+            // ----------------------------------------------------------
+            // OpenFOAM-parity signed cell centre and volume.
+            //
+            // Mirrors primitiveMesh::makeCellCentresAndVols().
+            //
+            // IMPORTANT:
+            // This is ONLY a local quality evaluator.  It must NOT replace
+            // cfMesh's globally cached bounded surrogate cell centre,
+            // which intentionally clamps negative pyramid weights to keep
+            // defective intermediate meshes numerically finite.
+            // ----------------------------------------------------------
+
+            auto v1OFCellCentreVolume =
+            [&]
+            (
+                const label cellI,
+                point& cellCtr,
+                scalar& cellVol
+            ) -> bool
+            {
+                if
+                (
+                    cellI < 0
+                 || cellI >= label(v1Cells.size())
+                )
+                    return false;
+
+                const cell& c =
+                    v1Cells[cellI];
+
+                if( c.empty() )
+                    return false;
+
+                point cEst(vector::zero);
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(v1Faces.size())
+                    )
+                        return false;
+
+                    vector fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v1OFFaceCentreArea
+                        (
+                            v1Faces[faceI],
+                            fc,
+                            fa
+                        )
+                    )
+                        return false;
+
+                    cEst += fc;
+                }
+
+                cEst /= scalar(c.size());
+
+                vector weightedCentre(vector::zero);
+                scalar vol3 = scalar(0);
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    vector fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v1OFFaceCentreArea
+                        (
+                            v1Faces[faceI],
+                            fc,
+                            fa
+                        )
+                    )
+                        return false;
+
+                    scalar pyr3Vol =
+                        fa & (fc-cEst);
+
+                    if( exactOwner[faceI] != cellI )
+                        pyr3Vol *= scalar(-1);
+
+                    const vector pc =
+                        scalar(0.75)*fc
+                      + scalar(0.25)*cEst;
+
+                    weightedCentre +=
+                        pyr3Vol*pc;
+
+                    vol3 += pyr3Vol;
+                }
+
+                if( Foam::mag(vol3) > vSmall )
+                    cellCtr = weightedCentre/vol3;
+                else
+                    cellCtr = cEst;
+
+                cellVol =
+                    vol3/scalar(3);
+
+                return true;
+            };
+
+
+            // ----------------------------------------------------------
+            // OpenFOAM-parity single-face finite-volume quality.
+            //
+            // Internal-face skew mirrors
+            // meshCheck::faceSkewness().
+            //
+            // Boundary-face skew mirrors
+            // meshCheck::boundaryFaceSkewness().
+            //
+            // pyrMargin:
+            //     owner    = -ownerPyramidVolume
+            //     neighbour= +neighbourPyramidVolume
+            //
+            // Larger pyrMargin is better.  checkMesh considers the face
+            // bad when either oriented pyramid margin is below -SMALL.
+            // ----------------------------------------------------------
+
+            auto v1OFFaceQuality =
+            [&]
+            (
+                const label faceI,
+                scalar& skewness,
+                scalar& orthogonality,
+                scalar& pyrMargin,
+                bool& badPyramid,
+                scalar& ownerVol,
+                scalar& neighbourVol
+            ) -> bool
+            {
+                if
+                (
+                    faceI < 0
+                 || faceI >= label(v1Faces.size())
+                )
+                    return false;
+
+                vector fc(vector::zero);
+                vector fa(vector::zero);
+
+                if
+                (
+                    !v1OFFaceCentreArea
+                    (
+                        v1Faces[faceI],
+                        fc,
+                        fa
+                    )
+                )
+                    return false;
+
+                const label ownCellI =
+                    exactOwner[faceI];
+
+                point ownCc(vector::zero);
+
+                if
+                (
+                    !v1OFCellCentreVolume
+                    (
+                        ownCellI,
+                        ownCc,
+                        ownerVol
+                    )
+                )
+                    return false;
+
+                const scalar ownerPyrVol =
+                    pyramidPointFaceRef
+                    (
+                        v1Faces[faceI],
+                        ownCc
+                    ).mag(v1Points);
+
+                pyrMargin =
+                    -ownerPyrVol;
+
+                badPyramid =
+                    ownerPyrVol > SMALL;
+
+                const label neiCellI =
+                    v1Neighbour[faceI];
+
+                if( neiCellI >= 0 )
+                {
+                    point neiCc(vector::zero);
+
+                    if
+                    (
+                        !v1OFCellCentreVolume
+                        (
+                            neiCellI,
+                            neiCc,
+                            neighbourVol
+                        )
+                    )
+                        return false;
+
+                    const scalar neighbourPyrVol =
+                        pyramidPointFaceRef
+                        (
+                            v1Faces[faceI],
+                            neiCc
+                        ).mag(v1Points);
+
+                    pyrMargin =
+                        Foam::min
+                        (
+                            pyrMargin,
+                            neighbourPyrVol
+                        );
+
+                    if( neighbourPyrVol < -SMALL )
+                        badPyramid = true;
+
+                    const vector Cpf =
+                        fc-ownCc;
+
+                    const vector d =
+                        neiCc-ownCc;
+
+                    const vector sv =
+                        Cpf
+                      - (
+                            (fa & Cpf)
+                           /((fa & d) + rootVSmall)
+                        )*d;
+
+                    const vector svHat =
+                        sv/(mag(sv) + rootVSmall);
+
+                    scalar fd =
+                        scalar(0.2)*mag(d)
+                      + rootVSmall;
+
+                    const face& f =
+                        v1Faces[faceI];
+
+                    forAll(f, pi)
+                    {
+                        fd =
+                            Foam::max
+                            (
+                                fd,
+                                Foam::mag
+                                (
+                                    svHat
+                                  & (
+                                        v1Points[f[pi]]
+                                       -fc
+                                    )
+                                )
+                            );
+                    }
+
+                    skewness =
+                        mag(sv)/fd;
+
+                    orthogonality =
+                        (d & fa)
+                       /(mag(d)*mag(fa) + rootVSmall);
+                }
+                else
+                {
+                    neighbourVol = GREAT;
+
+                    const vector Cpf =
+                        fc-ownCc;
+
+                    vector normal = fa;
+                    normal /=
+                        mag(normal) + rootVSmall;
+
+                    const vector d =
+                        normal*(normal & Cpf);
+
+                    const vector sv =
+                        Cpf
+                      - (
+                            (fa & Cpf)
+                           /((fa & d) + rootVSmall)
+                        )*d;
+
+                    const vector svHat =
+                        sv/(mag(sv) + rootVSmall);
+
+                    scalar fd =
+                        scalar(0.4)*mag(d)
+                      + rootVSmall;
+
+                    const face& f =
+                        v1Faces[faceI];
+
+                    forAll(f, pi)
+                    {
+                        fd =
+                            Foam::max
+                            (
+                                fd,
+                                Foam::mag
+                                (
+                                    svHat
+                                  & (
+                                        v1Points[f[pi]]
+                                       -fc
+                                    )
+                                )
+                            );
+                    }
+
+                    skewness =
+                        mag(sv)/fd;
+
+                    // Non-orthogonality is an owner-neighbour metric.
+                    orthogonality = GREAT;
+                }
+
+                return true;
+            };
+
+
+            // ----------------------------------------------------------
+            // point -> split-edge map for generated interior vertices.
+            // Ambiguous points are not legal repair variables.
+            // ----------------------------------------------------------
+
+            std::map<label,label> v1PointEdge;
+            std::set<label> v1AmbiguousPoints;
+
+            for
+            (
+                label seI=0;
+                seI<label(splitEdges_.size());
+                ++seI
+            )
+            {
+                const label rowSize =
+                    newVerticesForSplitEdge_.
+                        sizeOfRow(seI);
+
+                for
+                (
+                    label rowI=1;
+                    rowI<rowSize-1;
+                    ++rowI
+                )
+                {
+                    const label pointI =
+                        newVerticesForSplitEdge_
+                        (
+                            seI,
+                            rowI
+                        );
+
+                    std::map<label,label>::iterator it =
+                        v1PointEdge.find(pointI);
+
+                    if( it == v1PointEdge.end() )
+                    {
+                        v1PointEdge[pointI] = seI;
+                    }
+                    else if( it->second != seI )
+                    {
+                        v1AmbiguousPoints.insert(pointI);
+                    }
+                }
+            }
+
+            for
+            (
+                std::set<label>::const_iterator
+                    it=v1AmbiguousPoints.begin();
+                it!=v1AmbiguousPoints.end();
+                ++it
+            )
+            {
+                v1PointEdge.erase(*it);
+            }
+
+
+            // ----------------------------------------------------------
+            // CFMitch v2.5 cell-side pyramid predicate.
+            //
+            // This deliberately tests the pyramid orientation relative to
+            // THIS cell, rather than assigning both sides of a globally bad
+            // face to the repair solver.
+            //
+            // owner:
+            //     pyramidPointFaceRef(...).mag() > SMALL  => bad
+            //
+            // neighbour:
+            //     pyramidPointFaceRef(...).mag() < -SMALL => bad
+            //
+            // This is the same orientation convention used by
+            // v1OFFaceQuality() above.
+            // ----------------------------------------------------------
+
+            auto v1CellBadPyramidCount =
+            [&]
+            (
+                const label cellI
+            ) -> label
+            {
+                if
+                (
+                    cellI < 0
+                 || cellI >= label(v1Cells.size())
+                )
+                    return labelMax;
+
+                point cellCtr(vector::zero);
+                scalar cellVol = -GREAT;
+
+                if
+                (
+                    !v1OFCellCentreVolume
+                    (
+                        cellI,
+                        cellCtr,
+                        cellVol
+                    )
+                )
+                    return labelMax;
+
+                const cell& c =
+                    v1Cells[cellI];
+
+                label nBad = 0;
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(v1Faces.size())
+                    )
+                        return labelMax;
+
+                    const scalar pyrVol =
+                        pyramidPointFaceRef
+                        (
+                            v1Faces[faceI],
+                            cellCtr
+                        ).mag(v1Points);
+
+                    if
+                    (
+                        faceI < label(exactOwner.size())
+                     && exactOwner[faceI] == cellI
+                    )
+                    {
+                        if( pyrVol > SMALL )
+                            ++nBad;
+                    }
+                    else if
+                    (
+                        faceI < label(v1Neighbour.size())
+                     && v1Neighbour[faceI] == cellI
+                    )
+                    {
+                        if( pyrVol < -SMALL )
+                            ++nBad;
+                    }
+                    else
+                    {
+                        // Cell/face addressing disagreement means this is
+                        // not a safe V1C quality target.
+                        return labelMax;
+                    }
+                }
+
+                return nBad;
+            };
+
+
+            // ----------------------------------------------------------
+            // CFMitch v2.7 diagnostic:
+            // face-role classification for an unresolved wall-adjacent
+            // type-1 child.
+            //
+            // Hair orientation has already been established by
+            // detectBoundaryLayers:
+            //
+            //     splitEdges_[seI].start() = boundary/root point
+            //     splitEdges_[seI].end()   = interior/core-side point
+            //
+            // This diagnostic deliberately uses the same cell-side
+            // OpenFOAM pyramid predicate as v1CellBadPyramidCount().
+            // ----------------------------------------------------------
+
+            labelHashSet v1HairStartPoints;
+
+            forAll(splitEdges_, seI)
+            {
+                v1HairStartPoints.insert
+                (
+                    splitEdges_[seI].start()
+                );
+            }
+
+
+            auto v1ReportWallChildBadFaceRoles =
+            [&]
+            (
+                const label cellI
+            )
+            {
+                if
+                (
+                    cellI < 0
+                 || cellI >= label(v1Cells.size())
+                 || cellI >= label(exactVolumeParent.size())
+                 || cellI >= label(exactVolumeLocalChild.size())
+                 || cellI >= label(exactVolumeRefType.size())
+                )
+                {
+                    return;
+                }
+
+                if( exactVolumeRefType[cellI] != 1 )
+                    return;
+
+                const label parentI =
+                    exactVolumeParent[cellI];
+
+                const label localChildI =
+                    exactVolumeLocalChild[cellI];
+
+                if
+                (
+                    parentI < 0
+                 || localChildI < 0
+                )
+                    return;
+
+                point cellCtr(vector::zero);
+                scalar cellVol = -GREAT;
+
+                if
+                (
+                    !v1OFCellCentreVolume
+                    (
+                        cellI,
+                        cellCtr,
+                        cellVol
+                    )
+                )
+                    return;
+
+                const cell& c =
+                    v1Cells[cellI];
+
+                label nBadThisCell = 0;
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(v1Faces.size())
+                     || faceI >= label(exactOwner.size())
+                     || faceI >= label(v1Neighbour.size())
+                    )
+                        continue;
+
+                    const scalar pyrVol =
+                        pyramidPointFaceRef
+                        (
+                            v1Faces[faceI],
+                            cellCtr
+                        ).mag(v1Points);
+
+                    bool badForThisCell = false;
+                    bool thisCellIsOwner = false;
+
+                    if( exactOwner[faceI] == cellI )
+                    {
+                        thisCellIsOwner = true;
+
+                        if( pyrVol > SMALL )
+                            badForThisCell = true;
+                    }
+                    else if( v1Neighbour[faceI] == cellI )
+                    {
+                        if( pyrVol < -SMALL )
+                            badForThisCell = true;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    if( !badForThisCell )
+                        continue;
+
+                    ++nBadThisCell;
+                    ++blV27WallChildBadFaces;
+
+                    word role("UNKNOWN");
+
+                    // First identify the actual wall/base face from
+                    // topology: every point on it is a known hair root.
+                    bool allHairStarts = true;
+
+                    const face& f =
+                        v1Faces[faceI];
+
+                    forAll(f, fpI)
+                    {
+                        if
+                        (
+                            !v1HairStartPoints.found
+                            (
+                                f[fpI]
+                            )
+                        )
+                        {
+                            allHairStarts = false;
+                            break;
+                        }
+                    }
+
+                    if( allHairStarts )
+                    {
+                        role = "WALL_BASE";
+                        ++blV27WallChildWallBaseBad;
+                    }
+                    else
+                    {
+                        label otherCellI = -1;
+
+                        if( thisCellIsOwner )
+                        {
+                            otherCellI =
+                                v1Neighbour[faceI];
+                        }
+                        else
+                        {
+                            otherCellI =
+                                exactOwner[faceI];
+                        }
+
+                        bool classifiedInternalOuter =
+                            false;
+
+                        if
+                        (
+                            otherCellI >= 0
+                         && otherCellI <
+                            label(exactVolumeParent.size())
+                         && otherCellI <
+                            label(exactVolumeLocalChild.size())
+                         && otherCellI <
+                            label(exactVolumeRefType.size())
+                         && exactVolumeRefType[otherCellI] == 1
+                         && exactVolumeParent[otherCellI] ==
+                            parentI
+                         && exactVolumeLocalChild[otherCellI] ==
+                            localChildI - 1
+                        )
+                        {
+                            role = "INTERNAL_OUTER";
+                            classifiedInternalOuter = true;
+                            ++blV27WallChildInternalOuterBad;
+                        }
+
+                        if( !classifiedInternalOuter )
+                        {
+                            // For the first wall-adjacent child, every
+                            // non-wall face other than its coreward sibling
+                            // interface is a lateral face unless addressing
+                            // says that another same-parent relationship
+                            // exists unexpectedly.
+                            if
+                            (
+                                otherCellI >= 0
+                             && otherCellI <
+                                label(exactVolumeParent.size())
+                             && exactVolumeParent[otherCellI] ==
+                                parentI
+                            )
+                            {
+                                role = "UNKNOWN";
+                                ++blV27WallChildUnknownBad;
+                            }
+                            else
+                            {
+                                role = "LATERAL";
+                                ++blV27WallChildLateralBad;
+                            }
+                        }
+                    }
+
+                    Info
+                        << "CFMITCH V2.7 WALLCHILD BADFACE:"
+                        << " cell=" << cellI
+                        << " parent=" << parentI
+                        << " bfI="
+                        << cellToBaseBndFace_[cellI]
+                        << " localChild="
+                        << localChildI
+                        << " face=" << faceI
+                        << " role=" << role
+                        << " side="
+                        << (
+                            thisCellIsOwner
+                          ? "owner"
+                          : "neighbour"
+                           )
+                        << " pyrVol=" << pyrVol
+                        << " nPts=" << f.size()
+                        << endl;
+
+                    if( role == "WALL_BASE" )
+                    {
+                        Info
+                            << "CFMITCH V2.7.2 WALLBASE ROOTS:"
+                            << " cell=" << cellI
+                            << " parent=" << parentI
+                            << " bfI="
+                            << cellToBaseBndFace_[cellI]
+                            << " face=" << faceI
+                            << " roots=";
+
+                        forAll(f, fpI)
+                        {
+                            if( fpI )
+                                Info << ',';
+
+                            Info << f[fpI];
+                        }
+
+                        Info << endl;
+                    }
+                }
+
+                if( nBadThisCell > 0 )
+                {
+                    ++blV27WallChildCells;
+
+                    if( nBadThisCell > 1 )
+                        ++blV27WallChildMultiBad;
+
+                    Info
+                        << "CFMITCH V2.7 WALLCHILD CELL:"
+                        << " cell=" << cellI
+                        << " parent=" << parentI
+                        << " bfI="
+                        << cellToBaseBndFace_[cellI]
+                        << " localChild="
+                        << localChildI
+                        << " badFaces="
+                        << nBadThisCell
+                        << endl;
+                }
+            };
+
+
+            // ----------------------------------------------------------
+            // Generalized repair seed population.
+            //
+            // Start with the historical negative-volume seeds.
+            // ----------------------------------------------------------
+
+            boolList v1RepairCellMask
+            (
+                v1Cells.size(),
+                false
+            );
+
+            forAll(blV1NegativeType1Cells, negI)
+            {
+                const label cellI =
+                    blV1NegativeType1Cells[negI];
+
+                if
+                (
+                    cellI >= 0
+                 && cellI < label(v1RepairCellMask.size())
+                )
+                {
+                    v1RepairCellMask[cellI] = true;
+                }
+            }
+
+
+            // ----------------------------------------------------------
+            // Add positive/otherwise non-negative pyramid-defect cells,
+            // but ONLY when the cell actually contains an unambiguous
+            // generated split-edge point.  This establishes that V1C has
+            // a legitimate construction degree of freedom for the cell.
+            // ----------------------------------------------------------
+
+            label nV25GeneratedEdgeCells = 0;
+            label nV25PyramidEvalFailed = 0;
+
+            forAll(v1Cells, cellI)
+            {
+                const cell& c =
+                    v1Cells[cellI];
+
+                bool hasGeneratedSplitPoint = false;
+
+                forAll(c, cfI)
+                {
+                    const label faceI =
+                        c[cfI];
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(v1Faces.size())
+                    )
+                        continue;
+
+                    const face& f =
+                        v1Faces[faceI];
+
+                    forAll(f, fpI)
+                    {
+                        if
+                        (
+                            v1PointEdge.find(f[fpI])
+                         != v1PointEdge.end()
+                        )
+                        {
+                            hasGeneratedSplitPoint = true;
+                            break;
+                        }
+                    }
+
+                    if( hasGeneratedSplitPoint )
+                        break;
+                }
+
+                if( !hasGeneratedSplitPoint )
+                    continue;
+
+                ++nV25GeneratedEdgeCells;
+
+                const label nBadPyr =
+                    v1CellBadPyramidCount(cellI);
+
+                if( nBadPyr == labelMax )
+                {
+                    ++nV25PyramidEvalFailed;
+                    continue;
+                }
+
+                if
+                (
+                    nBadPyr > 0
+                 && !v1RepairCellMask[cellI]
+                )
+                {
+                    v1RepairCellMask[cellI] = true;
+                    ++blV25PyramidAdditionalSeeds;
+                }
+            }
+
+
+            // Deterministic ascending-cell repair order.
+            DynList<label, 256> blV1RepairCells;
+
+            forAll(v1RepairCellMask, cellI)
+            {
+                if( v1RepairCellMask[cellI] )
+                    blV1RepairCells.append(cellI);
+            }
+
+            blV25RepairSeeds =
+                blV1RepairCells.size();
+
+
+            Info
+                << "CFMITCH V2.5 BIRTH QUALITY SEEDS:"
+                << " negative="
+                << blV1InitialNegative
+                << " pyramidAdditional="
+                << blV25PyramidAdditionalSeeds
+                << " totalRepairCells="
+                << blV25RepairSeeds
+                << " generatedEdgeCells="
+                << nV25GeneratedEdgeCells
+                << " pyramidEvalFailed="
+                << nV25PyramidEvalFailed
+                << endl;
+
+
+            // ----------------------------------------------------------
+            // Candidate split edges are those containing an interior
+            // generated point belonging to a V1C repair cell.
+            // ----------------------------------------------------------
+
+            std::set<label> v1CandidateEdges;
+
+            forAll(blV1RepairCells, badI)
+            {
+                const label badCellI =
+                    blV1RepairCells[badI];
+
+                if
+                (
+                    badCellI < 0
+                 || badCellI >= label(v1Cells.size())
+                )
+                    continue;
+
+                const cell& c =
+                    v1Cells[badCellI];
+
+                forAll(c, cfI)
+                {
+                    const face& f =
+                        v1Faces[c[cfI]];
+
+                    forAll(f, fpI)
+                    {
+                        std::map<label,label>::const_iterator
+                            it =
+                                v1PointEdge.find(f[fpI]);
+
+                        if( it != v1PointEdge.end() )
+                            v1CandidateEdges.insert(it->second);
+                    }
+                }
+            }
+
+
+            // ----------------------------------------------------------
+            // Build complete incident-cell stars for all candidate
+            // split-edge chains with ONE global cell scan.
+            // ----------------------------------------------------------
+
+            std::map<label,label> v1PointCandidateEdge;
+
+            std::map<label, std::set<label> >
+                v1EdgeCells;
+
+            for
+            (
+                std::set<label>::const_iterator
+                    eIt=v1CandidateEdges.begin();
+                eIt!=v1CandidateEdges.end();
+                ++eIt
+            )
+            {
+                const label seI = *eIt;
+
+                v1EdgeCells[seI];
+
+                const label rowSize =
+                    newVerticesForSplitEdge_.
+                        sizeOfRow(seI);
+
+                for
+                (
+                    label rowI=1;
+                    rowI<rowSize-1;
+                    ++rowI
+                )
+                {
+                    const label pointI =
+                        newVerticesForSplitEdge_
+                        (
+                            seI,
+                            rowI
+                        );
+
+                    v1PointCandidateEdge[pointI] =
+                        seI;
+                }
+            }
+
+
+            forAll(v1Cells, cellI)
+            {
+                std::set<label> touchedEdges;
+
+                const cell& c =
+                    v1Cells[cellI];
+
+                forAll(c, cfI)
+                {
+                    const face& f =
+                        v1Faces[c[cfI]];
+
+                    forAll(f, fpI)
+                    {
+                        std::map<label,label>::const_iterator
+                            pIt =
+                                v1PointCandidateEdge.find
+                                (
+                                    f[fpI]
+                                );
+
+                        if
+                        (
+                            pIt
+                         != v1PointCandidateEdge.end()
+                        )
+                            touchedEdges.insert
+                            (
+                                pIt->second
+                            );
+                    }
+                }
+
+                for
+                (
+                    std::set<label>::const_iterator
+                        eIt=touchedEdges.begin();
+                    eIt!=touchedEdges.end();
+                    ++eIt
+                )
+                {
+                    v1EdgeCells[*eIt].
+                        insert(cellI);
+                }
+            }
+
+
+            // Search smallest amplitudes first.
+            static const scalar v1AmplitudeMag[] =
+            {
+                scalar(0.01),
+                scalar(0.02),
+                scalar(0.03),
+                scalar(0.04),
+                scalar(0.05),
+                scalar(0.06),
+                scalar(0.08),
+                scalar(0.10),
+                scalar(0.12),
+                scalar(0.16),
+                scalar(0.18),
+                scalar(0.20),
+                scalar(0.25),
+                scalar(0.30),
+                scalar(0.35),
+                scalar(0.40),
+                scalar(0.425),
+                scalar(0.45),
+                scalar(0.475),
+                scalar(0.50)
+            };
+
+            static const label nV1AmplitudeMag =
+                sizeof(v1AmplitudeMag)
+               /sizeof(v1AmplitudeMag[0]);
+
+
+            forAll(blV1RepairCells, badI)
+            {
+                const label badCellI =
+                    blV1RepairCells[badI];
+
+                scalar badVolBefore =
+                    v1CellVolume(badCellI);
+
+                label badPyrBefore = 0;
+
+                if( badVolBefore > scalar(0) )
+                {
+                    badPyrBefore =
+                        v1CellBadPyramidCount(badCellI);
+
+                    if( badPyrBefore == labelMax )
+                    {
+                        ++blV1Unresolved;
+
+                        Info
+                            << "CFMITCH V2.5 BIRTH TARGET SKIP:"
+                            << " cell=" << badCellI
+                            << " reason=pyramidEvaluationFailed"
+                            << endl;
+
+                        continue;
+                    }
+                }
+
+                // A previously committed shared-chain transaction may have
+                // fixed this positive-volume pyramid seed already.
+                if
+                (
+                    badVolBefore > scalar(0)
+                 && badPyrBefore == 0
+                )
+                {
+                    ++blV1Fixed;
+                    continue;
+                }
+
+                const bool requirePyramidRepair =
+                    (
+                        badVolBefore > scalar(0)
+                     && badPyrBefore > 0
+                    );
+
+
+                // Candidate split edges touching this bad child.
+                std::set<label> badEdges;
+
+                const cell& badCell =
+                    v1Cells[badCellI];
+
+                forAll(badCell, cfI)
+                {
+                    const face& f =
+                        v1Faces[badCell[cfI]];
+
+                    forAll(f, fpI)
+                    {
+                        std::map<label,label>::const_iterator it =
+                            v1PointEdge.find(f[fpI]);
+
+                        if( it != v1PointEdge.end() )
+                            badEdges.insert(it->second);
+                    }
+                }
+
+
+                bool found = false;
+
+                label bestEdge = -1;
+                scalar bestAmplitude = scalar(0);
+                scalar bestTargetVol = -GREAT;
+                scalar bestMinRatio = -GREAT;
+
+                List<point> bestPositions;
+
+                scalar bestTargetOFVol = -GREAT;
+                scalar bestMaxOFSkew = GREAT;
+                scalar bestMinOFOrtho = -GREAT;
+                scalar bestMinOFRatio = -GREAT;
+                scalar bestMaxMove = GREAT;
+                label bestBadPyrCount = labelMax;
+
+                // v1d fallback bookkeeping.  Stage 1 remains the existing
+                // exhaustive single-hair v1c search.  These fields are used
+                // only if Stage 1 finds no safe candidate and a face-derived
+                // two-hair transaction succeeds.
+                bool bestIsPair = false;
+
+                label bestEdgeA = -1;
+                label bestEdgeB = -1;
+
+                scalar bestAmplitudeA = scalar(0);
+                scalar bestAmplitudeB = scalar(0);
+
+                List<point> bestPositionsA;
+                List<point> bestPositionsB;
+
+
+                for
+                (
+                    std::set<label>::const_iterator
+                        eIt=badEdges.begin();
+                    eIt!=badEdges.end();
+                    ++eIt
+                )
+                {
+                    const label seI = *eIt;
+
+                    const edge& se =
+                        splitEdges_[seI];
+
+                    const point edgeStart =
+                        v1Points[se.start()];
+
+                    const point edgeEnd =
+                        v1Points[se.end()];
+
+                    const vector edgeVec =
+                        edgeEnd-edgeStart;
+
+                    const scalar edgeMagSqr =
+                        magSqr(edgeVec);
+
+                    if( edgeMagSqr <= VSMALL )
+                        continue;
+
+
+                    const label rowSize =
+                        newVerticesForSplitEdge_.
+                            sizeOfRow(seI);
+
+                    if( rowSize < 3 )
+                        continue;
+
+
+                    List<point> originalPositions
+                    (
+                        rowSize-2
+                    );
+
+                    List<scalar> originalT
+                    (
+                        rowSize
+                    );
+
+                    originalT[0] = scalar(0);
+                    originalT[rowSize-1] = scalar(1);
+
+                    bool chainValid = true;
+
+                    for
+                    (
+                        label rowI=1;
+                        rowI<rowSize-1;
+                        ++rowI
+                    )
+                    {
+                        const label pointI =
+                            newVerticesForSplitEdge_
+                            (
+                                seI,
+                                rowI
+                            );
+
+                        originalPositions[rowI-1] =
+                            v1Points[pointI];
+
+                        originalT[rowI] =
+                            (
+                                (v1Points[pointI]-edgeStart)
+                              & edgeVec
+                            )
+                           /(edgeMagSqr + VSMALL);
+
+                        if
+                        (
+                            !(originalT[rowI] > originalT[rowI-1])
+                         || !(originalT[rowI] < scalar(1))
+                        )
+                        {
+                            chainValid = false;
+                            break;
+                        }
+                    }
+
+                    if( !chainValid )
+                        continue;
+
+
+                    std::map
+                    <
+                        label,
+                        std::set<label>
+                    >::const_iterator starIt =
+                        v1EdgeCells.find(seI);
+
+                    if
+                    (
+                        starIt == v1EdgeCells.end()
+                     || starIt->second.empty()
+                    )
+                        continue;
+
+
+                    // Baseline star volumes.
+                    std::map<label,scalar> baselineVolumes;
+
+                    for
+                    (
+                        std::set<label>::const_iterator
+                            cIt=starIt->second.begin();
+                        cIt!=starIt->second.end();
+                        ++cIt
+                    )
+                    {
+                        baselineVolumes[*cIt] =
+                            v1CellVolume(*cIt);
+                    }
+
+
+                    // OpenFOAM-parity baseline cell volumes.
+                    std::map<label,scalar> baselineOFVolumes;
+
+                    for
+                    (
+                        std::set<label>::const_iterator
+                            cIt=starIt->second.begin();
+                        cIt!=starIt->second.end();
+                        ++cIt
+                    )
+                    {
+                        point cc(vector::zero);
+                        scalar cv = -GREAT;
+
+                        if
+                        (
+                            !v1OFCellCentreVolume
+                            (
+                                *cIt,
+                                cc,
+                                cv
+                            )
+                        )
+                        {
+                            chainValid = false;
+                            break;
+                        }
+
+                        baselineOFVolumes[*cIt] = cv;
+                    }
+
+                    if( !chainValid )
+                        continue;
+
+
+                    // Every face whose quality can change because this
+                    // candidate hair moves either a face vertex or an
+                    // incident cell centre.
+                    std::set<label> affectedFaces;
+
+                    for
+                    (
+                        std::set<label>::const_iterator
+                            cIt=starIt->second.begin();
+                        cIt!=starIt->second.end();
+                        ++cIt
+                    )
+                    {
+                        const cell& starCell =
+                            v1Cells[*cIt];
+
+                        forAll(starCell, cfI)
+                            affectedFaces.insert(starCell[cfI]);
+                    }
+
+
+                    std::map<label,scalar> baselineOFSkew;
+                    std::map<label,scalar> baselineOFOrtho;
+                    std::map<label,scalar> baselineOFPyrMargin;
+                    std::map<label,bool> baselineOFPyrBad;
+                    std::map<label,bool> baselineOFEligible;
+
+                    bool baselineQualityValid = true;
+
+                    for
+                    (
+                        std::set<label>::const_iterator
+                            fIt=affectedFaces.begin();
+                        fIt!=affectedFaces.end();
+                        ++fIt
+                    )
+                    {
+                        const label faceI = *fIt;
+
+                        scalar skew = GREAT;
+                        scalar ortho = -GREAT;
+                        scalar pyrMargin = -GREAT;
+                        scalar ownVol = -GREAT;
+                        scalar neiVol = -GREAT;
+                        bool pyrBad = true;
+
+                        if
+                        (
+                            !v1OFFaceQuality
+                            (
+                                faceI,
+                                skew,
+                                ortho,
+                                pyrMargin,
+                                pyrBad,
+                                ownVol,
+                                neiVol
+                            )
+                        )
+                        {
+                            baselineQualityValid = false;
+                            break;
+                        }
+
+                        baselineOFSkew[faceI] =
+                            skew;
+
+                        baselineOFOrtho[faceI] =
+                            ortho;
+
+                        baselineOFPyrMargin[faceI] =
+                            pyrMargin;
+
+                        baselineOFPyrBad[faceI] =
+                            pyrBad;
+
+                        baselineOFEligible[faceI] =
+                            (
+                                ownVol > scalar(0)
+                             && (
+                                    v1Neighbour[faceI] < 0
+                                 || neiVol > scalar(0)
+                                )
+                            );
+                    }
+
+                    if( !baselineQualityValid )
+                        continue;
+
+
+                    auto restoreChain =
+                    [&]()
+                    {
+                        for
+                        (
+                            label rowI=1;
+                            rowI<rowSize-1;
+                            ++rowI
+                        )
+                        {
+                            const label pointI =
+                                newVerticesForSplitEdge_
+                                (
+                                    seI,
+                                    rowI
+                                );
+
+                            v1Points[pointI] =
+                                originalPositions[rowI-1];
+                        }
+                    };
+
+
+                    auto applyAmplitude =
+                    [&]
+                    (
+                        const scalar amplitude
+                    ) -> bool
+                    {
+                        // BLValidityRepair v1b:
+                        //
+                        // amplitude is the RELATIVE correction applied to
+                        // the first generated row.  That absolute shift is
+                        // then monotonically tapered to zero towards the
+                        // BL/core endpoint.
+                        //
+                        // Unlike v1a, no deeper point can move farther than
+                        // the first generated row.
+                        const scalar firstT =
+                            originalT[1];
+
+                        if
+                        (
+                            firstT <= scalar(0)
+                         || firstT >= scalar(1)
+                        )
+                        {
+                            restoreChain();
+                            return false;
+                        }
+
+                        scalar prevT = scalar(0);
+
+                        for
+                        (
+                            label rowI=1;
+                            rowI<rowSize-1;
+                            ++rowI
+                        )
+                        {
+                            const scalar t =
+                                originalT[rowI];
+
+                            const scalar decayBase =
+                                Foam::max
+                                (
+                                    scalar(0),
+                                    (scalar(1)-t)
+                                   /(scalar(1)-firstT + VSMALL)
+                                );
+
+                            const scalar deltaT =
+                                amplitude
+                               *firstT
+                               *Foam::pow
+                                (
+                                    decayBase,
+                                    scalar(4)
+                                );
+
+                            const scalar warpedT =
+                                t + deltaT;
+
+                            if
+                            (
+                                !(warpedT > prevT)
+                             || !(warpedT < originalT[rowI+1])
+                            )
+                            {
+                                restoreChain();
+                                return false;
+                            }
+
+                            const label pointI =
+                                newVerticesForSplitEdge_
+                                (
+                                    seI,
+                                    rowI
+                                );
+
+                            v1Points[pointI] =
+                                edgeStart
+                              + warpedT*edgeVec;
+
+                            prevT = warpedT;
+                        }
+
+                        return true;
+                    };
+
+
+                    for
+                    (
+                        label ampI=0;
+                        ampI<nV1AmplitudeMag;
+                        ++ampI
+                    )
+                    {
+                        for(label sign=-1; sign<=1; sign+=2)
+                        {
+                            restoreChain();
+
+                            const scalar amplitude =
+                                scalar(sign)
+                               *v1AmplitudeMag[ampI];
+
+                            if
+                            (
+                                !applyAmplitude(amplitude)
+                            )
+                                continue;
+
+
+                            const scalar targetVol =
+                                v1CellVolume(badCellI);
+
+                            // Require a meaningful positive margin, not
+                            // merely a numerical sign crossing.
+                            const scalar targetFloor =
+                                scalar(0.20)
+                               *Foam::mag(badVolBefore);
+
+                            if( targetVol <= targetFloor )
+                                continue;
+
+
+                            bool safe = true;
+                            scalar minPositiveRatio = GREAT;
+
+                            for
+                            (
+                                std::set<label>::const_iterator
+                                    cIt=starIt->second.begin();
+                                cIt!=starIt->second.end();
+                                ++cIt
+                            )
+                            {
+                                const label starCellI =
+                                    *cIt;
+
+                                const scalar oldV =
+                                    baselineVolumes[starCellI];
+
+                                const scalar newV =
+                                    v1CellVolume(starCellI);
+
+
+                                if( oldV > scalar(0) )
+                                {
+                                    // No neighbour is allowed to collapse
+                                    // while fixing the target.
+                                    if( newV <= scalar(0) )
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+
+                                    const scalar ratio =
+                                        newV
+                                       /(oldV + VSMALL);
+
+                                    minPositiveRatio =
+                                        Foam::min
+                                        (
+                                            minPositiveRatio,
+                                            ratio
+                                        );
+
+                                    if( ratio < scalar(0.75) )
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+                                }
+                                else
+                                {
+                                    // Existing negative neighbours may
+                                    // remain for their own later repair,
+                                    // but this chain may not worsen them.
+                                    if( newV < oldV )
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+
+                            if( !safe )
+                                continue;
+
+
+                            // ------------------------------------------
+                            // OpenFOAM-parity signed-volume star.
+                            // ------------------------------------------
+
+                            point targetOFCentre(vector::zero);
+                            scalar targetOFVol = -GREAT;
+
+                            if
+                            (
+                                !v1OFCellCentreVolume
+                                (
+                                    badCellI,
+                                    targetOFCentre,
+                                    targetOFVol
+                                )
+                            )
+                                continue;
+
+                            if( targetOFVol <= targetFloor )
+                                continue;
+
+
+                            scalar minOFPositiveRatio = GREAT;
+
+                            for
+                            (
+                                std::set<label>::const_iterator
+                                    cIt=starIt->second.begin();
+                                cIt!=starIt->second.end();
+                                ++cIt
+                            )
+                            {
+                                const label starCellI =
+                                    *cIt;
+
+                                const scalar oldOFV =
+                                    baselineOFVolumes[starCellI];
+
+                                point newOFCentre(vector::zero);
+                                scalar newOFV = -GREAT;
+
+                                if
+                                (
+                                    !v1OFCellCentreVolume
+                                    (
+                                        starCellI,
+                                        newOFCentre,
+                                        newOFV
+                                    )
+                                )
+                                {
+                                    safe = false;
+                                    break;
+                                }
+
+                                if( oldOFV > scalar(0) )
+                                {
+                                    if( newOFV <= scalar(0) )
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+
+                                    const scalar ratio =
+                                        newOFV
+                                       /(oldOFV + VSMALL);
+
+                                    minOFPositiveRatio =
+                                        Foam::min
+                                        (
+                                            minOFPositiveRatio,
+                                            ratio
+                                        );
+
+                                    if( ratio < scalar(0.75) )
+                                    {
+                                        safe = false;
+                                        break;
+                                    }
+                                }
+                                else if( newOFV < oldOFV )
+                                {
+                                    safe = false;
+                                    break;
+                                }
+                            }
+
+                            if( !safe )
+                                continue;
+
+
+                            // ------------------------------------------
+                            // Solver-facing local quality.
+                            //
+                            // A face whose baseline owner/neighbour cell
+                            // was already non-positive does not have a
+                            // trustworthy baseline FV metric.  Once the
+                            // trial makes that face fully positive, require
+                            // absolute safe quality.
+                            //
+                            // For an already-valid baseline face, permit
+                            // existing bad quality to remain only when it
+                            // does not regress.
+                            // ------------------------------------------
+
+                            static const scalar v1CSkewLimit =
+                                scalar(4);
+
+                            // Hard FV admissibility boundary:
+                            // orthogonality < 0 corresponds to >90 deg.
+                            // Faces in the 70-90 deg range remain eligible
+                            // but are penalised by best-candidate ranking.
+                            static const scalar v1COrtho90 =
+                                scalar(0);
+
+                            bool ofSafe = true;
+                            const char* rejectReason = "none";
+
+                            scalar trialMaxSkew = scalar(0);
+                            scalar trialMinOrtho = GREAT;
+                            label trialBadPyrCount = 0;
+
+                            for
+                            (
+                                std::set<label>::const_iterator
+                                    fIt=affectedFaces.begin();
+                                fIt!=affectedFaces.end();
+                                ++fIt
+                            )
+                            {
+                                const label faceI = *fIt;
+
+                                scalar trialSkew = GREAT;
+                                scalar trialOrtho = -GREAT;
+                                scalar trialPyrMargin = -GREAT;
+                                scalar trialOwnVol = -GREAT;
+                                scalar trialNeiVol = -GREAT;
+                                bool trialPyrBad = true;
+
+                                if
+                                (
+                                    !v1OFFaceQuality
+                                    (
+                                        faceI,
+                                        trialSkew,
+                                        trialOrtho,
+                                        trialPyrMargin,
+                                        trialPyrBad,
+                                        trialOwnVol,
+                                        trialNeiVol
+                                    )
+                                )
+                                {
+                                    ofSafe = false;
+                                    rejectReason = "ofGeometry";
+                                    break;
+                                }
+
+                                const bool trialEligible =
+                                    (
+                                        trialOwnVol > scalar(0)
+                                     && (
+                                            v1Neighbour[faceI] < 0
+                                         || trialNeiVol > scalar(0)
+                                        )
+                                    );
+
+                                // Faces still attached to an existing
+                                // negative cell are handled when that cell
+                                // receives its own repair.  Their skew and
+                                // orthogonality are not meaningful yet.
+                                if( !trialEligible )
+                                    continue;
+
+                                if( trialPyrBad )
+                                    ++trialBadPyrCount;
+
+                                trialMaxSkew =
+                                    Foam::max
+                                    (
+                                        trialMaxSkew,
+                                        trialSkew
+                                    );
+
+                                if( v1Neighbour[faceI] >= 0 )
+                                {
+                                    trialMinOrtho =
+                                        Foam::min
+                                        (
+                                            trialMinOrtho,
+                                            trialOrtho
+                                        );
+                                }
+
+                                const bool baselineEligible =
+                                    baselineOFEligible[faceI];
+
+                                if( !baselineEligible )
+                                {
+                                    // The candidate has converted a face
+                                    // next to an invalid cell into fully
+                                    // positive FV geometry.  It must now
+                                    // satisfy absolute production safety.
+                                    if( trialPyrBad )
+                                    {
+                                        Info
+                                            << "BL_VALIDITY_REPAIR_V1C_PYRFAIL"
+                                            << " cell=" << badCellI
+                                            << " parent="
+                                            << exactVolumeParent[badCellI]
+                                            << " localChild="
+                                            << exactVolumeLocalChild[badCellI]
+                                            << " splitEdge=" << seI
+                                            << " amplitude=" << amplitude
+                                            << " face=" << faceI
+                                            << " owner="
+                                            << exactOwner[faceI]
+                                            << " neighbour="
+                                            << v1Neighbour[faceI]
+                                            << " baselineEligible="
+                                            << baselineEligible
+                                            << " baselinePyrBad="
+                                            << baselineOFPyrBad[faceI]
+                                            << " baselinePyrMargin="
+                                            << baselineOFPyrMargin[faceI]
+                                            << " trialPyrMargin="
+                                            << trialPyrMargin
+                                            << " trialSkew="
+                                            << trialSkew
+                                            << " trialOrtho="
+                                            << trialOrtho
+                                            << " facePoints="
+                                            << v1Faces[faceI]
+                                            << " pointEdges=(";
+
+                                        const face& diagFace =
+                                            v1Faces[faceI];
+
+                                        forAll(diagFace, dpi)
+                                        {
+                                            const label pointI =
+                                                diagFace[dpi];
+
+                                            std::map<label,label>::
+                                                const_iterator peIt =
+                                                    v1PointEdge.find
+                                                    (
+                                                        pointI
+                                                    );
+
+                                            Info
+                                                << pointI
+                                                << ":";
+
+                                            if
+                                            (
+                                                peIt
+                                             != v1PointEdge.end()
+                                            )
+                                            {
+                                                Info << peIt->second;
+                                            }
+                                            else
+                                            {
+                                                Info << -1;
+                                            }
+
+                                            if
+                                            (
+                                                dpi
+                                              < diagFace.size()-1
+                                            )
+                                                Info << ",";
+                                        }
+
+                                        Info << ")" << endl;
+
+                                        ofSafe = false;
+                                        rejectReason = "newPyramid";
+                                        break;
+                                    }
+
+                                    if( trialSkew > v1CSkewLimit )
+                                    {
+                                        ofSafe = false;
+                                        rejectReason = "newSkew";
+                                        break;
+                                    }
+
+                                    if
+                                    (
+                                        v1Neighbour[faceI] >= 0
+                                     && trialOrtho < v1COrtho90
+                                    )
+                                    {
+                                        ofSafe = false;
+                                        rejectReason = "newNonOrtho90";
+                                        break;
+                                    }
+
+                                    continue;
+                                }
+
+
+                                const bool basePyrBad =
+                                    baselineOFPyrBad[faceI];
+
+                                const scalar basePyrMargin =
+                                    baselineOFPyrMargin[faceI];
+
+                                if
+                                (
+                                    !basePyrBad
+                                 && trialPyrBad
+                                )
+                                {
+                                    Info
+                                        << "BL_VALIDITY_REPAIR_V1C_PYRFAIL"
+                                        << " cell=" << badCellI
+                                        << " parent="
+                                        << exactVolumeParent[badCellI]
+                                        << " localChild="
+                                        << exactVolumeLocalChild[badCellI]
+                                        << " splitEdge=" << seI
+                                        << " amplitude=" << amplitude
+                                        << " face=" << faceI
+                                        << " owner="
+                                        << exactOwner[faceI]
+                                        << " neighbour="
+                                        << v1Neighbour[faceI]
+                                        << " baselineEligible="
+                                        << baselineEligible
+                                        << " baselinePyrBad="
+                                        << basePyrBad
+                                        << " baselinePyrMargin="
+                                        << basePyrMargin
+                                        << " trialPyrMargin="
+                                        << trialPyrMargin
+                                        << " trialSkew="
+                                        << trialSkew
+                                        << " trialOrtho="
+                                        << trialOrtho
+                                        << " facePoints="
+                                        << v1Faces[faceI]
+                                        << " pointEdges=(";
+
+                                    const face& diagFace =
+                                        v1Faces[faceI];
+
+                                    forAll(diagFace, dpi)
+                                    {
+                                        const label pointI =
+                                            diagFace[dpi];
+
+                                        std::map<label,label>::
+                                            const_iterator peIt =
+                                                v1PointEdge.find
+                                                (
+                                                    pointI
+                                                );
+
+                                        Info
+                                            << pointI
+                                            << ":";
+
+                                        if
+                                        (
+                                            peIt
+                                         != v1PointEdge.end()
+                                        )
+                                        {
+                                            Info << peIt->second;
+                                        }
+                                        else
+                                        {
+                                            Info << -1;
+                                        }
+
+                                        if
+                                        (
+                                            dpi
+                                          < diagFace.size()-1
+                                        )
+                                            Info << ",";
+                                    }
+
+                                    Info << ")" << endl;
+
+                                    ofSafe = false;
+                                    rejectReason = "newPyramid";
+                                    break;
+                                }
+
+                                if
+                                (
+                                    basePyrBad
+                                 && trialPyrBad
+                                )
+                                {
+                                    const scalar pyrTol =
+                                        scalar(1e-12)
+                                       *(
+                                            Foam::mag(basePyrMargin)
+                                          + SMALL
+                                        );
+
+                                    if
+                                    (
+                                        trialPyrMargin
+                                      < basePyrMargin-pyrTol
+                                    )
+                                    {
+                                        // Diagnostic-only:
+                                        // expose the EXISTING bad pyramid
+                                        // which blocks this candidate.
+                                        //
+                                        // Deduplicate by:
+                                        //
+                                        //     target cell
+                                        //     moved split edge
+                                        //     blocking face
+                                        //
+                                        // so the amplitude sweep does not
+                                        // emit thousands of equivalent lines.
+                                        const std::pair
+                                        <
+                                            label,
+                                            std::pair<label,label>
+                                        > diagKey =
+                                            std::make_pair
+                                            (
+                                                badCellI,
+                                                std::make_pair
+                                                (
+                                                    seI,
+                                                    faceI
+                                                )
+                                            );
+
+                                        if
+                                        (
+                                            blV1WorsePyrDiagSeen.insert
+                                            (
+                                                diagKey
+                                            ).second
+                                        )
+                                        {
+                                            const face& diagFace =
+                                                v1Faces[faceI];
+
+                                            bool movedEdgeOnFace =
+                                                false;
+
+                                            std::set<label>
+                                                generatedFaceEdges;
+
+                                            forAll(diagFace, dpi)
+                                            {
+                                                const label pointI =
+                                                    diagFace[dpi];
+
+                                                std::map<label,label>::
+                                                    const_iterator peIt =
+                                                        v1PointEdge.find
+                                                        (
+                                                            pointI
+                                                        );
+
+                                                if
+                                                (
+                                                    peIt
+                                                 != v1PointEdge.end()
+                                                )
+                                                {
+                                                    generatedFaceEdges.insert
+                                                    (
+                                                        peIt->second
+                                                    );
+
+                                                    if
+                                                    (
+                                                        peIt->second
+                                                     == seI
+                                                    )
+                                                    {
+                                                        movedEdgeOnFace =
+                                                            true;
+                                                    }
+                                                }
+                                            }
+
+                                            const bool touchesTarget =
+                                                (
+                                                    exactOwner[faceI]
+                                                 == badCellI
+                                                 || v1Neighbour[faceI]
+                                                 == badCellI
+                                                );
+
+                                            // CFMitch production-quiet:
+                                            // per-trial PYRWORSE forensic
+                                            // output suppressed.  Quality
+                                            // rejection behavior unchanged.
+                                            (void)touchesTarget;
+                                            (void)movedEdgeOnFace;
+                                            (void)generatedFaceEdges;
+                                        }
+
+                                        ofSafe = false;
+                                        rejectReason = "worsePyramid";
+                                        break;
+                                    }
+                                }
+
+
+                                const scalar baseSkew =
+                                    baselineOFSkew[faceI];
+
+                                const scalar skewTol =
+                                    scalar(1e-10)
+                                   *(
+                                        scalar(1)
+                                      + Foam::mag(baseSkew)
+                                    );
+
+                                if( baseSkew <= v1CSkewLimit )
+                                {
+                                    if( trialSkew > v1CSkewLimit )
+                                    {
+                                        ofSafe = false;
+                                        rejectReason = "newSkew";
+                                        break;
+                                    }
+                                }
+                                else if
+                                (
+                                    trialSkew
+                                  > baseSkew+skewTol
+                                )
+                                {
+                                    ofSafe = false;
+                                    rejectReason = "worseSkew";
+                                    break;
+                                }
+
+
+                                if( v1Neighbour[faceI] >= 0 )
+                                {
+                                    const scalar baseOrtho =
+                                        baselineOFOrtho[faceI];
+
+                                    const scalar orthoTol =
+                                        scalar(1e-12);
+
+                                    if( baseOrtho >= v1COrtho90 )
+                                    {
+                                        if
+                                        (
+                                            trialOrtho < v1COrtho90
+                                        )
+                                        {
+                                            ofSafe = false;
+                                            rejectReason =
+                                                "newNonOrtho90";
+                                            break;
+                                        }
+                                    }
+                                    else if
+                                    (
+                                        trialOrtho
+                                      < baseOrtho-orthoTol
+                                    )
+                                    {
+                                        ofSafe = false;
+                                        rejectReason =
+                                            "worseNonOrtho";
+                                        break;
+                                    }
+                                }
+                            }
+
+
+                            if( !ofSafe )
+                            {
+                                // CFMitch production-quiet:
+                                // per-trial reject output suppressed.
+                                // rejectReason and all acceptance logic
+                                // remain unchanged.
+
+                                (void)rejectReason;
+                                continue;
+                            }
+
+
+                            // CFMitch V2.5 target-pyramid admissibility.
+                            //
+                            // Existing V1C permits a pre-existing bad
+                            // pyramid to remain when it does not worsen.
+                            // That is appropriate while rescuing a negative
+                            // cell, but it is insufficient when the pyramid
+                            // itself is the reason this positive cell was
+                            // seeded.
+                            //
+                            // For a quality-only target, require this trial
+                            // to eliminate every bad pyramid side belonging
+                            // to the target cell before it may enter the
+                            // candidate ranking.
+                            if( requirePyramidRepair )
+                            {
+                                const label trialTargetBadPyr =
+                                    v1CellBadPyramidCount(badCellI);
+
+                                if( trialTargetBadPyr != 0 )
+                                {
+                                    ++blV25TargetPyrRejects;
+                                    continue;
+                                }
+                            }
+
+
+                            scalar trialMaxMove = scalar(0);
+
+                            for
+                            (
+                                label rowI=1;
+                                rowI<rowSize-1;
+                                ++rowI
+                            )
+                            {
+                                const label pointI =
+                                    newVerticesForSplitEdge_
+                                    (
+                                        seI,
+                                        rowI
+                                    );
+
+                                trialMaxMove =
+                                    Foam::max
+                                    (
+                                        trialMaxMove,
+                                        mag
+                                        (
+                                            v1Points[pointI]
+                                          - originalPositions[rowI-1]
+                                        )
+                                    );
+                            }
+
+
+                            Info
+                                << "BL_VALIDITY_REPAIR_V1C_CANDIDATE"
+                                << " cell=" << badCellI
+                                << " splitEdge=" << seI
+                                << " amplitude=" << amplitude
+                                << " targetVol=" << targetVol
+                                << " targetOFVol=" << targetOFVol
+                                << " maxOFSkew=" << trialMaxSkew
+                                << " minOFOrtho=" << trialMinOrtho
+                                << " badOFPyr="
+                                << trialBadPyrCount
+                                << " maxPhysicalMove="
+                                << trialMaxMove
+                                << " minPositiveStarRatio="
+                                << minPositiveRatio
+                                << " minOFPositiveStarRatio="
+                                << minOFPositiveRatio
+                                << endl;
+
+
+                            // Deterministic lexicographic quality ranking:
+                            //
+                            //   1) fewer bad OF pyramids
+                            //   2) lower maximum OF skew
+                            //   3) higher minimum OF orthogonality
+                            //   4) smaller physical movement
+                            //   5) better raw-volume star preservation
+                            bool better = !found;
+
+                            if( found )
+                            {
+                                if
+                                (
+                                    trialBadPyrCount
+                                  < bestBadPyrCount
+                                )
+                                {
+                                    better = true;
+                                }
+                                else if
+                                (
+                                    trialBadPyrCount
+                                 == bestBadPyrCount
+                                )
+                                {
+                                    if
+                                    (
+                                        trialMaxSkew
+                                      < bestMaxOFSkew
+                                       - scalar(1e-12)
+                                    )
+                                    {
+                                        better = true;
+                                    }
+                                    else if
+                                    (
+                                        Foam::mag
+                                        (
+                                            trialMaxSkew
+                                          - bestMaxOFSkew
+                                        )
+                                      <= scalar(1e-12)
+                                    )
+                                    {
+                                        if
+                                        (
+                                            trialMinOrtho
+                                          > bestMinOFOrtho
+                                           + scalar(1e-12)
+                                        )
+                                        {
+                                            better = true;
+                                        }
+                                        else if
+                                        (
+                                            Foam::mag
+                                            (
+                                                trialMinOrtho
+                                              - bestMinOFOrtho
+                                            )
+                                          <= scalar(1e-12)
+                                        )
+                                        {
+                                            if
+                                            (
+                                                trialMaxMove
+                                              < bestMaxMove
+                                               - scalar(1e-15)
+                                            )
+                                            {
+                                                better = true;
+                                            }
+                                            else if
+                                            (
+                                                Foam::mag
+                                                (
+                                                    trialMaxMove
+                                                  - bestMaxMove
+                                                )
+                                              <= scalar(1e-15)
+                                             && minPositiveRatio
+                                              > bestMinRatio
+                                            )
+                                            {
+                                                better = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+
+                            if( better )
+                            {
+                                found = true;
+                                bestEdge = seI;
+                                bestAmplitude = amplitude;
+                                bestTargetVol = targetVol;
+                                bestTargetOFVol = targetOFVol;
+                                bestMinRatio = minPositiveRatio;
+                                bestMinOFRatio = minOFPositiveRatio;
+                                bestMaxOFSkew = trialMaxSkew;
+                                bestMinOFOrtho = trialMinOrtho;
+                                bestBadPyrCount =
+                                    trialBadPyrCount;
+                                bestMaxMove =
+                                    trialMaxMove;
+
+                                bestPositions.setSize(rowSize-2);
+
+                                for
+                                (
+                                    label rowI=1;
+                                    rowI<rowSize-1;
+                                    ++rowI
+                                )
+                                {
+                                    const label pointI =
+                                        newVerticesForSplitEdge_
+                                        (
+                                            seI,
+                                            rowI
+                                        );
+
+                                    bestPositions[rowI-1] =
+                                        v1Points[pointI];
+                                }
+                            }
+                        }
+                    }
+
+
+                    restoreChain();
+                }
+
+
+                // ======================================================
+                // CFMITCH V2.7.1 WALL-FACE COHERENT REPAIR
+                //
+                // The v2.7 forensic classifier established that the
+                // dominant unresolved type-1 quality population is:
+                //
+                //   - positive volume
+                //   - wallLayer == 0
+                //   - exactly one bad pyramid face
+                //   - that face is the original WALL_BASE
+                //
+                // Existing V1C moves one complete hair at a time.  For a
+                // WALL_BASE-only failure that can unnecessarily twist an
+                // otherwise-valid first cross-section.
+                //
+                // This bounded stage moves every hair rooted on the actual
+                // wall/base face with the SAME normalized amplitude.
+                //
+                // There is therefore only one scalar search variable:
+                //
+                //     alpha
+                //
+                // rather than the combinatorial alphaA/alphaB search used
+                // by V1D_PAIR.
+                //
+                // Every candidate is evaluated over the union of all
+                // participating incident-cell stars with the same
+                // production safety policy as V1C/V1D:
+                //
+                //   * target raw/OF volume remains meaningful positive
+                //   * positive neighbour volumes remain positive
+                //   * no positive neighbour loses more than 25% volume
+                //   * no new/worse bad pyramid
+                //   * no new/worse skew
+                //   * no new/worse >90-degree nonorthogonality
+                //   * quality target reaches zero bad pyramid faces
+                //
+                // No topology or layer-count change occurs here.
+                // ======================================================
+
+                bool v271FaceBreathCommitted = false;
+
+                if
+                (
+                    !found
+                 && requirePyramidRepair
+                 && badCellI >= 0
+                 && badCellI < label(exactVolumeParent.size())
+                 && badCellI < label(exactVolumeLocalChild.size())
+                 && badCellI < label(exactVolumeRefType.size())
+                 && exactVolumeRefType[badCellI] == 1
+                )
+                {
+                    const label v271BfI =
+                        cellToBaseBndFace_[badCellI];
+
+                    const label v271LocalChild =
+                        exactVolumeLocalChild[badCellI];
+
+                    bool v271Eligible =
+                        (
+                            v271BfI >= 0
+                         && v271BfI <
+                            label(nLayersAtBndFace_.size())
+                         && v271LocalChild >= 0
+                        );
+
+                    label v271N = -1;
+                    label v271WallLayer = -1;
+
+                    if( v271Eligible )
+                    {
+                        v271N =
+                            nLayersAtBndFace_[v271BfI];
+
+                        v271WallLayer =
+                            v271N
+                          - 1
+                          - v271LocalChild;
+
+                        if
+                        (
+                            v271N < 2
+                         || v271WallLayer != 0
+                        )
+                            v271Eligible = false;
+                    }
+
+
+                    // --------------------------------------------------
+                    // Find every pyramid-bad face belonging specifically
+                    // to THIS target cell, using exactly the same owner /
+                    // neighbour sign convention as
+                    // v1CellBadPyramidCount().
+                    //
+                    // For this first experiment require exactly one bad
+                    // face, and require every vertex of that face to be a
+                    // known hair root.  That is our topology-derived
+                    // WALL_BASE classification.
+                    // --------------------------------------------------
+
+                    label v271BadFaceI = -1;
+                    label v271BadFaceCount = 0;
+                    label v271WallBaseBadCount = 0;
+
+                    point v271TargetCentre(vector::zero);
+                    scalar v271TargetOFVolBefore = -GREAT;
+
+                    if
+                    (
+                        v271Eligible
+                     && !v1OFCellCentreVolume
+                        (
+                            badCellI,
+                            v271TargetCentre,
+                            v271TargetOFVolBefore
+                        )
+                    )
+                    {
+                        v271Eligible = false;
+                    }
+
+                    if( v271Eligible )
+                    {
+                        const cell& v271Cell =
+                            v1Cells[badCellI];
+
+                        forAll(v271Cell, cfI)
+                        {
+                            const label faceI =
+                                v271Cell[cfI];
+
+                            if
+                            (
+                                faceI < 0
+                             || faceI >= label(v1Faces.size())
+                             || faceI >= label(exactOwner.size())
+                             || faceI >= label(v1Neighbour.size())
+                            )
+                            {
+                                v271Eligible = false;
+                                break;
+                            }
+
+                            const scalar pyrVol =
+                                pyramidPointFaceRef
+                                (
+                                    v1Faces[faceI],
+                                    v271TargetCentre
+                                ).mag(v1Points);
+
+                            bool badForTarget = false;
+
+                            if( exactOwner[faceI] == badCellI )
+                            {
+                                if( pyrVol > SMALL )
+                                    badForTarget = true;
+                            }
+                            else if
+                            (
+                                v1Neighbour[faceI] == badCellI
+                            )
+                            {
+                                if( pyrVol < -SMALL )
+                                    badForTarget = true;
+                            }
+                            else
+                            {
+                                v271Eligible = false;
+                                break;
+                            }
+
+                            if( !badForTarget )
+                                continue;
+
+                            ++v271BadFaceCount;
+
+                            bool allHairStarts = true;
+
+                            const face& f =
+                                v1Faces[faceI];
+
+                            forAll(f, fpI)
+                            {
+                                if
+                                (
+                                    !v1HairStartPoints.found
+                                    (
+                                        f[fpI]
+                                    )
+                                )
+                                {
+                                    allHairStarts = false;
+                                    break;
+                                }
+                            }
+
+                            if( allHairStarts )
+                            {
+                                ++v271WallBaseBadCount;
+                                v271BadFaceI = faceI;
+                            }
+                        }
+                    }
+
+                    if
+                    (
+                        v271Eligible
+                     && (
+                            v271BadFaceCount != 1
+                         || v271WallBaseBadCount != 1
+                         || v271BadFaceI < 0
+                        )
+                    )
+                    {
+                        v271Eligible = false;
+                    }
+
+
+                    if( v271Eligible )
+                    {
+                        ++blV271FaceBreathEligible;
+
+                        const face& v271WallFace =
+                            v1Faces[v271BadFaceI];
+
+                        labelHashSet v271BadCellPoints;
+
+                        const cell& v271BadCell =
+                            v1Cells[badCellI];
+
+                        forAll(v271BadCell, cfI)
+                        {
+                            const face& f =
+                                v1Faces[v271BadCell[cfI]];
+
+                            forAll(f, fpI)
+                                v271BadCellPoints.insert(f[fpI]);
+                        }
+
+
+                        // ----------------------------------------------
+                        // Derive exactly one participating hair from each
+                        // wall/base vertex.
+                        //
+                        // The hair must:
+                        //   - start at this wall vertex
+                        //   - contain generated rows
+                        //   - have its first generated point in the target
+                        //     first child
+                        //
+                        // Ambiguous mappings fail closed.
+                        // ----------------------------------------------
+
+                        std::set<label> v271Edges;
+                        bool v271ParticipantsValid = true;
+
+                        forAll(v271WallFace, fpI)
+                        {
+                            const label wallPointI =
+                                v271WallFace[fpI];
+
+                            if
+                            (
+                                wallPointI < 0
+                             || wallPointI >=
+                                label(splitEdgesAtPoint_.size())
+                            )
+                            {
+                                v271ParticipantsValid = false;
+                                break;
+                            }
+
+                            label matchedEdge = -1;
+                            label nMatches = 0;
+
+                            forAllRow
+                            (
+                                splitEdgesAtPoint_,
+                                wallPointI,
+                                sepI
+                            )
+                            {
+                                const label seI =
+                                    splitEdgesAtPoint_
+                                    (
+                                        wallPointI,
+                                        sepI
+                                    );
+
+                                if
+                                (
+                                    seI < 0
+                                 || seI >= label(splitEdges_.size())
+                                )
+                                    continue;
+
+                                const edge& se =
+                                    splitEdges_[seI];
+
+                                if( se.start() != wallPointI )
+                                    continue;
+
+                                const label rowSize =
+                                    newVerticesForSplitEdge_.
+                                        sizeOfRow(seI);
+
+                                if( rowSize < 3 )
+                                    continue;
+
+                                const label firstPointI =
+                                    newVerticesForSplitEdge_
+                                    (
+                                        seI,
+                                        1
+                                    );
+
+                                if
+                                (
+                                    !v271BadCellPoints.found
+                                    (
+                                        firstPointI
+                                    )
+                                )
+                                    continue;
+
+                                matchedEdge = seI;
+                                ++nMatches;
+                            }
+
+                            if( nMatches != 1 )
+                            {
+                                v271ParticipantsValid = false;
+                                break;
+                            }
+
+                            v271Edges.insert(matchedEdge);
+                        }
+
+                        if
+                        (
+                            v271ParticipantsValid
+                         && label(v271Edges.size()) !=
+                            label(v271WallFace.size())
+                        )
+                        {
+                            v271ParticipantsValid = false;
+                        }
+
+
+                        if( !v271ParticipantsValid )
+                        {
+                            ++blV271FaceBreathSkipped;
+
+                            Info
+                                << "CFMITCH V2.7.1 WALLFACE SKIP:"
+                                << " cell=" << badCellI
+                                << " parent="
+                                << exactVolumeParent[badCellI]
+                                << " bfI=" << v271BfI
+                                << " localChild="
+                                << v271LocalChild
+                                << " reason=participantMapping"
+                                << " wallFacePts="
+                                << v271WallFace.size()
+                                << " mappedEdges="
+                                << v271Edges.size()
+                                << endl;
+                        }
+                        else
+                        {
+                            ++blV271FaceBreathAttempted;
+
+
+                            // ------------------------------------------
+                            // Capture every complete participating chain.
+                            // ------------------------------------------
+
+                            std::map<label,point>
+                                v271EdgeStart;
+
+                            std::map<label,vector>
+                                v271EdgeVec;
+
+                            std::map<label,label>
+                                v271RowSize;
+
+                            std::map<label,List<point> >
+                                v271OriginalPositions;
+
+                            std::map<label,List<scalar> >
+                                v271OriginalT;
+
+                            // Generated point labels must be unique across
+                            // participating hairs for this first prototype.
+                            // Shared/degenerate chains fail closed.
+                            std::map<label,label>
+                                v271GeneratedPointEdge;
+
+                            bool v271CaptureValid = true;
+
+
+                            for
+                            (
+                                std::set<label>::const_iterator
+                                    eIt=v271Edges.begin();
+                                eIt!=v271Edges.end();
+                                ++eIt
+                            )
+                            {
+                                const label edgeI = *eIt;
+
+                                const edge& se =
+                                    splitEdges_[edgeI];
+
+                                const point edgeStart =
+                                    v1Points[se.start()];
+
+                                const point edgeEnd =
+                                    v1Points[se.end()];
+
+                                const vector edgeVec =
+                                    edgeEnd-edgeStart;
+
+                                const scalar edgeMagSqr =
+                                    magSqr(edgeVec);
+
+                                if( edgeMagSqr <= VSMALL )
+                                {
+                                    v271CaptureValid = false;
+                                    break;
+                                }
+
+                                const label rowSize =
+                                    newVerticesForSplitEdge_.
+                                        sizeOfRow(edgeI);
+
+                                if( rowSize < 3 )
+                                {
+                                    v271CaptureValid = false;
+                                    break;
+                                }
+
+                                List<point> originalPositions
+                                (
+                                    rowSize-2
+                                );
+
+                                List<scalar> originalT
+                                (
+                                    rowSize
+                                );
+
+                                originalT[0] =
+                                    scalar(0);
+
+                                originalT[rowSize-1] =
+                                    scalar(1);
+
+                                for
+                                (
+                                    label rowI=1;
+                                    rowI<rowSize-1;
+                                    ++rowI
+                                )
+                                {
+                                    const label pointI =
+                                        newVerticesForSplitEdge_
+                                        (
+                                            edgeI,
+                                            rowI
+                                        );
+
+                                    std::map<label,label>::
+                                        iterator gpIt =
+                                            v271GeneratedPointEdge.find
+                                            (
+                                                pointI
+                                            );
+
+                                    if
+                                    (
+                                        gpIt !=
+                                        v271GeneratedPointEdge.end()
+                                     && gpIt->second != edgeI
+                                    )
+                                    {
+                                        v271CaptureValid = false;
+                                        break;
+                                    }
+
+                                    v271GeneratedPointEdge[pointI] =
+                                        edgeI;
+
+                                    originalPositions[rowI-1] =
+                                        v1Points[pointI];
+
+                                    originalT[rowI] =
+                                        (
+                                            (v1Points[pointI]-edgeStart)
+                                          & edgeVec
+                                        )
+                                       /(edgeMagSqr + VSMALL);
+
+                                    if
+                                    (
+                                        !(originalT[rowI] >
+                                            originalT[rowI-1])
+                                     || !(originalT[rowI] <
+                                            scalar(1))
+                                    )
+                                    {
+                                        v271CaptureValid = false;
+                                        break;
+                                    }
+                                }
+
+                                if( !v271CaptureValid )
+                                    break;
+
+                                v271EdgeStart[edgeI] =
+                                    edgeStart;
+
+                                v271EdgeVec[edgeI] =
+                                    edgeVec;
+
+                                v271RowSize[edgeI] =
+                                    rowSize;
+
+                                v271OriginalPositions[edgeI] =
+                                    originalPositions;
+
+                                v271OriginalT[edgeI] =
+                                    originalT;
+                            }
+
+
+                            if( !v271CaptureValid )
+                            {
+                                ++blV271FaceBreathSkipped;
+
+                                Info
+                                    << "CFMITCH V2.7.1 WALLFACE SKIP:"
+                                    << " cell=" << badCellI
+                                    << " parent="
+                                    << exactVolumeParent[badCellI]
+                                    << " bfI=" << v271BfI
+                                    << " localChild="
+                                    << v271LocalChild
+                                    << " reason=chainCapture"
+                                    << " edges="
+                                    << v271Edges.size()
+                                    << endl;
+                            }
+                            else
+                            {
+                                auto v271Restore =
+                                [&]()
+                                {
+                                    for
+                                    (
+                                        std::set<label>::const_iterator
+                                            eIt=v271Edges.begin();
+                                        eIt!=v271Edges.end();
+                                        ++eIt
+                                    )
+                                    {
+                                        const label edgeI =
+                                            *eIt;
+
+                                        const label rowSize =
+                                            v271RowSize[edgeI];
+
+                                        const List<point>&
+                                            originalPositions =
+                                                v271OriginalPositions
+                                                [
+                                                    edgeI
+                                                ];
+
+                                        for
+                                        (
+                                            label rowI=1;
+                                            rowI<rowSize-1;
+                                            ++rowI
+                                        )
+                                        {
+                                            const label pointI =
+                                                newVerticesForSplitEdge_
+                                                (
+                                                    edgeI,
+                                                    rowI
+                                                );
+
+                                            v1Points[pointI] =
+                                                originalPositions
+                                                [
+                                                    rowI-1
+                                                ];
+                                        }
+                                    }
+                                };
+
+
+                                auto v271Apply =
+                                [&]
+                                (
+                                    const scalar amplitude
+                                ) -> bool
+                                {
+                                    for
+                                    (
+                                        std::set<label>::const_iterator
+                                            eIt=v271Edges.begin();
+                                        eIt!=v271Edges.end();
+                                        ++eIt
+                                    )
+                                    {
+                                        const label edgeI =
+                                            *eIt;
+
+                                        const point& edgeStart =
+                                            v271EdgeStart[edgeI];
+
+                                        const vector& edgeVec =
+                                            v271EdgeVec[edgeI];
+
+                                        const label rowSize =
+                                            v271RowSize[edgeI];
+
+                                        const List<scalar>&
+                                            originalT =
+                                                v271OriginalT[edgeI];
+
+                                        const scalar firstT =
+                                            originalT[1];
+
+                                        if
+                                        (
+                                            firstT <= scalar(0)
+                                         || firstT >= scalar(1)
+                                        )
+                                        {
+                                            v271Restore();
+                                            return false;
+                                        }
+
+                                        scalar prevT =
+                                            scalar(0);
+
+                                        for
+                                        (
+                                            label rowI=1;
+                                            rowI<rowSize-1;
+                                            ++rowI
+                                        )
+                                        {
+                                            const scalar t =
+                                                originalT[rowI];
+
+                                            const scalar decayBase =
+                                                Foam::max
+                                                (
+                                                    scalar(0),
+                                                    (scalar(1)-t)
+                                                   /(
+                                                        scalar(1)-firstT
+                                                      + VSMALL
+                                                    )
+                                                );
+
+                                            const scalar deltaT =
+                                                amplitude
+                                               *firstT
+                                               *Foam::pow
+                                                (
+                                                    decayBase,
+                                                    scalar(4)
+                                                );
+
+                                            const scalar warpedT =
+                                                t + deltaT;
+
+                                            if
+                                            (
+                                                !(warpedT > prevT)
+                                             || !(warpedT <
+                                                    originalT[rowI+1])
+                                            )
+                                            {
+                                                v271Restore();
+                                                return false;
+                                            }
+
+                                            const label pointI =
+                                                newVerticesForSplitEdge_
+                                                (
+                                                    edgeI,
+                                                    rowI
+                                                );
+
+                                            v1Points[pointI] =
+                                                edgeStart
+                                              + warpedT*edgeVec;
+
+                                            prevT =
+                                                warpedT;
+                                        }
+                                    }
+
+                                    return true;
+                                };
+
+
+                                // --------------------------------------
+                                // Union of all participating hair stars.
+                                // --------------------------------------
+
+                                std::set<label> v271UnionStar;
+                                bool v271BaselineValid = true;
+
+                                for
+                                (
+                                    std::set<label>::const_iterator
+                                        eIt=v271Edges.begin();
+                                    eIt!=v271Edges.end();
+                                    ++eIt
+                                )
+                                {
+                                    std::map
+                                    <
+                                        label,
+                                        std::set<label>
+                                    >::const_iterator starIt =
+                                        v1EdgeCells.find(*eIt);
+
+                                    if
+                                    (
+                                        starIt == v1EdgeCells.end()
+                                     || starIt->second.empty()
+                                    )
+                                    {
+                                        v271BaselineValid = false;
+                                        break;
+                                    }
+
+                                    v271UnionStar.insert
+                                    (
+                                        starIt->second.begin(),
+                                        starIt->second.end()
+                                    );
+                                }
+
+
+                                std::map<label,scalar>
+                                    v271BaselineVolumes;
+
+                                std::map<label,scalar>
+                                    v271BaselineOFVolumes;
+
+
+                                if( v271BaselineValid )
+                                {
+                                    for
+                                    (
+                                        std::set<label>::const_iterator
+                                            cIt=v271UnionStar.begin();
+                                        cIt!=v271UnionStar.end();
+                                        ++cIt
+                                    )
+                                    {
+                                        v271BaselineVolumes[*cIt] =
+                                            v1CellVolume(*cIt);
+
+                                        point cc(vector::zero);
+                                        scalar cv = -GREAT;
+
+                                        if
+                                        (
+                                            !v1OFCellCentreVolume
+                                            (
+                                                *cIt,
+                                                cc,
+                                                cv
+                                            )
+                                        )
+                                        {
+                                            v271BaselineValid = false;
+                                            break;
+                                        }
+
+                                        v271BaselineOFVolumes[*cIt] =
+                                            cv;
+                                    }
+                                }
+
+
+                                std::set<label>
+                                    v271AffectedFaces;
+
+                                if( v271BaselineValid )
+                                {
+                                    for
+                                    (
+                                        std::set<label>::const_iterator
+                                            cIt=v271UnionStar.begin();
+                                        cIt!=v271UnionStar.end();
+                                        ++cIt
+                                    )
+                                    {
+                                        const cell& starCell =
+                                            v1Cells[*cIt];
+
+                                        forAll(starCell, sfI)
+                                        {
+                                            v271AffectedFaces.insert
+                                            (
+                                                starCell[sfI]
+                                            );
+                                        }
+                                    }
+                                }
+
+
+                                std::map<label,scalar>
+                                    v271BaselineOFSkew;
+
+                                std::map<label,scalar>
+                                    v271BaselineOFOrtho;
+
+                                std::map<label,scalar>
+                                    v271BaselineOFPyrMargin;
+
+                                std::map<label,bool>
+                                    v271BaselineOFPyrBad;
+
+                                std::map<label,bool>
+                                    v271BaselineOFEligible;
+
+
+                                if( v271BaselineValid )
+                                {
+                                    for
+                                    (
+                                        std::set<label>::const_iterator
+                                            fIt=
+                                                v271AffectedFaces.begin();
+                                        fIt!=
+                                            v271AffectedFaces.end();
+                                        ++fIt
+                                    )
+                                    {
+                                        const label faceI =
+                                            *fIt;
+
+                                        scalar skew = GREAT;
+                                        scalar ortho = -GREAT;
+                                        scalar pyrMargin = -GREAT;
+                                        scalar ownVol = -GREAT;
+                                        scalar neiVol = -GREAT;
+                                        bool pyrBad = true;
+
+                                        if
+                                        (
+                                            !v1OFFaceQuality
+                                            (
+                                                faceI,
+                                                skew,
+                                                ortho,
+                                                pyrMargin,
+                                                pyrBad,
+                                                ownVol,
+                                                neiVol
+                                            )
+                                        )
+                                        {
+                                            v271BaselineValid = false;
+                                            break;
+                                        }
+
+                                        v271BaselineOFSkew[faceI] =
+                                            skew;
+
+                                        v271BaselineOFOrtho[faceI] =
+                                            ortho;
+
+                                        v271BaselineOFPyrMargin[faceI] =
+                                            pyrMargin;
+
+                                        v271BaselineOFPyrBad[faceI] =
+                                            pyrBad;
+
+                                        v271BaselineOFEligible[faceI] =
+                                            (
+                                                ownVol > scalar(0)
+                                             && (
+                                                    v1Neighbour[faceI] < 0
+                                                 || neiVol > scalar(0)
+                                                )
+                                            );
+                                    }
+                                }
+
+
+                                if( !v271BaselineValid )
+                                {
+                                    ++blV271FaceBreathSkipped;
+
+                                    Info
+                                        << "CFMITCH V2.7.1 WALLFACE SKIP:"
+                                        << " cell=" << badCellI
+                                        << " parent="
+                                        << exactVolumeParent[badCellI]
+                                        << " bfI=" << v271BfI
+                                        << " localChild="
+                                        << v271LocalChild
+                                        << " reason=baseline"
+                                        << " edges="
+                                        << v271Edges.size()
+                                        << endl;
+                                }
+                                else
+                                {
+                                    const scalar v271TargetFloor =
+                                        scalar(0.20)
+                                       *Foam::mag(badVolBefore);
+
+                                    static const scalar
+                                        v271SkewLimit =
+                                            scalar(4);
+
+                                    static const scalar
+                                        v271Ortho90 =
+                                            scalar(0);
+
+
+                                    bool v271Found = false;
+
+                                    scalar v271BestAmplitude =
+                                        scalar(0);
+
+                                    scalar v271BestTargetVol =
+                                        -GREAT;
+
+                                    scalar v271BestTargetOFVol =
+                                        -GREAT;
+
+                                    scalar v271BestMinRatio =
+                                        -GREAT;
+
+                                    scalar v271BestMinOFRatio =
+                                        -GREAT;
+
+                                    scalar v271BestMaxSkew =
+                                        GREAT;
+
+                                    scalar v271BestMinOrtho =
+                                        -GREAT;
+
+                                    scalar v271BestMaxMove =
+                                        GREAT;
+
+                                    label v271BestBadPyrCount =
+                                        labelMax;
+
+                                    std::map
+                                    <
+                                        label,
+                                        List<point>
+                                    >
+                                        v271BestPositions;
+
+
+                                    label v271Trials = 0;
+                                    label v271VolumePass = 0;
+                                    label v271QualityPass = 0;
+                                    label v271TargetReject = 0;
+                                    label v271QualityReject = 0;
+
+
+                                    for
+                                    (
+                                        label ampI=0;
+                                        ampI<nV1AmplitudeMag;
+                                        ++ampI
+                                    )
+                                    {
+                                        for
+                                        (
+                                            label sign=-1;
+                                            sign<=1;
+                                            sign+=2
+                                        )
+                                        {
+                                            v271Restore();
+
+                                            const scalar amplitude =
+                                                scalar(sign)
+                                               *v1AmplitudeMag[ampI];
+
+                                            if
+                                            (
+                                                !v271Apply(amplitude)
+                                            )
+                                                continue;
+
+                                            ++v271Trials;
+                                            ++blV271FaceBreathTrials;
+
+
+                                            // --------------------------
+                                            // Raw cfMesh volume gate.
+                                            // --------------------------
+
+                                            const scalar targetVol =
+                                                v1CellVolume
+                                                (
+                                                    badCellI
+                                                );
+
+                                            if
+                                            (
+                                                targetVol
+                                             <= v271TargetFloor
+                                            )
+                                                continue;
+
+                                            bool safe = true;
+
+                                            scalar minPositiveRatio =
+                                                GREAT;
+
+                                            for
+                                            (
+                                                std::set<label>::
+                                                    const_iterator
+                                                    cIt=
+                                                        v271UnionStar.begin();
+                                                cIt!=
+                                                    v271UnionStar.end();
+                                                ++cIt
+                                            )
+                                            {
+                                                const label starCellI =
+                                                    *cIt;
+
+                                                const scalar oldV =
+                                                    v271BaselineVolumes
+                                                    [
+                                                        starCellI
+                                                    ];
+
+                                                const scalar newV =
+                                                    v1CellVolume
+                                                    (
+                                                        starCellI
+                                                    );
+
+                                                if
+                                                (
+                                                    oldV > scalar(0)
+                                                )
+                                                {
+                                                    if
+                                                    (
+                                                        newV <= scalar(0)
+                                                    )
+                                                    {
+                                                        safe = false;
+                                                        break;
+                                                    }
+
+                                                    const scalar ratio =
+                                                        newV
+                                                       /(oldV + VSMALL);
+
+                                                    minPositiveRatio =
+                                                        Foam::min
+                                                        (
+                                                            minPositiveRatio,
+                                                            ratio
+                                                        );
+
+                                                    if
+                                                    (
+                                                        ratio
+                                                      < scalar(0.75)
+                                                    )
+                                                    {
+                                                        safe = false;
+                                                        break;
+                                                    }
+                                                }
+                                                else if
+                                                (
+                                                    newV < oldV
+                                                )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+                                            }
+
+                                            if( !safe )
+                                                continue;
+
+
+                                            // --------------------------
+                                            // OpenFOAM signed-volume gate.
+                                            // --------------------------
+
+                                            point targetOFCentre
+                                            (
+                                                vector::zero
+                                            );
+
+                                            scalar targetOFVol =
+                                                -GREAT;
+
+                                            if
+                                            (
+                                                !v1OFCellCentreVolume
+                                                (
+                                                    badCellI,
+                                                    targetOFCentre,
+                                                    targetOFVol
+                                                )
+                                            )
+                                                continue;
+
+                                            if
+                                            (
+                                                targetOFVol
+                                             <= v271TargetFloor
+                                            )
+                                                continue;
+
+                                            scalar minOFPositiveRatio =
+                                                GREAT;
+
+                                            for
+                                            (
+                                                std::set<label>::
+                                                    const_iterator
+                                                    cIt=
+                                                        v271UnionStar.begin();
+                                                cIt!=
+                                                    v271UnionStar.end();
+                                                ++cIt
+                                            )
+                                            {
+                                                const label starCellI =
+                                                    *cIt;
+
+                                                const scalar oldOFV =
+                                                    v271BaselineOFVolumes
+                                                    [
+                                                        starCellI
+                                                    ];
+
+                                                point newOFCentre
+                                                (
+                                                    vector::zero
+                                                );
+
+                                                scalar newOFV =
+                                                    -GREAT;
+
+                                                if
+                                                (
+                                                    !v1OFCellCentreVolume
+                                                    (
+                                                        starCellI,
+                                                        newOFCentre,
+                                                        newOFV
+                                                    )
+                                                )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+
+                                                if
+                                                (
+                                                    oldOFV > scalar(0)
+                                                )
+                                                {
+                                                    if
+                                                    (
+                                                        newOFV <= scalar(0)
+                                                    )
+                                                    {
+                                                        safe = false;
+                                                        break;
+                                                    }
+
+                                                    const scalar ratio =
+                                                        newOFV
+                                                       /(oldOFV + VSMALL);
+
+                                                    minOFPositiveRatio =
+                                                        Foam::min
+                                                        (
+                                                            minOFPositiveRatio,
+                                                            ratio
+                                                        );
+
+                                                    if
+                                                    (
+                                                        ratio
+                                                      < scalar(0.75)
+                                                    )
+                                                    {
+                                                        safe = false;
+                                                        break;
+                                                    }
+                                                }
+                                                else if
+                                                (
+                                                    newOFV < oldOFV
+                                                )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+                                            }
+
+                                            if( !safe )
+                                                continue;
+
+
+                                            ++v271VolumePass;
+                                            ++blV271FaceBreathVolumePass;
+
+
+                                            // --------------------------
+                                            // OpenFOAM-parity quality gate.
+                                            // --------------------------
+
+                                            bool ofSafe = true;
+
+                                            const char* v271RejectReason =
+                                                "none";
+
+                                            label v271RejectFace =
+                                                -1;
+
+                                            scalar trialMaxSkew =
+                                                scalar(0);
+
+                                            scalar trialMinOrtho =
+                                                GREAT;
+
+                                            label trialBadPyrCount =
+                                                0;
+
+
+                                            for
+                                            (
+                                                std::set<label>::
+                                                    const_iterator
+                                                    fIt=
+                                                        v271AffectedFaces.begin();
+                                                fIt!=
+                                                    v271AffectedFaces.end();
+                                                ++fIt
+                                            )
+                                            {
+                                                const label faceI =
+                                                    *fIt;
+
+                                                scalar trialSkew =
+                                                    GREAT;
+
+                                                scalar trialOrtho =
+                                                    -GREAT;
+
+                                                scalar trialPyrMargin =
+                                                    -GREAT;
+
+                                                scalar trialOwnVol =
+                                                    -GREAT;
+
+                                                scalar trialNeiVol =
+                                                    -GREAT;
+
+                                                bool trialPyrBad =
+                                                    true;
+
+
+                                                if
+                                                (
+                                                    !v1OFFaceQuality
+                                                    (
+                                                        faceI,
+                                                        trialSkew,
+                                                        trialOrtho,
+                                                        trialPyrMargin,
+                                                        trialPyrBad,
+                                                        trialOwnVol,
+                                                        trialNeiVol
+                                                    )
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    v271RejectReason =
+                                                        "ofGeometry";
+                                                    v271RejectFace =
+                                                        faceI;
+                                                    break;
+                                                }
+
+
+                                                const bool trialEligible =
+                                                    (
+                                                        trialOwnVol
+                                                      > scalar(0)
+                                                     && (
+                                                            v1Neighbour
+                                                            [
+                                                                faceI
+                                                            ] < 0
+                                                         || trialNeiVol
+                                                          > scalar(0)
+                                                        )
+                                                    );
+
+                                                if( !trialEligible )
+                                                    continue;
+
+
+                                                if( trialPyrBad )
+                                                {
+                                                    ++trialBadPyrCount;
+                                                }
+
+
+                                                trialMaxSkew =
+                                                    Foam::max
+                                                    (
+                                                        trialMaxSkew,
+                                                        trialSkew
+                                                    );
+
+
+                                                if
+                                                (
+                                                    v1Neighbour[faceI]
+                                                  >= 0
+                                                )
+                                                {
+                                                    trialMinOrtho =
+                                                        Foam::min
+                                                        (
+                                                            trialMinOrtho,
+                                                            trialOrtho
+                                                        );
+                                                }
+
+
+                                                const bool
+                                                    baselineEligible =
+                                                        v271BaselineOFEligible
+                                                        [
+                                                            faceI
+                                                        ];
+
+
+                                                if( !baselineEligible )
+                                                {
+                                                    if( trialPyrBad )
+                                                    {
+                                                        ofSafe = false;
+                                                        v271RejectReason =
+                                                            "newPyramid";
+                                                        v271RejectFace =
+                                                            faceI;
+                                                        break;
+                                                    }
+
+                                                    if
+                                                    (
+                                                        trialSkew
+                                                      > v271SkewLimit
+                                                    )
+                                                    {
+                                                        ofSafe = false;
+                                                        v271RejectReason =
+                                                            "newSkew";
+                                                        v271RejectFace =
+                                                            faceI;
+                                                        break;
+                                                    }
+
+                                                    if
+                                                    (
+                                                        v1Neighbour[faceI]
+                                                      >= 0
+                                                     && trialOrtho
+                                                      < v271Ortho90
+                                                    )
+                                                    {
+                                                        ofSafe = false;
+                                                        v271RejectReason =
+                                                            "newNonOrtho90";
+                                                        v271RejectFace =
+                                                            faceI;
+                                                        break;
+                                                    }
+
+                                                    continue;
+                                                }
+
+
+                                                const bool basePyrBad =
+                                                    v271BaselineOFPyrBad
+                                                    [
+                                                        faceI
+                                                    ];
+
+                                                const scalar
+                                                    basePyrMargin =
+                                                        v271BaselineOFPyrMargin
+                                                        [
+                                                            faceI
+                                                        ];
+
+
+                                                if
+                                                (
+                                                    !basePyrBad
+                                                 && trialPyrBad
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    v271RejectReason =
+                                                        "newPyramid";
+                                                    v271RejectFace =
+                                                        faceI;
+                                                    break;
+                                                }
+
+
+                                                if
+                                                (
+                                                    basePyrBad
+                                                 && trialPyrBad
+                                                )
+                                                {
+                                                    const scalar pyrTol =
+                                                        scalar(1e-12)
+                                                       *(
+                                                            Foam::mag
+                                                            (
+                                                                basePyrMargin
+                                                            )
+                                                          + SMALL
+                                                        );
+
+                                                    if
+                                                    (
+                                                        trialPyrMargin
+                                                      <
+                                                        basePyrMargin
+                                                       -pyrTol
+                                                    )
+                                                    {
+                                                        ofSafe = false;
+                                                        v271RejectReason =
+                                                            "worsePyramid";
+                                                        v271RejectFace =
+                                                            faceI;
+                                                        break;
+                                                    }
+                                                }
+
+
+                                                const scalar baseSkew =
+                                                    v271BaselineOFSkew
+                                                    [
+                                                        faceI
+                                                    ];
+
+                                                const scalar skewTol =
+                                                    scalar(1e-10)
+                                                   *(
+                                                        scalar(1)
+                                                      + Foam::mag
+                                                        (
+                                                            baseSkew
+                                                        )
+                                                    );
+
+
+                                                if
+                                                (
+                                                    baseSkew
+                                                  <= v271SkewLimit
+                                                )
+                                                {
+                                                    if
+                                                    (
+                                                        trialSkew
+                                                      > v271SkewLimit
+                                                    )
+                                                    {
+                                                        ofSafe = false;
+                                                        v271RejectReason =
+                                                            "newSkew";
+                                                        v271RejectFace =
+                                                            faceI;
+                                                        break;
+                                                    }
+                                                }
+                                                else if
+                                                (
+                                                    trialSkew
+                                                  > baseSkew+skewTol
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    v271RejectReason =
+                                                        "worseSkew";
+                                                    v271RejectFace =
+                                                        faceI;
+                                                    break;
+                                                }
+
+
+                                                if
+                                                (
+                                                    v1Neighbour[faceI]
+                                                  >= 0
+                                                )
+                                                {
+                                                    const scalar
+                                                        baseOrtho =
+                                                            v271BaselineOFOrtho
+                                                            [
+                                                                faceI
+                                                            ];
+
+                                                    const scalar orthoTol =
+                                                        scalar(1e-12);
+
+
+                                                    if
+                                                    (
+                                                        baseOrtho
+                                                      >= v271Ortho90
+                                                    )
+                                                    {
+                                                        if
+                                                        (
+                                                            trialOrtho
+                                                          < v271Ortho90
+                                                        )
+                                                        {
+                                                            ofSafe = false;
+                                                            v271RejectReason =
+                                                                "newNonOrtho90";
+                                                            v271RejectFace =
+                                                                faceI;
+                                                            break;
+                                                        }
+                                                    }
+                                                    else if
+                                                    (
+                                                        trialOrtho
+                                                      < baseOrtho
+                                                       -orthoTol
+                                                    )
+                                                    {
+                                                        ofSafe = false;
+                                                        v271RejectReason =
+                                                            "worseNonOrtho";
+                                                        v271RejectFace =
+                                                            faceI;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+
+                                            if( !ofSafe )
+                                            {
+                                                ++v271QualityReject;
+                                                ++blV271FaceBreathQualityReject;
+
+                                                if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "newPyramid"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectNewPyramid;
+                                                }
+                                                else if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "worsePyramid"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectWorsePyramid;
+                                                }
+                                                else if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "newSkew"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectNewSkew;
+                                                }
+                                                else if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "worseSkew"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectWorseSkew;
+                                                }
+                                                else if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "newNonOrtho90"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectNewNonOrtho90;
+                                                }
+                                                else if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "worseNonOrtho"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectWorseNonOrtho;
+                                                }
+                                                else if
+                                                (
+                                                    std::strcmp
+                                                    (
+                                                        v271RejectReason,
+                                                        "ofGeometry"
+                                                    ) == 0
+                                                )
+                                                {
+                                                    ++blV271RejectOFGeometry;
+                                                }
+                                                else
+                                                {
+                                                    ++blV271RejectOther;
+                                                }
+
+
+                                                bool rejectOnTargetFace =
+                                                    false;
+
+                                                if
+                                                (
+                                                    v271RejectFace >= 0
+                                                )
+                                                {
+                                                    const cell&
+                                                        targetCell =
+                                                            v1Cells
+                                                            [
+                                                                badCellI
+                                                            ];
+
+                                                    forAll
+                                                    (
+                                                        targetCell,
+                                                        tcfI
+                                                    )
+                                                    {
+                                                        if
+                                                        (
+                                                            targetCell[tcfI]
+                                                         ==
+                                                            v271RejectFace
+                                                        )
+                                                        {
+                                                            rejectOnTargetFace =
+                                                                true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+
+                                                if( rejectOnTargetFace )
+                                                {
+                                                    ++blV271RejectOnTargetCellFace;
+                                                }
+                                                else
+                                                {
+                                                    ++blV271RejectOnOtherStarFace;
+                                                }
+
+                                                continue;
+                                            }
+
+
+                                            // The quality-only target must
+                                            // actually be repaired, not just
+                                            // made "no worse".
+                                            const label
+                                                trialTargetBadPyr =
+                                                    v1CellBadPyramidCount
+                                                    (
+                                                        badCellI
+                                                    );
+
+                                            if
+                                            (
+                                                trialTargetBadPyr != 0
+                                            )
+                                            {
+                                                ++v271TargetReject;
+                                                ++blV271FaceBreathTargetReject;
+                                                continue;
+                                            }
+
+
+                                            ++v271QualityPass;
+                                            ++blV271FaceBreathQualityPass;
+
+
+                                            // --------------------------
+                                            // Maximum physical movement.
+                                            // --------------------------
+
+                                            scalar trialMaxMove =
+                                                scalar(0);
+
+                                            for
+                                            (
+                                                std::set<label>::
+                                                    const_iterator
+                                                    eIt=
+                                                        v271Edges.begin();
+                                                eIt!=
+                                                    v271Edges.end();
+                                                ++eIt
+                                            )
+                                            {
+                                                const label edgeI =
+                                                    *eIt;
+
+                                                const label rowSize =
+                                                    v271RowSize[edgeI];
+
+                                                const List<point>&
+                                                    originalPositions =
+                                                        v271OriginalPositions
+                                                        [
+                                                            edgeI
+                                                        ];
+
+                                                for
+                                                (
+                                                    label rowI=1;
+                                                    rowI<rowSize-1;
+                                                    ++rowI
+                                                )
+                                                {
+                                                    const label pointI =
+                                                        newVerticesForSplitEdge_
+                                                        (
+                                                            edgeI,
+                                                            rowI
+                                                        );
+
+                                                    trialMaxMove =
+                                                        Foam::max
+                                                        (
+                                                            trialMaxMove,
+                                                            mag
+                                                            (
+                                                                v1Points
+                                                                [
+                                                                    pointI
+                                                                ]
+                                                              -
+                                                                originalPositions
+                                                                [
+                                                                    rowI-1
+                                                                ]
+                                                            )
+                                                        );
+                                                }
+                                            }
+
+
+                                            // Same deterministic ranking
+                                            // used by V1C/V1D.
+                                            bool better =
+                                                !v271Found;
+
+                                            if( v271Found )
+                                            {
+                                                if
+                                                (
+                                                    trialBadPyrCount
+                                                  <
+                                                    v271BestBadPyrCount
+                                                )
+                                                {
+                                                    better = true;
+                                                }
+                                                else if
+                                                (
+                                                    trialBadPyrCount
+                                                 ==
+                                                    v271BestBadPyrCount
+                                                )
+                                                {
+                                                    if
+                                                    (
+                                                        trialMaxSkew
+                                                      <
+                                                        v271BestMaxSkew
+                                                       -scalar(1e-12)
+                                                    )
+                                                    {
+                                                        better = true;
+                                                    }
+                                                    else if
+                                                    (
+                                                        Foam::mag
+                                                        (
+                                                            trialMaxSkew
+                                                          -
+                                                            v271BestMaxSkew
+                                                        )
+                                                      <= scalar(1e-12)
+                                                    )
+                                                    {
+                                                        if
+                                                        (
+                                                            trialMinOrtho
+                                                          >
+                                                            v271BestMinOrtho
+                                                           +scalar(1e-12)
+                                                        )
+                                                        {
+                                                            better = true;
+                                                        }
+                                                        else if
+                                                        (
+                                                            Foam::mag
+                                                            (
+                                                                trialMinOrtho
+                                                              -
+                                                                v271BestMinOrtho
+                                                            )
+                                                          <= scalar(1e-12)
+                                                        )
+                                                        {
+                                                            if
+                                                            (
+                                                                trialMaxMove
+                                                              <
+                                                                v271BestMaxMove
+                                                               -scalar(1e-15)
+                                                            )
+                                                            {
+                                                                better = true;
+                                                            }
+                                                            else if
+                                                            (
+                                                                Foam::mag
+                                                                (
+                                                                    trialMaxMove
+                                                                  -
+                                                                    v271BestMaxMove
+                                                                )
+                                                              <= scalar(1e-15)
+                                                             &&
+                                                                minPositiveRatio
+                                                              >
+                                                                v271BestMinRatio
+                                                            )
+                                                            {
+                                                                better = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+
+                                            if( better )
+                                            {
+                                                v271Found = true;
+
+                                                v271BestAmplitude =
+                                                    amplitude;
+
+                                                v271BestTargetVol =
+                                                    targetVol;
+
+                                                v271BestTargetOFVol =
+                                                    targetOFVol;
+
+                                                v271BestMinRatio =
+                                                    minPositiveRatio;
+
+                                                v271BestMinOFRatio =
+                                                    minOFPositiveRatio;
+
+                                                v271BestMaxSkew =
+                                                    trialMaxSkew;
+
+                                                v271BestMinOrtho =
+                                                    trialMinOrtho;
+
+                                                v271BestBadPyrCount =
+                                                    trialBadPyrCount;
+
+                                                v271BestMaxMove =
+                                                    trialMaxMove;
+
+                                                v271BestPositions.clear();
+
+                                                for
+                                                (
+                                                    std::set<label>::
+                                                        const_iterator
+                                                        eIt=
+                                                            v271Edges.begin();
+                                                    eIt!=
+                                                        v271Edges.end();
+                                                    ++eIt
+                                                )
+                                                {
+                                                    const label edgeI =
+                                                        *eIt;
+
+                                                    const label rowSize =
+                                                        v271RowSize
+                                                        [
+                                                            edgeI
+                                                        ];
+
+                                                    List<point>
+                                                        positions
+                                                        (
+                                                            rowSize-2
+                                                        );
+
+                                                    for
+                                                    (
+                                                        label rowI=1;
+                                                        rowI<rowSize-1;
+                                                        ++rowI
+                                                    )
+                                                    {
+                                                        const label pointI =
+                                                            newVerticesForSplitEdge_
+                                                            (
+                                                                edgeI,
+                                                                rowI
+                                                            );
+
+                                                        positions[rowI-1] =
+                                                            v1Points[pointI];
+                                                    }
+
+                                                    v271BestPositions
+                                                    [
+                                                        edgeI
+                                                    ] = positions;
+                                                }
+                                            }
+                                        }
+                                    }
+
+
+                                    // All trial geometry must be gone before
+                                    // committing the selected transaction.
+                                    v271Restore();
+
+
+                                    Info
+                                        << "CFMITCH V2.7.1 WALLFACE SEARCH:"
+                                        << " cell=" << badCellI
+                                        << " parent="
+                                        << exactVolumeParent[badCellI]
+                                        << " bfI=" << v271BfI
+                                        << " localChild="
+                                        << v271LocalChild
+                                        << " wallLayer="
+                                        << v271WallLayer
+                                        << " edges="
+                                        << v271Edges.size()
+                                        << " trials="
+                                        << v271Trials
+                                        << " volumePass="
+                                        << v271VolumePass
+                                        << " qualityPass="
+                                        << v271QualityPass
+                                        << " rejectQuality="
+                                        << v271QualityReject
+                                        << " rejectTargetPyramid="
+                                        << v271TargetReject
+                                        << " found="
+                                        << (
+                                            v271Found
+                                          ? "true"
+                                          : "false"
+                                           )
+                                        << endl;
+
+
+                                    if( v271Found )
+                                    {
+                                        scalar maxPhysicalMove =
+                                            scalar(0);
+
+                                        for
+                                        (
+                                            std::set<label>::
+                                                const_iterator
+                                                eIt=
+                                                    v271Edges.begin();
+                                            eIt!=
+                                                v271Edges.end();
+                                            ++eIt
+                                        )
+                                        {
+                                            const label edgeI =
+                                                *eIt;
+
+                                            const label rowSize =
+                                                v271RowSize[edgeI];
+
+                                            const List<point>&
+                                                bestPositions =
+                                                    v271BestPositions
+                                                    [
+                                                        edgeI
+                                                    ];
+
+                                            for
+                                            (
+                                                label rowI=1;
+                                                rowI<rowSize-1;
+                                                ++rowI
+                                            )
+                                            {
+                                                const label pointI =
+                                                    newVerticesForSplitEdge_
+                                                    (
+                                                        edgeI,
+                                                        rowI
+                                                    );
+
+                                                maxPhysicalMove =
+                                                    Foam::max
+                                                    (
+                                                        maxPhysicalMove,
+                                                        mag
+                                                        (
+                                                            bestPositions
+                                                            [
+                                                                rowI-1
+                                                            ]
+                                                          -
+                                                            v1Points[pointI]
+                                                        )
+                                                    );
+
+                                                v1Points[pointI] =
+                                                    bestPositions[rowI-1];
+                                            }
+                                        }
+
+
+                                        const scalar committedVol =
+                                            v1CellVolume(badCellI);
+
+                                        const label committedBadPyr =
+                                            v1CellBadPyramidCount
+                                            (
+                                                badCellI
+                                            );
+
+
+                                        if
+                                        (
+                                            committedVol > scalar(0)
+                                         && committedBadPyr == 0
+                                        )
+                                        {
+                                            ++blV1Fixed;
+
+                                            blV1CommittedChains +=
+                                                v271Edges.size();
+
+                                            ++blV271FaceBreathFixed;
+
+                                            v271FaceBreathCommitted =
+                                                true;
+
+                                            Info
+                                                << "CFMITCH V2.7.1 WALLFACE MOVE:"
+                                                << " cell="
+                                                << badCellI
+                                                << " parent="
+                                                << exactVolumeParent
+                                                   [
+                                                       badCellI
+                                                   ]
+                                                << " bfI="
+                                                << v271BfI
+                                                << " localChild="
+                                                << v271LocalChild
+                                                << " edges="
+                                                << v271Edges.size()
+                                                << " amplitude="
+                                                << v271BestAmplitude
+                                                << " maxPhysicalMove="
+                                                << maxPhysicalMove
+                                                << " oldCellVol="
+                                                << badVolBefore
+                                                << " targetVol="
+                                                << v271BestTargetVol
+                                                << " committedVol="
+                                                << committedVol
+                                                << " targetOFVol="
+                                                << v271BestTargetOFVol
+                                                << " maxOFSkew="
+                                                << v271BestMaxSkew
+                                                << " minOFOrtho="
+                                                << v271BestMinOrtho
+                                                << " badOFPyr="
+                                                << v271BestBadPyrCount
+                                                << " minPositiveStarRatio="
+                                                << v271BestMinRatio
+                                                << " minOFPositiveStarRatio="
+                                                << v271BestMinOFRatio
+                                                << endl;
+                                        }
+                                        else
+                                        {
+                                            // Defensive fail-closed restore.
+                                            v271Restore();
+
+                                            Info
+                                                << "CFMITCH V2.7.1 WALLFACE COMMIT_REJECT:"
+                                                << " cell="
+                                                << badCellI
+                                                << " committedVol="
+                                                << committedVol
+                                                << " committedBadPyr="
+                                                << committedBadPyr
+                                                << endl;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+
+                // A successful coherent face transaction has already been
+                // committed atomically and accounted for.  Move directly
+                // to the next repair seed.
+                if( v271FaceBreathCommitted )
+                    continue;
+
+
+                // ======================================================
+                // BL_VALIDITY_REPAIR_V1D_PAIR
+                //
+                // Stage 2 fallback: if no coherent single hair can make
+                // the negative child solver-safe, search pairs of hairs
+                // which actually occur together on a face of the bad
+                // child.
+                //
+                // No Rotor37 edge ids are encoded here.  Candidate pairs
+                // are derived entirely from topology + v1PointEdge.
+                //
+                // Each trial:
+                //   - restores BOTH complete chains
+                //   - moves BOTH complete chains coherently
+                //   - evaluates the UNION of their incident-cell stars
+                //   - evaluates every face of that union with the same
+                //     OpenFOAM-parity quality rules used by v1c
+                //   - survives only as an atomic two-chain transaction
+                // ======================================================
+
+                // CFMitch v2.6:
+                //
+                // The paired-hair fallback is now available to both:
+                //   - historical negative-volume repair seeds
+                //   - positive-volume bad-pyramid quality seeds
+                //
+                // Quality-only seeds receive an additional target-cell
+                // pyramid-elimination gate below before a pair candidate
+                // is permitted into ranking.
+                // CFMitch v2.7.1:
+                //
+                // Positive-volume pyramid-quality seeds do not enter the
+                // combinatorial paired-hair fallback.  Eligible type-1
+                // wall-adjacent WALL_BASE-only targets have already received
+                // the bounded coherent wall-face search above.
+                //
+                // Preserve V1D_PAIR only for its original negative-volume
+                // rescue role.
+                if( !found && !requirePyramidRepair )
+                {
+                    std::set<std::pair<label,label> > pairEdges;
+
+
+                    // --------------------------------------------------
+                    // Discover hair pairs which share an actual face of
+                    // the negative child.
+                    // --------------------------------------------------
+
+                    forAll(badCell, cfI)
+                    {
+                        const face& f =
+                            v1Faces[badCell[cfI]];
+
+                        std::set<label> faceEdges;
+
+                        forAll(f, fpI)
+                        {
+                            std::map<label,label>::const_iterator peIt =
+                                v1PointEdge.find(f[fpI]);
+
+                            if( peIt != v1PointEdge.end() )
+                                faceEdges.insert(peIt->second);
+                        }
+
+                        for
+                        (
+                            std::set<label>::const_iterator
+                                aIt=faceEdges.begin();
+                            aIt!=faceEdges.end();
+                            ++aIt
+                        )
+                        {
+                            std::set<label>::const_iterator bIt = aIt;
+                            ++bIt;
+
+                            for
+                            (
+                                ;
+                                bIt!=faceEdges.end();
+                                ++bIt
+                            )
+                            {
+                                pairEdges.insert
+                                (
+                                    std::make_pair
+                                    (
+                                        *aIt,
+                                        *bIt
+                                    )
+                                );
+                            }
+                        }
+                    }
+
+
+                    // Keep the first paired search deliberately bounded.
+                    // Both signs are tested for both hairs.
+                    static const scalar v1DPairAmplitudeMag[] =
+                    {
+                        scalar(0.01),
+                        scalar(0.02),
+                        scalar(0.03),
+                        scalar(0.04),
+                        scalar(0.05),
+                        scalar(0.06),
+                        scalar(0.08),
+                        scalar(0.10),
+                        scalar(0.12),
+                        scalar(0.16),
+                        scalar(0.20),
+                        scalar(0.25),
+                        scalar(0.30),
+                        scalar(0.35),
+                        scalar(0.40),
+                        scalar(0.425),
+                        scalar(0.45),
+                        scalar(0.475),
+                        scalar(0.50)
+                    };
+
+                    static const label nV1DPairAmplitudeMag =
+                        sizeof(v1DPairAmplitudeMag)
+                       /sizeof(v1DPairAmplitudeMag[0]);
+
+                    // At least one member of a pair must remain a
+                    // compensating correction.  Either edge may be the
+                    // large mover; no topology-specific ordering is used.
+                    static const scalar v1DPairSecondaryMax =
+                        scalar(0.20);
+
+
+                    label v1DPairTrials = 0;
+                    label v1DPairVolumePass = 0;
+                    label v1DPairQualityPass = 0;
+
+                    label v1DRejectNewPyramid = 0;
+                    label v1DRejectWorsePyramid = 0;
+                    label v1DRejectNewSkew = 0;
+                    label v1DRejectWorseSkew = 0;
+                    label v1DRejectNewNonOrtho90 = 0;
+                    label v1DRejectWorseNonOrtho = 0;
+                    label v1DRejectOFGeometry = 0;
+
+                    // CFMitch v2.6:
+                    // Pair candidate passed the ordinary union-star
+                    // admissibility tests but failed to eliminate every
+                    // bad pyramid side belonging to the quality target.
+                    label v1DRejectTargetPyramid = 0;
+
+                    label v1DRejectOther = 0;
+
+
+                    // --------------------------------------------------
+                    // Generic chain capture helper.
+                    // --------------------------------------------------
+
+                    auto capturePairChain =
+                    [&]
+                    (
+                        const label edgeI,
+                        point& edgeStart,
+                        vector& edgeVec,
+                        label& rowSize,
+                        List<point>& originalPositions,
+                        List<scalar>& originalT
+                    ) -> bool
+                    {
+                        const edge& se =
+                            splitEdges_[edgeI];
+
+                        edgeStart =
+                            v1Points[se.start()];
+
+                        const point edgeEnd =
+                            v1Points[se.end()];
+
+                        edgeVec =
+                            edgeEnd-edgeStart;
+
+                        const scalar edgeMagSqr =
+                            magSqr(edgeVec);
+
+                        if( edgeMagSqr <= VSMALL )
+                            return false;
+
+                        rowSize =
+                            newVerticesForSplitEdge_.
+                                sizeOfRow(edgeI);
+
+                        if( rowSize < 3 )
+                            return false;
+
+                        originalPositions.setSize
+                        (
+                            rowSize-2
+                        );
+
+                        originalT.setSize
+                        (
+                            rowSize
+                        );
+
+                        originalT[0] =
+                            scalar(0);
+
+                        originalT[rowSize-1] =
+                            scalar(1);
+
+                        for
+                        (
+                            label rowI=1;
+                            rowI<rowSize-1;
+                            ++rowI
+                        )
+                        {
+                            const label pointI =
+                                newVerticesForSplitEdge_
+                                (
+                                    edgeI,
+                                    rowI
+                                );
+
+                            originalPositions[rowI-1] =
+                                v1Points[pointI];
+
+                            originalT[rowI] =
+                                (
+                                    (v1Points[pointI]-edgeStart)
+                                  & edgeVec
+                                )
+                               /(edgeMagSqr + VSMALL);
+
+                            if
+                            (
+                                !(originalT[rowI] > originalT[rowI-1])
+                             || !(originalT[rowI] < scalar(1))
+                            )
+                                return false;
+                        }
+
+                        return true;
+                    };
+
+
+                    // --------------------------------------------------
+                    // Generic coherent-chain amplitude helper.
+                    //
+                    // Caller owns restoration if this returns false.
+                    // --------------------------------------------------
+
+                    auto applyPairChain =
+                    [&]
+                    (
+                        const label edgeI,
+                        const point& edgeStart,
+                        const vector& edgeVec,
+                        const label rowSize,
+                        const List<scalar>& originalT,
+                        const scalar amplitude
+                    ) -> bool
+                    {
+                        const scalar firstT =
+                            originalT[1];
+
+                        if
+                        (
+                            firstT <= scalar(0)
+                         || firstT >= scalar(1)
+                        )
+                            return false;
+
+                        scalar prevT =
+                            scalar(0);
+
+                        for
+                        (
+                            label rowI=1;
+                            rowI<rowSize-1;
+                            ++rowI
+                        )
+                        {
+                            const scalar t =
+                                originalT[rowI];
+
+                            const scalar decayBase =
+                                Foam::max
+                                (
+                                    scalar(0),
+                                    (scalar(1)-t)
+                                   /(scalar(1)-firstT + VSMALL)
+                                );
+
+                            const scalar deltaT =
+                                amplitude
+                               *firstT
+                               *Foam::pow
+                                (
+                                    decayBase,
+                                    scalar(4)
+                                );
+
+                            const scalar warpedT =
+                                t + deltaT;
+
+                            if
+                            (
+                                !(warpedT > prevT)
+                             || !(warpedT < originalT[rowI+1])
+                            )
+                                return false;
+
+                            const label pointI =
+                                newVerticesForSplitEdge_
+                                (
+                                    edgeI,
+                                    rowI
+                                );
+
+                            v1Points[pointI] =
+                                edgeStart
+                              + warpedT*edgeVec;
+
+                            prevT =
+                                warpedT;
+                        }
+
+                        return true;
+                    };
+
+
+                    for
+                    (
+                        std::set<std::pair<label,label> >::const_iterator
+                            pairIt=pairEdges.begin();
+                        pairIt!=pairEdges.end();
+                        ++pairIt
+                    )
+                    {
+                        const label edgeA =
+                            pairIt->first;
+
+                        const label edgeB =
+                            pairIt->second;
+
+
+                        std::map
+                        <
+                            label,
+                            std::set<label>
+                        >::const_iterator starAIt =
+                            v1EdgeCells.find(edgeA);
+
+                        std::map
+                        <
+                            label,
+                            std::set<label>
+                        >::const_iterator starBIt =
+                            v1EdgeCells.find(edgeB);
+
+                        if
+                        (
+                            starAIt == v1EdgeCells.end()
+                         || starBIt == v1EdgeCells.end()
+                         || starAIt->second.empty()
+                         || starBIt->second.empty()
+                        )
+                            continue;
+
+
+                        point edgeStartA(vector::zero);
+                        point edgeStartB(vector::zero);
+
+                        vector edgeVecA(vector::zero);
+                        vector edgeVecB(vector::zero);
+
+                        label rowSizeA = 0;
+                        label rowSizeB = 0;
+
+                        List<point> originalPositionsA;
+                        List<point> originalPositionsB;
+
+                        List<scalar> originalTA;
+                        List<scalar> originalTB;
+
+
+                        if
+                        (
+                            !capturePairChain
+                            (
+                                edgeA,
+                                edgeStartA,
+                                edgeVecA,
+                                rowSizeA,
+                                originalPositionsA,
+                                originalTA
+                            )
+                         || !capturePairChain
+                            (
+                                edgeB,
+                                edgeStartB,
+                                edgeVecB,
+                                rowSizeB,
+                                originalPositionsB,
+                                originalTB
+                            )
+                        )
+                            continue;
+
+
+                        auto restorePair =
+                        [&]()
+                        {
+                            for
+                            (
+                                label rowI=1;
+                                rowI<rowSizeA-1;
+                                ++rowI
+                            )
+                            {
+                                const label pointI =
+                                    newVerticesForSplitEdge_
+                                    (
+                                        edgeA,
+                                        rowI
+                                    );
+
+                                v1Points[pointI] =
+                                    originalPositionsA[rowI-1];
+                            }
+
+                            for
+                            (
+                                label rowI=1;
+                                rowI<rowSizeB-1;
+                                ++rowI
+                            )
+                            {
+                                const label pointI =
+                                    newVerticesForSplitEdge_
+                                    (
+                                        edgeB,
+                                        rowI
+                                    );
+
+                                v1Points[pointI] =
+                                    originalPositionsB[rowI-1];
+                            }
+                        };
+
+
+                        // ----------------------------------------------
+                        // Union of both complete incident-cell stars.
+                        // ----------------------------------------------
+
+                        std::set<label> unionStar =
+                            starAIt->second;
+
+                        unionStar.insert
+                        (
+                            starBIt->second.begin(),
+                            starBIt->second.end()
+                        );
+
+
+                        std::map<label,scalar>
+                            pairBaselineVolumes;
+
+                        std::map<label,scalar>
+                            pairBaselineOFVolumes;
+
+
+                        bool pairBaselineValid = true;
+
+                        for
+                        (
+                            std::set<label>::const_iterator
+                                cIt=unionStar.begin();
+                            cIt!=unionStar.end();
+                            ++cIt
+                        )
+                        {
+                            pairBaselineVolumes[*cIt] =
+                                v1CellVolume(*cIt);
+
+                            point cc(vector::zero);
+                            scalar cv = -GREAT;
+
+                            if
+                            (
+                                !v1OFCellCentreVolume
+                                (
+                                    *cIt,
+                                    cc,
+                                    cv
+                                )
+                            )
+                            {
+                                pairBaselineValid = false;
+                                break;
+                            }
+
+                            pairBaselineOFVolumes[*cIt] =
+                                cv;
+                        }
+
+                        if( !pairBaselineValid )
+                            continue;
+
+
+                        // ----------------------------------------------
+                        // All faces whose direct geometry OR owner/
+                        // neighbour centre may change.
+                        // ----------------------------------------------
+
+                        std::set<label> pairAffectedFaces;
+
+                        for
+                        (
+                            std::set<label>::const_iterator
+                                cIt=unionStar.begin();
+                            cIt!=unionStar.end();
+                            ++cIt
+                        )
+                        {
+                            const cell& starCell =
+                                v1Cells[*cIt];
+
+                            forAll(starCell, sfI)
+                                pairAffectedFaces.insert(starCell[sfI]);
+                        }
+
+
+                        std::map<label,scalar>
+                            pairBaselineOFSkew;
+
+                        std::map<label,scalar>
+                            pairBaselineOFOrtho;
+
+                        std::map<label,scalar>
+                            pairBaselineOFPyrMargin;
+
+                        std::map<label,bool>
+                            pairBaselineOFPyrBad;
+
+                        std::map<label,bool>
+                            pairBaselineOFEligible;
+
+
+                        for
+                        (
+                            std::set<label>::const_iterator
+                                fIt=pairAffectedFaces.begin();
+                            fIt!=pairAffectedFaces.end();
+                            ++fIt
+                        )
+                        {
+                            const label faceI =
+                                *fIt;
+
+                            scalar skew = GREAT;
+                            scalar ortho = -GREAT;
+                            scalar pyrMargin = -GREAT;
+                            scalar ownVol = -GREAT;
+                            scalar neiVol = -GREAT;
+                            bool pyrBad = true;
+
+                            if
+                            (
+                                !v1OFFaceQuality
+                                (
+                                    faceI,
+                                    skew,
+                                    ortho,
+                                    pyrMargin,
+                                    pyrBad,
+                                    ownVol,
+                                    neiVol
+                                )
+                            )
+                            {
+                                pairBaselineValid = false;
+                                break;
+                            }
+
+                            pairBaselineOFSkew[faceI] =
+                                skew;
+
+                            pairBaselineOFOrtho[faceI] =
+                                ortho;
+
+                            pairBaselineOFPyrMargin[faceI] =
+                                pyrMargin;
+
+                            pairBaselineOFPyrBad[faceI] =
+                                pyrBad;
+
+                            pairBaselineOFEligible[faceI] =
+                                (
+                                    ownVol > scalar(0)
+                                 && (
+                                        v1Neighbour[faceI] < 0
+                                     || neiVol > scalar(0)
+                                    )
+                                );
+                        }
+
+                        if( !pairBaselineValid )
+                            continue;
+
+
+                        const scalar pairTargetFloor =
+                            scalar(0.20)
+                           *Foam::mag(badVolBefore);
+
+                        static const scalar v1DPairSkewLimit =
+                            scalar(4);
+
+                        static const scalar v1DPairOrtho90 =
+                            scalar(0);
+
+
+                        for
+                        (
+                            label ampAI=0;
+                            ampAI<nV1DPairAmplitudeMag;
+                            ++ampAI
+                        )
+                        {
+                            for
+                            (
+                                label signA=-1;
+                                signA<=1;
+                                signA+=2
+                            )
+                            {
+                                const scalar amplitudeA =
+                                    scalar(signA)
+                                   *v1DPairAmplitudeMag[ampAI];
+
+
+                                for
+                                (
+                                    label ampBI=0;
+                                    ampBI<nV1DPairAmplitudeMag;
+                                    ++ampBI
+                                )
+                                {
+                                    const scalar pairMagA =
+                                        v1DPairAmplitudeMag[ampAI];
+
+                                    const scalar pairMagB =
+                                        v1DPairAmplitudeMag[ampBI];
+
+                                    if
+                                    (
+                                        pairMagA > v1DPairSecondaryMax
+                                     && pairMagB > v1DPairSecondaryMax
+                                    )
+                                    {
+                                        continue;
+                                    }
+
+                                    for
+                                    (
+                                        label signB=-1;
+                                        signB<=1;
+                                        signB+=2
+                                    )
+                                    {
+                                        const scalar amplitudeB =
+                                            scalar(signB)
+                                           *v1DPairAmplitudeMag[ampBI];
+
+                                        restorePair();
+
+
+                                        if
+                                        (
+                                            !applyPairChain
+                                            (
+                                                edgeA,
+                                                edgeStartA,
+                                                edgeVecA,
+                                                rowSizeA,
+                                                originalTA,
+                                                amplitudeA
+                                            )
+                                        )
+                                        {
+                                            restorePair();
+                                            continue;
+                                        }
+
+                                        if
+                                        (
+                                            !applyPairChain
+                                            (
+                                                edgeB,
+                                                edgeStartB,
+                                                edgeVecB,
+                                                rowSizeB,
+                                                originalTB,
+                                                amplitudeB
+                                            )
+                                        )
+                                        {
+                                            restorePair();
+                                            continue;
+                                        }
+
+
+                                        ++v1DPairTrials;
+
+
+                                        // ----------------------------------
+                                        // Raw cfMesh signed-volume gate.
+                                        // ----------------------------------
+
+                                        const scalar targetVol =
+                                            v1CellVolume(badCellI);
+
+                                        if
+                                        (
+                                            targetVol
+                                         <= pairTargetFloor
+                                        )
+                                            continue;
+
+
+                                        bool safe = true;
+
+                                        scalar minPositiveRatio =
+                                            GREAT;
+
+
+                                        for
+                                        (
+                                            std::set<label>::const_iterator
+                                                cIt=unionStar.begin();
+                                            cIt!=unionStar.end();
+                                            ++cIt
+                                        )
+                                        {
+                                            const label starCellI =
+                                                *cIt;
+
+                                            const scalar oldV =
+                                                pairBaselineVolumes
+                                                [
+                                                    starCellI
+                                                ];
+
+                                            const scalar newV =
+                                                v1CellVolume
+                                                (
+                                                    starCellI
+                                                );
+
+                                            if( oldV > scalar(0) )
+                                            {
+                                                if( newV <= scalar(0) )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+
+                                                const scalar ratio =
+                                                    newV
+                                                   /(oldV + VSMALL);
+
+                                                minPositiveRatio =
+                                                    Foam::min
+                                                    (
+                                                        minPositiveRatio,
+                                                        ratio
+                                                    );
+
+                                                if
+                                                (
+                                                    ratio
+                                                  < scalar(0.75)
+                                                )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+                                            }
+                                            else if( newV < oldV )
+                                            {
+                                                safe = false;
+                                                break;
+                                            }
+                                        }
+
+                                        if( !safe )
+                                            continue;
+
+
+                                        // ----------------------------------
+                                        // OpenFOAM signed-volume gate.
+                                        // ----------------------------------
+
+                                        point targetOFCentre
+                                        (
+                                            vector::zero
+                                        );
+
+                                        scalar targetOFVol =
+                                            -GREAT;
+
+                                        if
+                                        (
+                                            !v1OFCellCentreVolume
+                                            (
+                                                badCellI,
+                                                targetOFCentre,
+                                                targetOFVol
+                                            )
+                                        )
+                                            continue;
+
+                                        if
+                                        (
+                                            targetOFVol
+                                         <= pairTargetFloor
+                                        )
+                                            continue;
+
+
+                                        scalar minOFPositiveRatio =
+                                            GREAT;
+
+
+                                        for
+                                        (
+                                            std::set<label>::const_iterator
+                                                cIt=unionStar.begin();
+                                            cIt!=unionStar.end();
+                                            ++cIt
+                                        )
+                                        {
+                                            const label starCellI =
+                                                *cIt;
+
+                                            const scalar oldOFV =
+                                                pairBaselineOFVolumes
+                                                [
+                                                    starCellI
+                                                ];
+
+                                            point newOFCentre
+                                            (
+                                                vector::zero
+                                            );
+
+                                            scalar newOFV =
+                                                -GREAT;
+
+                                            if
+                                            (
+                                                !v1OFCellCentreVolume
+                                                (
+                                                    starCellI,
+                                                    newOFCentre,
+                                                    newOFV
+                                                )
+                                            )
+                                            {
+                                                safe = false;
+                                                break;
+                                            }
+
+                                            if
+                                            (
+                                                oldOFV
+                                              > scalar(0)
+                                            )
+                                            {
+                                                if
+                                                (
+                                                    newOFV
+                                                 <= scalar(0)
+                                                )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+
+                                                const scalar ratio =
+                                                    newOFV
+                                                   /(oldOFV + VSMALL);
+
+                                                minOFPositiveRatio =
+                                                    Foam::min
+                                                    (
+                                                        minOFPositiveRatio,
+                                                        ratio
+                                                    );
+
+                                                if
+                                                (
+                                                    ratio
+                                                  < scalar(0.75)
+                                                )
+                                                {
+                                                    safe = false;
+                                                    break;
+                                                }
+                                            }
+                                            else if
+                                            (
+                                                newOFV < oldOFV
+                                            )
+                                            {
+                                                safe = false;
+                                                break;
+                                            }
+                                        }
+
+                                        if( !safe )
+                                            continue;
+
+
+                                        ++v1DPairVolumePass;
+
+
+                                        // ----------------------------------
+                                        // OpenFOAM-parity quality gate over
+                                        // the ENTIRE union-star face set.
+                                        // ----------------------------------
+
+                                        bool ofSafe = true;
+
+                                        scalar trialMaxSkew =
+                                            scalar(0);
+
+                                        scalar trialMinOrtho =
+                                            GREAT;
+
+                                        label trialBadPyrCount =
+                                            0;
+
+                                        label rejectFace =
+                                            -1;
+
+                                        const char* rejectReason =
+                                            "none";
+
+
+                                        for
+                                        (
+                                            std::set<label>::const_iterator
+                                                fIt=
+                                                    pairAffectedFaces.begin();
+                                            fIt!=
+                                                pairAffectedFaces.end();
+                                            ++fIt
+                                        )
+                                        {
+                                            const label faceI =
+                                                *fIt;
+
+                                            scalar trialSkew =
+                                                GREAT;
+
+                                            scalar trialOrtho =
+                                                -GREAT;
+
+                                            scalar trialPyrMargin =
+                                                -GREAT;
+
+                                            scalar trialOwnVol =
+                                                -GREAT;
+
+                                            scalar trialNeiVol =
+                                                -GREAT;
+
+                                            bool trialPyrBad =
+                                                true;
+
+
+                                            if
+                                            (
+                                                !v1OFFaceQuality
+                                                (
+                                                    faceI,
+                                                    trialSkew,
+                                                    trialOrtho,
+                                                    trialPyrMargin,
+                                                    trialPyrBad,
+                                                    trialOwnVol,
+                                                    trialNeiVol
+                                                )
+                                            )
+                                            {
+                                                ofSafe = false;
+                                                rejectFace = faceI;
+                                                rejectReason =
+                                                    "ofGeometry";
+                                                break;
+                                            }
+
+
+                                            const bool trialEligible =
+                                                (
+                                                    trialOwnVol
+                                                  > scalar(0)
+                                                 && (
+                                                        v1Neighbour
+                                                        [
+                                                            faceI
+                                                        ] < 0
+                                                     || trialNeiVol
+                                                      > scalar(0)
+                                                    )
+                                                );
+
+                                            if( !trialEligible )
+                                                continue;
+
+
+                                            if( trialPyrBad )
+                                                ++trialBadPyrCount;
+
+
+                                            trialMaxSkew =
+                                                Foam::max
+                                                (
+                                                    trialMaxSkew,
+                                                    trialSkew
+                                                );
+
+
+                                            if
+                                            (
+                                                v1Neighbour[faceI]
+                                              >= 0
+                                            )
+                                            {
+                                                trialMinOrtho =
+                                                    Foam::min
+                                                    (
+                                                        trialMinOrtho,
+                                                        trialOrtho
+                                                    );
+                                            }
+
+
+                                            const bool baselineEligible =
+                                                pairBaselineOFEligible
+                                                [
+                                                    faceI
+                                                ];
+
+
+                                            if( !baselineEligible )
+                                            {
+                                                if( trialPyrBad )
+                                                {
+                                                    ofSafe = false;
+                                                    rejectFace = faceI;
+                                                    rejectReason =
+                                                        "newPyramid";
+                                                    break;
+                                                }
+
+                                                if
+                                                (
+                                                    trialSkew
+                                                  > v1DPairSkewLimit
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    rejectFace = faceI;
+                                                    rejectReason =
+                                                        "newSkew";
+                                                    break;
+                                                }
+
+                                                if
+                                                (
+                                                    v1Neighbour[faceI]
+                                                  >= 0
+                                                 && trialOrtho
+                                                  < v1DPairOrtho90
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    rejectFace = faceI;
+                                                    rejectReason =
+                                                        "newNonOrtho90";
+                                                    break;
+                                                }
+
+                                                continue;
+                                            }
+
+
+                                            const bool basePyrBad =
+                                                pairBaselineOFPyrBad
+                                                [
+                                                    faceI
+                                                ];
+
+                                            const scalar basePyrMargin =
+                                                pairBaselineOFPyrMargin
+                                                [
+                                                    faceI
+                                                ];
+
+
+                                            if
+                                            (
+                                                !basePyrBad
+                                             && trialPyrBad
+                                            )
+                                            {
+                                                ofSafe = false;
+                                                rejectFace = faceI;
+                                                rejectReason =
+                                                    "newPyramid";
+                                                break;
+                                            }
+
+
+                                            if
+                                            (
+                                                basePyrBad
+                                             && trialPyrBad
+                                            )
+                                            {
+                                                const scalar pyrTol =
+                                                    scalar(1e-12)
+                                                   *(
+                                                        Foam::mag
+                                                        (
+                                                            basePyrMargin
+                                                        )
+                                                      + SMALL
+                                                    );
+
+                                                if
+                                                (
+                                                    trialPyrMargin
+                                                  < basePyrMargin-pyrTol
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    rejectFace = faceI;
+                                                    rejectReason =
+                                                        "worsePyramid";
+                                                    break;
+                                                }
+                                            }
+
+
+                                            const scalar baseSkew =
+                                                pairBaselineOFSkew
+                                                [
+                                                    faceI
+                                                ];
+
+                                            const scalar skewTol =
+                                                scalar(1e-10)
+                                               *(
+                                                    scalar(1)
+                                                  + Foam::mag(baseSkew)
+                                                );
+
+
+                                            if
+                                            (
+                                                baseSkew
+                                              <= v1DPairSkewLimit
+                                            )
+                                            {
+                                                if
+                                                (
+                                                    trialSkew
+                                                  > v1DPairSkewLimit
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    rejectFace = faceI;
+                                                    rejectReason =
+                                                        "newSkew";
+                                                    break;
+                                                }
+                                            }
+                                            else if
+                                            (
+                                                trialSkew
+                                              > baseSkew+skewTol
+                                            )
+                                            {
+                                                ofSafe = false;
+                                                rejectFace = faceI;
+                                                rejectReason =
+                                                    "worseSkew";
+                                                break;
+                                            }
+
+
+                                            if
+                                            (
+                                                v1Neighbour[faceI]
+                                              >= 0
+                                            )
+                                            {
+                                                const scalar baseOrtho =
+                                                    pairBaselineOFOrtho
+                                                    [
+                                                        faceI
+                                                    ];
+
+                                                const scalar orthoTol =
+                                                    scalar(1e-12);
+
+
+                                                if
+                                                (
+                                                    baseOrtho
+                                                  >= v1DPairOrtho90
+                                                )
+                                                {
+                                                    if
+                                                    (
+                                                        trialOrtho
+                                                      < v1DPairOrtho90
+                                                    )
+                                                    {
+                                                        ofSafe = false;
+                                                        rejectFace = faceI;
+                                                        rejectReason =
+                                                            "newNonOrtho90";
+                                                        break;
+                                                    }
+                                                }
+                                                else if
+                                                (
+                                                    trialOrtho
+                                                  < baseOrtho-orthoTol
+                                                )
+                                                {
+                                                    ofSafe = false;
+                                                    rejectFace = faceI;
+                                                    rejectReason =
+                                                        "worseNonOrtho";
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+
+                                        (void)rejectFace;
+                                        if( !ofSafe )
+                                        {
+                                            if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "newPyramid"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectNewPyramid;
+                                            }
+                                            else if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "worsePyramid"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectWorsePyramid;
+                                            }
+                                            else if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "newSkew"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectNewSkew;
+                                            }
+                                            else if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "worseSkew"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectWorseSkew;
+                                            }
+                                            else if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "newNonOrtho90"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectNewNonOrtho90;
+                                            }
+                                            else if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "worseNonOrtho"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectWorseNonOrtho;
+                                            }
+                                            else if
+                                            (
+                                                std::strcmp
+                                                (
+                                                    rejectReason,
+                                                    "ofGeometry"
+                                                ) == 0
+                                            )
+                                            {
+                                                ++v1DRejectOFGeometry;
+                                            }
+                                            else
+                                            {
+                                                ++v1DRejectOther;
+                                            }
+
+                                            continue;
+                                        }
+
+
+                                        // CFMitch v2.6:
+                                        // For a positive-volume quality
+                                        // seed, the target pyramid defect
+                                        // itself must be completely removed.
+                                        //
+                                        // The ordinary V1D face gate above
+                                        // protects the full union star from
+                                        // NEW or WORSE quality.  This extra
+                                        // predicate makes the repair
+                                        // objective explicit for the target
+                                        // cell rather than merely allowing
+                                        // its existing bad pyramid to remain.
+                                        if( requirePyramidRepair )
+                                        {
+                                            const label
+                                                trialTargetBadPyr =
+                                                    v1CellBadPyramidCount
+                                                    (
+                                                        badCellI
+                                                    );
+
+                                            if( trialTargetBadPyr != 0 )
+                                            {
+                                                ++v1DRejectTargetPyramid;
+
+                                                // Aggregate with the v2.5
+                                                // single-hair target reject
+                                                // count for the final V1C
+                                                // summary as well.
+                                                ++blV25TargetPyrRejects;
+
+                                                continue;
+                                            }
+                                        }
+
+
+                                        ++v1DPairQualityPass;
+
+
+                                        // ----------------------------------
+                                        // Candidate motion magnitude.
+                                        // ----------------------------------
+
+                                        scalar trialMaxMove =
+                                            scalar(0);
+
+
+                                        for
+                                        (
+                                            label rowI=1;
+                                            rowI<rowSizeA-1;
+                                            ++rowI
+                                        )
+                                        {
+                                            const label pointI =
+                                                newVerticesForSplitEdge_
+                                                (
+                                                    edgeA,
+                                                    rowI
+                                                );
+
+                                            trialMaxMove =
+                                                Foam::max
+                                                (
+                                                    trialMaxMove,
+                                                    mag
+                                                    (
+                                                        v1Points[pointI]
+                                                      - originalPositionsA
+                                                        [
+                                                            rowI-1
+                                                        ]
+                                                    )
+                                                );
+                                        }
+
+
+                                        for
+                                        (
+                                            label rowI=1;
+                                            rowI<rowSizeB-1;
+                                            ++rowI
+                                        )
+                                        {
+                                            const label pointI =
+                                                newVerticesForSplitEdge_
+                                                (
+                                                    edgeB,
+                                                    rowI
+                                                );
+
+                                            trialMaxMove =
+                                                Foam::max
+                                                (
+                                                    trialMaxMove,
+                                                    mag
+                                                    (
+                                                        v1Points[pointI]
+                                                      - originalPositionsB
+                                                        [
+                                                            rowI-1
+                                                        ]
+                                                    )
+                                                );
+                                        }
+
+
+                                        // Same deterministic ranking as
+                                        // v1c, now over paired candidates.
+                                        bool better =
+                                            !found;
+
+
+                                        if( found )
+                                        {
+                                            if
+                                            (
+                                                trialBadPyrCount
+                                              < bestBadPyrCount
+                                            )
+                                            {
+                                                better = true;
+                                            }
+                                            else if
+                                            (
+                                                trialBadPyrCount
+                                             == bestBadPyrCount
+                                            )
+                                            {
+                                                if
+                                                (
+                                                    trialMaxSkew
+                                                  < bestMaxOFSkew
+                                                   - scalar(1e-12)
+                                                )
+                                                {
+                                                    better = true;
+                                                }
+                                                else if
+                                                (
+                                                    Foam::mag
+                                                    (
+                                                        trialMaxSkew
+                                                      - bestMaxOFSkew
+                                                    )
+                                                  <= scalar(1e-12)
+                                                )
+                                                {
+                                                    if
+                                                    (
+                                                        trialMinOrtho
+                                                      > bestMinOFOrtho
+                                                       + scalar(1e-12)
+                                                    )
+                                                    {
+                                                        better = true;
+                                                    }
+                                                    else if
+                                                    (
+                                                        Foam::mag
+                                                        (
+                                                            trialMinOrtho
+                                                          - bestMinOFOrtho
+                                                        )
+                                                      <= scalar(1e-12)
+                                                    )
+                                                    {
+                                                        if
+                                                        (
+                                                            trialMaxMove
+                                                          < bestMaxMove
+                                                           - scalar(1e-15)
+                                                        )
+                                                        {
+                                                            better = true;
+                                                        }
+                                                        else if
+                                                        (
+                                                            Foam::mag
+                                                            (
+                                                                trialMaxMove
+                                                              - bestMaxMove
+                                                            )
+                                                          <= scalar(1e-15)
+                                                         && minPositiveRatio
+                                                          > bestMinRatio
+                                                        )
+                                                        {
+                                                            better = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+
+                                        if( better )
+                                        {
+                                            found = true;
+                                            bestIsPair = true;
+
+                                            bestEdgeA =
+                                                edgeA;
+
+                                            bestEdgeB =
+                                                edgeB;
+
+                                            bestAmplitudeA =
+                                                amplitudeA;
+
+                                            bestAmplitudeB =
+                                                amplitudeB;
+
+                                            bestTargetVol =
+                                                targetVol;
+
+                                            bestTargetOFVol =
+                                                targetOFVol;
+
+                                            bestMinRatio =
+                                                minPositiveRatio;
+
+                                            bestMinOFRatio =
+                                                minOFPositiveRatio;
+
+                                            bestMaxOFSkew =
+                                                trialMaxSkew;
+
+                                            bestMinOFOrtho =
+                                                trialMinOrtho;
+
+                                            bestBadPyrCount =
+                                                trialBadPyrCount;
+
+                                            bestMaxMove =
+                                                trialMaxMove;
+
+
+                                            bestPositionsA.setSize
+                                            (
+                                                rowSizeA-2
+                                            );
+
+                                            for
+                                            (
+                                                label rowI=1;
+                                                rowI<rowSizeA-1;
+                                                ++rowI
+                                            )
+                                            {
+                                                const label pointI =
+                                                    newVerticesForSplitEdge_
+                                                    (
+                                                        edgeA,
+                                                        rowI
+                                                    );
+
+                                                bestPositionsA[rowI-1] =
+                                                    v1Points[pointI];
+                                            }
+
+
+                                            bestPositionsB.setSize
+                                            (
+                                                rowSizeB-2
+                                            );
+
+                                            for
+                                            (
+                                                label rowI=1;
+                                                rowI<rowSizeB-1;
+                                                ++rowI
+                                            )
+                                            {
+                                                const label pointI =
+                                                    newVerticesForSplitEdge_
+                                                    (
+                                                        edgeB,
+                                                        rowI
+                                                    );
+
+                                                bestPositionsB[rowI-1] =
+                                                    v1Points[pointI];
+                                            }
+
+
+                                            Info
+                                                << "BL_VALIDITY_REPAIR_V1D_PAIR_CANDIDATE"
+                                                << " cell="
+                                                << badCellI
+                                                << " parent="
+                                                << exactVolumeParent
+                                                   [
+                                                       badCellI
+                                                   ]
+                                                << " localChild="
+                                                << exactVolumeLocalChild
+                                                   [
+                                                       badCellI
+                                                   ]
+                                                << " edgeA="
+                                                << edgeA
+                                                << " amplitudeA="
+                                                << amplitudeA
+                                                << " edgeB="
+                                                << edgeB
+                                                << " amplitudeB="
+                                                << amplitudeB
+                                                << " targetVol="
+                                                << targetVol
+                                                << " targetOFVol="
+                                                << targetOFVol
+                                                << " maxOFSkew="
+                                                << trialMaxSkew
+                                                << " minOFOrtho="
+                                                << trialMinOrtho
+                                                << " badOFPyr="
+                                                << trialBadPyrCount
+                                                << " maxPhysicalMove="
+                                                << trialMaxMove
+                                                << " minPositiveStarRatio="
+                                                << minPositiveRatio
+                                                << " minOFPositiveStarRatio="
+                                                << minOFPositiveRatio
+                                                << endl;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+
+                        restorePair();
+                    }
+
+
+                    Info
+                        << "BL_VALIDITY_REPAIR_V1D_PAIR_SUMMARY"
+                        << " cell=" << badCellI
+                        << " parent="
+                        << exactVolumeParent[badCellI]
+                        << " localChild="
+                        << exactVolumeLocalChild[badCellI]
+                        << " candidatePairs="
+                        << pairEdges.size()
+                        << " trials="
+                        << v1DPairTrials
+                        << " volumePass="
+                        << v1DPairVolumePass
+                        << " qualityPass="
+                        << v1DPairQualityPass
+                        << " rejectNewPyramid="
+                        << v1DRejectNewPyramid
+                        << " rejectWorsePyramid="
+                        << v1DRejectWorsePyramid
+                        << " rejectNewSkew="
+                        << v1DRejectNewSkew
+                        << " rejectWorseSkew="
+                        << v1DRejectWorseSkew
+                        << " rejectNewNonOrtho90="
+                        << v1DRejectNewNonOrtho90
+                        << " rejectWorseNonOrtho="
+                        << v1DRejectWorseNonOrtho
+                        << " rejectOFGeometry="
+                        << v1DRejectOFGeometry
+                        << " rejectTargetPyramid="
+                        << v1DRejectTargetPyramid
+                        << " rejectOther="
+                        << v1DRejectOther
+                        << " found="
+                        << (bestIsPair ? "true" : "false")
+                        << endl;
+                }
+
+
+                if( found && bestIsPair )
+                {
+                    const label rowSizeA =
+                        newVerticesForSplitEdge_.
+                            sizeOfRow(bestEdgeA);
+
+                    const label rowSizeB =
+                        newVerticesForSplitEdge_.
+                            sizeOfRow(bestEdgeB);
+
+
+                    scalar maxPhysicalMove =
+                        scalar(0);
+
+
+                    for
+                    (
+                        label rowI=1;
+                        rowI<rowSizeA-1;
+                        ++rowI
+                    )
+                    {
+                        const label pointI =
+                            newVerticesForSplitEdge_
+                            (
+                                bestEdgeA,
+                                rowI
+                            );
+
+                        maxPhysicalMove =
+                            Foam::max
+                            (
+                                maxPhysicalMove,
+                                mag
+                                (
+                                    bestPositionsA[rowI-1]
+                                  - v1Points[pointI]
+                                )
+                            );
+
+                        v1Points[pointI] =
+                            bestPositionsA[rowI-1];
+                    }
+
+
+                    for
+                    (
+                        label rowI=1;
+                        rowI<rowSizeB-1;
+                        ++rowI
+                    )
+                    {
+                        const label pointI =
+                            newVerticesForSplitEdge_
+                            (
+                                bestEdgeB,
+                                rowI
+                            );
+
+                        maxPhysicalMove =
+                            Foam::max
+                            (
+                                maxPhysicalMove,
+                                mag
+                                (
+                                    bestPositionsB[rowI-1]
+                                  - v1Points[pointI]
+                                )
+                            );
+
+                        v1Points[pointI] =
+                            bestPositionsB[rowI-1];
+                    }
+
+
+                    const scalar committedVol =
+                        v1CellVolume(badCellI);
+
+
+                    Info
+                        << "BL_VALIDITY_REPAIR_V1D_PAIR_MOVE"
+                        << " cell=" << badCellI
+                        << " parent="
+                        << exactVolumeParent[badCellI]
+                        << " localChild="
+                        << exactVolumeLocalChild[badCellI]
+                        << " bfI="
+                        << cellToBaseBndFace_[badCellI]
+                        << " edgeA="
+                        << bestEdgeA
+                        << " amplitudeA="
+                        << bestAmplitudeA
+                        << " edgeB="
+                        << bestEdgeB
+                        << " amplitudeB="
+                        << bestAmplitudeB
+                        << " maxPhysicalMove="
+                        << maxPhysicalMove
+                        << " oldCellVol="
+                        << badVolBefore
+                        << " targetVol="
+                        << bestTargetVol
+                        << " committedVol="
+                        << committedVol
+                        << " minPositiveStarRatio="
+                        << bestMinRatio
+                        << " targetOFVol="
+                        << bestTargetOFVol
+                        << " maxOFSkew="
+                        << bestMaxOFSkew
+                        << " minOFOrtho="
+                        << bestMinOFOrtho
+                        << " badOFPyr="
+                        << bestBadPyrCount
+                        << " minOFPositiveStarRatio="
+                        << bestMinOFRatio
+                        << endl;
+
+
+                    if( committedVol > scalar(0) )
+                    {
+                        ++blV1Fixed;
+
+                        // This transaction commits two coherent chains.
+                        blV1CommittedChains += 2;
+                    }
+                    else
+                    {
+                        ++blV1Unresolved;
+                    }
+                }
+                else if( found )
+                {
+                    const label rowSize =
+                        newVerticesForSplitEdge_.
+                            sizeOfRow(bestEdge);
+
+                    scalar maxPhysicalMove = scalar(0);
+
+                    for
+                    (
+                        label rowI=1;
+                        rowI<rowSize-1;
+                        ++rowI
+                    )
+                    {
+                        const label pointI =
+                            newVerticesForSplitEdge_
+                            (
+                                bestEdge,
+                                rowI
+                            );
+
+                        maxPhysicalMove =
+                            Foam::max
+                            (
+                                maxPhysicalMove,
+                                mag
+                                (
+                                    bestPositions[rowI-1]
+                                  - v1Points[pointI]
+                                )
+                            );
+
+                        v1Points[pointI] =
+                            bestPositions[rowI-1];
+                    }
+
+
+                    const scalar committedVol =
+                        v1CellVolume(badCellI);
+
+
+                    Info
+                        << "BL_VALIDITY_REPAIR_V1C_MOVE"
+                        << " cell=" << badCellI
+                        << " parent="
+                        << exactVolumeParent[badCellI]
+                        << " localChild="
+                        << exactVolumeLocalChild[badCellI]
+                        << " bfI="
+                        << cellToBaseBndFace_[badCellI]
+                        << " splitEdge="
+                        << bestEdge
+                        << " amplitude="
+                        << bestAmplitude
+                        << " maxPhysicalMove="
+                        << maxPhysicalMove
+                        << " oldCellVol="
+                        << badVolBefore
+                        << " targetVol="
+                        << bestTargetVol
+                        << " committedVol="
+                        << committedVol
+                        << " minPositiveStarRatio="
+                        << bestMinRatio
+                        << " targetOFVol="
+                        << bestTargetOFVol
+                        << " maxOFSkew="
+                        << bestMaxOFSkew
+                        << " minOFOrtho="
+                        << bestMinOFOrtho
+                        << " badOFPyr="
+                        << bestBadPyrCount
+                        << " minOFPositiveStarRatio="
+                        << bestMinOFRatio
+                        << endl;
+
+
+                    if( committedVol > scalar(0) )
+                    {
+                        ++blV1Fixed;
+                        ++blV1CommittedChains;
+                    }
+                    else
+                    {
+                        ++blV1Unresolved;
+                    }
+                }
+                else
+                {
+                    ++blV1Unresolved;
+
+                    // CFMitch v2.7 diagnostic:
+                    // classify the actual OpenFOAM-bad face(s) only when
+                    // this is an unresolved positive-pyramid type-1 child
+                    // at wallLayer zero.
+                    if
+                    (
+                        requirePyramidRepair
+                     && badCellI >= 0
+                     && badCellI <
+                        label(exactVolumeRefType.size())
+                     && exactVolumeRefType[badCellI] == 1
+                     && badCellI <
+                        label(exactVolumeLocalChild.size())
+                    )
+                    {
+                        const label diagnosticBfI =
+                            cellToBaseBndFace_[badCellI];
+
+                        if
+                        (
+                            diagnosticBfI >= 0
+                         && diagnosticBfI <
+                            label(nLayersAtBndFace_.size())
+                        )
+                        {
+                            const label diagnosticN =
+                                nLayersAtBndFace_
+                                [
+                                    diagnosticBfI
+                                ];
+
+                            const label diagnosticLocalChild =
+                                exactVolumeLocalChild
+                                [
+                                    badCellI
+                                ];
+
+                            const label diagnosticWallLayer =
+                                diagnosticN
+                              - 1
+                              - diagnosticLocalChild;
+
+                            if( diagnosticWallLayer == 0 )
+                            {
+                                v1ReportWallChildBadFaceRoles
+                                (
+                                    badCellI
+                                );
+                            }
+                        }
+                    }
+
+                    // CFMitch v2.7.1:
+                    //
+                    // v2.7 quality-derived N retreat is intentionally
+                    // disabled.
+                    //
+                    // Source forensics established that type-1 localChild
+                    // numbering runs from the core side toward the wall:
+                    //
+                    //     localChild = 0      -> outer/core-side child
+                    //     localChild = N - 1  -> wall-adjacent child
+                    //
+                    // Therefore the former
+                    //
+                    //     proposedCap = localChild
+                    //
+                    // did not represent a safe wall-side prefix and must
+                    // not generate planner constraints.
+                    //
+                    // qualityMaxLayersAtFace_ remains available for a future
+                    // correctly-defined front/termination policy.
+
+                    Info
+                        << "BL_VALIDITY_REPAIR_V1C_UNRESOLVED"
+                        << " cell=" << badCellI
+                        << " parent="
+                        << exactVolumeParent[badCellI]
+                        << " localChild="
+                        << exactVolumeLocalChild[badCellI]
+                        << " bfI="
+                        << cellToBaseBndFace_[badCellI]
+                        << " volume="
+                        << badVolBefore
+                        << " candidateEdges="
+                        << badEdges.size()
+                        << endl;
+                }
+            }
+
+
+            Info
+                << "CFMITCH V2.7.1 WALLFACE REPAIR SUMMARY:"
+                << " eligible="
+                << blV271FaceBreathEligible
+                << " attempted="
+                << blV271FaceBreathAttempted
+                << " skipped="
+                << blV271FaceBreathSkipped
+                << " trials="
+                << blV271FaceBreathTrials
+                << " volumePass="
+                << blV271FaceBreathVolumePass
+                << " qualityPass="
+                << blV271FaceBreathQualityPass
+                << " rejectQuality="
+                << blV271FaceBreathQualityReject
+                << " rejectTargetPyramid="
+                << blV271FaceBreathTargetReject
+                << " fixed="
+                << blV271FaceBreathFixed
+                << " rejectNewPyramid="
+                << blV271RejectNewPyramid
+                << " rejectWorsePyramid="
+                << blV271RejectWorsePyramid
+                << " rejectNewSkew="
+                << blV271RejectNewSkew
+                << " rejectWorseSkew="
+                << blV271RejectWorseSkew
+                << " rejectNewNonOrtho90="
+                << blV271RejectNewNonOrtho90
+                << " rejectWorseNonOrtho="
+                << blV271RejectWorseNonOrtho
+                << " rejectOFGeometry="
+                << blV271RejectOFGeometry
+                << " rejectOther="
+                << blV271RejectOther
+                << " rejectOnTargetFace="
+                << blV271RejectOnTargetCellFace
+                << " rejectOnOtherStarFace="
+                << blV271RejectOnOtherStarFace
+                << endl;
+
+
+            if( blV1CommittedChains )
+            {
+                // Coordinates changed; force all normal downstream checks
+                // to rebuild exact geometry from the committed positions.
+                mesh_.clearAddressingData();
+            }
+        }
+
+
+        Info
+            << "BL_VALIDITY_REPAIR_V1C_SUMMARY"
+            << " initialNegative="
+            << blV1InitialNegative
+            << " pyramidAdditional="
+            << blV25PyramidAdditionalSeeds
+            << " repairSeeds="
+            << blV25RepairSeeds
+            << " fixed="
+            << blV1Fixed
+            << " unresolved="
+            << blV1Unresolved
+            << " committedChains="
+            << blV1CommittedChains
+            << " targetPyrRejects="
+            << blV25TargetPyrRejects
+            << endl;
+
+
+        label blV27ZeroLayerFaces = 0;
+        label blV27MinCap = labelMax;
+        label blV27MaxCap = -1;
+
+        forAllConstIter
+        (
+            Map<label>,
+            qualityMaxLayersAtFace_,
+            qIt
+        )
+        {
+            const label cap = qIt();
+
+            blV27MinCap =
+                Foam::min(blV27MinCap, cap);
+
+            blV27MaxCap =
+                Foam::max(blV27MaxCap, cap);
+
+            if( cap == 0 )
+                ++blV27ZeroLayerFaces;
+        }
+
+        if( qualityMaxLayersAtFace_.empty() )
+            blV27MinCap = -1;
+
+        Info
+            << "CFMITCH V2.7 QUALITY LAYER CAPS:"
+            << " faces="
+            << qualityMaxLayersAtFace_.size()
+            << " zeroLayerFaces="
+            << blV27ZeroLayerFaces
+            << " minCap="
+            << blV27MinCap
+            << " maxCap="
+            << blV27MaxCap
+            << endl;
+
+        Info
+            << "CFMITCH V2.7 WALLCHILD FACE SUMMARY:"
+            << " cells="
+            << blV27WallChildCells
+            << " badFaces="
+            << blV27WallChildBadFaces
+            << " wallBase="
+            << blV27WallChildWallBaseBad
+            << " internalOuter="
+            << blV27WallChildInternalOuterBad
+            << " lateral="
+            << blV27WallChildLateralBad
+            << " unknown="
+            << blV27WallChildUnknownBad
+            << " multiBadCells="
+            << blV27WallChildMultiBad
+            << endl;
+
+    }
 
     # ifdef DEBUGLayer
     for(label procI=0;procI<Pstream::nProcs();++procI)
@@ -1912,6 +18733,20 @@ void refineBoundaryLayers::generateNewCells()
     # endif
 
     Info << "Finished generating new cells " << endl;
+
+    Info
+        << "BL_CHILD_SWEEP_SUMMARY"
+        << " triParentsChecked="
+        << nChildSweepParentsChecked
+        << " childrenChecked="
+        << nChildSweepChildrenChecked
+        << " badChildren="
+        << nChildSweepBadChildren
+        << " parentUnsafe="
+        << nChildSweepParentUnsafe
+        << " skippedParents="
+        << nChildSweepSkippedParents
+        << endl;
 }
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //

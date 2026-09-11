@@ -79,6 +79,24 @@ class meshOptimizer
         //- name of the subset contaning tangled points
         word badPointsSubsetName_;
 
+        //- optional surface octree for boundary point re-projection
+        //- during volume optimization. Null by default (no constraint).
+        const meshOctree* surfaceOctreePtr_;
+
+        //- point-patch membership indexed by boundary-point index
+        const VRWGraph* bndPointPatchesPtr_;
+
+        //- mapping: global mesh point label -> boundary point index
+        //- (-1 if interior point). Indexed by global point label.
+        const labelLongList* globalToBoundaryPointPtr_;
+
+        //- boundary points at feature curve corners (3+ patches, fully locked)
+        const labelHashSet* featureCornerPointsPtr_;
+
+        //- feature curve tangent vectors indexed by boundary point
+        //- zero vector = not a feature curve point
+        const vectorField* featureCurveTangentsPtr_;
+
     // Private member functions
         //- return mesh surface
         const meshSurfaceEngine& meshSurface() const;
@@ -218,6 +236,18 @@ public:
         //- stored into a point subset
         void enforceConstraints(const word subsetName="badPoints");
 
+        //- set optional surface constraint for boundary point re-projection
+        //- during volume optimization. All three pointers must be non-null
+        //- to activate. Pass null to disable (default).
+        void setSurfaceConstraint
+        (
+            const meshOctree* octreePtr,
+            const VRWGraph* bndPointPatchesPtr,
+            const labelLongList* globalToBoundaryPointPtr,
+            const labelHashSet* featureCornerPointsPtr = NULL,
+            const vectorField* featureCurveTangentsPtr = NULL
+        );
+
         //- lock the cells which shall not be modified
         template<class labelListType>
         inline void lockCells(const labelListType&);
@@ -271,6 +301,20 @@ public:
         //- performs mesh optimisation for faces with high non-orthogonality
         //- and skewness
         void optimizeLowQualityFaces(const label maxNumIterations = 10);
+
+        //- CFMitch V6.1:
+        //- optimise only an explicitly supplied face population.
+        //-
+        //- Unlike optimizeLowQualityFaces(), this does not call the generic
+        //- cfMesh low-quality selector.  It is intended for bounded,
+        //- transactionally validated repair populations selected by an
+        //- external quality metric (for example exact OpenFOAM skewness).
+        void optimizeSelectedFaces
+        (
+            const labelHashSet& selectedFaces,
+            const label maxNumIterations = 1,
+            const direction additionalLayers = 0
+        );
 
         //- perform optimization of cells near the boundary
         //- the use shall specify the number of iterations and the number

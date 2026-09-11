@@ -73,10 +73,13 @@ bool checkClosedBoundary(const polyMeshGen& mesh, const bool report)
 
     if( maxOpen > SMALL*max(1.0, sumMagClosedBoundary) )
     {
-        SeriousErrorIn
-        (
-            "bool checkClosedBoundary(const polyMeshGen&, const bool report)"
-        )   << "Possible hole in boundary description" << endl;
+        if( report )
+        {
+            SeriousErrorIn
+            (
+                "bool checkClosedBoundary(const polyMeshGen&, const bool report)"
+            )   << "Possible hole in boundary description" << endl;
+        }
 
         Info<< "Boundary openness in x-direction = "
             << sumClosed.component(vector::X) << endl;
@@ -132,12 +135,13 @@ bool checkClosedCells
 
         if( min(curCell) < 0 || max(curCell) > nFaces )
         {
-            WarningIn
-            (
-                "bool checkClosedCells("
-                "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
-            )   << "Cell " << cI << " contains face labels out of range: "
-                << curCell << " Max face index = " << nFaces << endl;
+            if( report )
+                WarningIn
+                (
+                    "bool checkClosedCells("
+                    "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
+                )   << "Cell " << cI << " contains face labels out of range: "
+                    << curCell << " Max face index = " << nFaces << endl;
 
             if( setPtr )
             {
@@ -153,12 +157,15 @@ bool checkClosedCells
 
     if( nErrorClosed > 0 )
     {
-        SeriousErrorIn
-        (
-            "bool checkClosedCells("
-            "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
-        )  << nErrorClosed << " cells with invalid face labels found"
-            << endl;
+        if( report )
+        {
+            SeriousErrorIn
+            (
+                "bool checkClosedCells("
+                "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
+            )  << nErrorClosed << " cells with invalid face labels found"
+                << endl;
+        }
 
         return true;
     }
@@ -230,9 +237,35 @@ bool checkClosedCells
             }
 
             ++nOpen;
+            if( report )
+            {
+                Pout<< "OPEN_CELL_DIAG cell=" << cellI
+                    << " opennessRatio="
+                    << mag(sumClosed[cellI])
+                       /(mag(sumMagClosed[cellI]) + VSMALL)
+                    << " volume=" << vols[cellI]
+                    << " nFaces=" << mesh.cells()[cellI].size()
+                    << " sumClosed=" << sumClosed[cellI]
+                    << endl;
+                const cell& c = mesh.cells()[cellI];
+                forAll(c, fI)
+                {
+                    const face& f = mesh.faces()[c[fI]];
+                    Pout<< "  face=" << c[fI]
+                        << " nPts=" << f.size()
+                        << " pts=" << f
+                        << endl;
+                }
+            }
         }
 
-        scalar aspectRatio =
+        // Skip aspect ratio for negative/zero-volume cells.
+        // checkCellVolumes handles those. Avoid inf/VGREAT propagating
+        // into reductions and triggering OpenFOAM SIGFPE.
+        if( vols[cellI] <= SMALL )
+            continue;
+
+        const scalar aspectRatio =
             1.0/6.0*sumMagClosed[cellI]/pow(vols[cellI], 2.0/3.0);
 
         maxAspectRatio = max(maxAspectRatio, aspectRatio);
@@ -257,25 +290,31 @@ bool checkClosedCells
 
     if( nOpen > 0 )
     {
-        SeriousErrorIn
-        (
-            "bool checkClosedCells("
-            "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
-        )   << nOpen << " open cells found. Max cell openness: "
-            << maxOpenCell << endl;
+        if( report )
+        {
+            SeriousErrorIn
+            (
+                "bool checkClosedCells("
+                "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
+            )   << nOpen << " open cells found. Max cell openness: "
+                << maxOpenCell << endl;
+        }
 
         return true;
     }
 
     if( nAspect > 0 )
     {
-        SeriousErrorIn
-        (
-            "bool checkClosedCells("
-            "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
-        )   << nAspect << " high aspect ratio cells found.  "
-            << "Max aspect ratio: " << maxAspectRatio
-            << endl;
+        if( report )
+        {
+            SeriousErrorIn
+            (
+                "bool checkClosedCells("
+                "const polyMeshGen&, const bool, const scalar, labelHashSet*)"
+            )   << nAspect << " high aspect ratio cells found.  "
+                << "Max aspect ratio: " << maxAspectRatio
+                << endl;
+        }
 
         return true;
     }
@@ -297,16 +336,38 @@ bool checkCellVolumes
     labelHashSet* setPtr
 )
 {
-    const scalarField& vols = mesh.addressingData().cellVolumes();
+    // Compute raw signed cell volumes directly -- do NOT use addressingData()
+    // cache which stores clamped (always positive) values for optimizer safety.
+    const vectorField& fCtrs = mesh.addressingData().faceCentres();
+    const vectorField& fAreas = mesh.addressingData().faceAreas();
+    const labelList& own = mesh.owner();
+    const cellListPMG& cells = mesh.cells();
 
     scalar minVolume = GREAT;
     scalar maxVolume = -GREAT;
 
     label nNegVolCells = 0;
 
-    forAll(vols, cellI)
+    forAll(cells, cellI)
     {
-        if( vols[cellI] < VSMALL )
+        const cell& c = cells[cellI];
+
+        vector cEst(vector::zero);
+        forAll(c, fI)
+            cEst += fCtrs[c[fI]];
+        cEst /= c.size();
+
+        scalar cellVol(0.0);
+        forAll(c, fI)
+        {
+            scalar pyr3Vol = fAreas[c[fI]] & (fCtrs[c[fI]] - cEst);
+            if( own[c[fI]] != cellI )
+                pyr3Vol *= -1.0;
+            cellVol += pyr3Vol;
+        }
+        cellVol /= 3.0;
+
+        if( cellVol < VSMALL )
         {
             if( report )
                 SeriousErrorIn
@@ -314,7 +375,7 @@ bool checkCellVolumes
                     "bool checkCellVolumes("
                     "const polyMeshGen&, const bool, labelHashSet*)"
                 )   << "Zero or negative cell volume detected for cell "
-                    << cellI << ".  Volume = " << vols[cellI] << endl;
+                    << cellI << ".  Volume = " << cellVol << endl;
 
             if( setPtr )
                 setPtr->insert(cellI);
@@ -322,8 +383,8 @@ bool checkCellVolumes
             ++nNegVolCells;
         }
 
-        minVolume = min(minVolume, vols[cellI]);
-        maxVolume = max(maxVolume, vols[cellI]);
+        minVolume = min(minVolume, cellVol);
+        maxVolume = max(maxVolume, cellVol);
     }
 
     reduce(minVolume, minOp<scalar>());
@@ -332,15 +393,18 @@ bool checkCellVolumes
 
     if( minVolume < VSMALL )
     {
-        SeriousErrorIn
-        (
-            "bool checkCellVolumes("
-            "const polyMeshGen&, const bool, labelHashSet*)"
-        )   << "Zero or negative cell volume detected.  "
-            << "Minimum negative volume: "
-            << minVolume << ".\nNumber of negative volume cells: "
-            << nNegVolCells << ".  This mesh is invalid"
-            << endl;
+        if( report )
+        {
+            SeriousErrorIn
+            (
+                "bool checkCellVolumes("
+                "const polyMeshGen&, const bool, labelHashSet*)"
+            )   << "Zero or negative cell volume detected.  "
+                << "Minimum negative volume: "
+                << minVolume << ".\nNumber of negative volume cells: "
+                << nNegVolCells << ".  This mesh is invalid"
+                << endl;
+        }
 
         return true;
     }
@@ -350,7 +414,6 @@ bool checkCellVolumes
         {
             Info<< "Min volume = " << minVolume
                 << ". Max volume = " << maxVolume
-                << ".  Total volume = " << sum(vols)
                 << ".  Cell volumes OK.\n" << endl;
         }
 
@@ -439,14 +502,17 @@ bool checkFaceAreas
 
     if( minArea < VSMALL )
     {
-        SeriousErrorIn
-        (
-            "bool checkFaceAreas("
-            "const polyMeshGen&, const bool, const scalar,"
-            " labelHashSet*, const boolList*)"
-        )   << "Zero or negative face area detected.  Minimum negative area: "
-            << minArea << ". This mesh is invalid"
-            << endl;
+        if( report )
+        {
+            SeriousErrorIn
+            (
+                "bool checkFaceAreas("
+                "const polyMeshGen&, const bool, const scalar,"
+                " labelHashSet*, const boolList*)"
+            )   << "Zero or negative face area detected.  Minimum negative area: "
+                << minArea << ". This mesh is invalid"
+                << endl;
+        }
 
         return true;
     }
@@ -607,13 +673,14 @@ bool checkCellPartTetrahedra
 
     if( nNegVolCells != 0 )
     {
-        WarningIn
-        (
-            "bool checkCellPartTetrahedra("
-            "const polyMeshGen&, const bool, const scalar,"
-            " labelHashSet*, const boolList*)"
-        )   << nNegVolCells << " zero or negative part tetrahedra detected."
-            << endl;
+        if( report )
+            WarningIn
+            (
+                "bool checkCellPartTetrahedra("
+                "const polyMeshGen&, const bool, const scalar,"
+                " labelHashSet*, const boolList*)"
+            )   << nNegVolCells << " zero or negative part tetrahedra detected."
+                << endl;
 
         return true;
     }
@@ -656,10 +723,57 @@ void checkFaceDotProduct
             if( changedFacePtr && !(*changedFacePtr)[faceI] )
                 continue;
 
-            const vector d = centres[nei[faceI]] - centres[own[faceI]];
+            const vector& cn = centres[nei[faceI]];
+            const vector& co = centres[own[faceI]];
             const vector& s = areas[faceI];
+            // Guard against inf/nan/absurd cell centres.
+            //
+            // Components MUST be tested with cmptMag (fabs) BEFORE any vector
+            // magnitude is computed. Foam::mag(v) = sqrt(x*x+y*y+z*z), so a
+            // component near 1e+289 -- which a collapsed cell produces, the
+            // centroid being moment/volume with volume approaching zero --
+            // overflows while EVALUATING THE GUARD, raising SIGFPE before the
+            // '> GREAT' comparison is reached. Foam::mag(scalar) is fabs and
+            // never squares. sqrt(GREAT) as the per-component ceiling also
+            // keeps the mag() calls below from overflowing.
+            //
+            // Sentinel is -1.0, NOT 1.0. The consumer tests
+            // 'dDotS < cos(nonOrthWarn)'; 1.0 fails that test, so the
+            // pathological face would be silently reported as GOOD. -1.0 is
+            // below the threshold and <= SMALL, so it lands in the
+            // errorNonOrth branch and is inserted into setPtr. The checker
+            // must not crash, and must not hide the defect either.
+            const scalar cmptCeil = Foam::sqrt(GREAT);
+            bool badCentre = false;
+            for(direction cmpt=0; cmpt<vector::nComponents; ++cmpt)
+            {
+                const scalar a = cn[cmpt], b = co[cmpt];
+                if( a != a || b != b
+                 || Foam::mag(a) > cmptCeil || Foam::mag(b) > cmptCeil )
+                {
+                    badCentre = true;
+                    break;
+                }
+            }
+            if( badCentre )
+            {
+                faceDotProduct[faceI] = -1.0;
+                continue;
+            }
+            const vector d = cn - co;
+            const scalar magD = mag(d);
+            const scalar magS = mag(s);
 
-            faceDotProduct[faceI] = (d & s)/(mag(d)*mag(s) + VSMALL);
+            // Degenerate centre spacing or face area: do not let checker FPE.
+            // Same reasoning on the sentinel -- a collapsed face is a defect
+            // and must remain visible to setPtr.
+            if( magD < SMALL || magS < SMALL )
+            {
+                faceDotProduct[faceI] = -1.0;
+                continue;
+            }
+
+            faceDotProduct[faceI] = (d & s)/(magD*magS);
         }
     }
 
@@ -717,8 +831,17 @@ void checkFaceDotProduct
                     const point& cNei = otherCentres[fI];
                     const vector d = cNei - cOwn;
                     const vector& s = areas[faceI];
+                    const scalar magD = mag(d);
+                    const scalar magS = mag(s);
 
-                    faceDotProduct[faceI] = (d & s)/(mag(d)*mag(s) + VSMALL);
+                    // Degenerate processor-face geometry: avoid checker FPE.
+                    if( magD < SMALL || magS < SMALL )
+                    {
+                        faceDotProduct[faceI] = 1.0;
+                        continue;
+                    }
+
+                    faceDotProduct[faceI] = (d & s)/(magD*magS);
                 }
             }
         }
@@ -940,12 +1063,13 @@ bool checkFaceDotProduct
 
     if( errorNonOrth > 0 )
     {
-        WarningIn
-        (
-            "checkFaceDotProduct("
-            "const polyMeshGen&, const bool, const scalar,"
-            " labelHashSet*, const boolList*)"
-        )   << "Error in non-orthogonality detected" << endl;
+        if( report )
+            WarningIn
+            (
+                "checkFaceDotProduct("
+                "const polyMeshGen&, const bool, const scalar,"
+                " labelHashSet*, const boolList*)"
+            )   << "Error in non-orthogonality detected" << endl;
 
         return true;
     }
@@ -986,11 +1110,30 @@ bool checkFacePyramids
         if( changedFacePtr && !(*changedFacePtr)[faceI] )
             continue;
 
-        // Create the owner pyramid - it will have negative volume
+        // Create the owner pyramid - it will have negative volume.
+        // Guard against degenerate cell centres from negVol cells.
+        const vector& cOwn = ctrs[owner[faceI]];
+        const scalar cox = cOwn.x(), coy = cOwn.y(), coz = cOwn.z();
+        if( cox != cox || coy != coy || coz != coz ||
+            cox > GREAT || cox < -GREAT ||
+            coy > GREAT || coy < -GREAT ||
+            coz > GREAT || coz < -GREAT )
+        {
+            if( setPtr )
+            {
+                # ifdef USE_OMP
+                # pragma omp critical
+                # endif
+                setPtr->insert(faceI);
+            }
+            ++nErrorPyrs;
+            continue;
+        }
+
         const scalar pyrVol = pyramidPointFaceRef
         (
             faces[faceI],
-            ctrs[owner[faceI]]
+            cOwn
         ).mag(points);
 
         bool badFace(false);
@@ -1019,12 +1162,31 @@ bool checkFacePyramids
 
         if( neighbour[faceI] != -1 )
         {
-            // Create the neighbour pyramid - it will have positive volume
+            // Create the neighbour pyramid - it will have positive volume.
+            // Guard against degenerate cell centres from negVol cells.
+            const vector& cNei = ctrs[neighbour[faceI]];
+            const scalar cnx = cNei.x(), cny = cNei.y(), cnz = cNei.z();
+            if( cnx != cnx || cny != cny || cnz != cnz ||
+                cnx > GREAT || cnx < -GREAT ||
+                cny > GREAT || cny < -GREAT ||
+                cnz > GREAT || cnz < -GREAT )
+            {
+                if( setPtr )
+                {
+                    # ifdef USE_OMP
+                    # pragma omp critical
+                    # endif
+                    setPtr->insert(faceI);
+                }
+                ++nErrorPyrs;
+                continue;
+            }
+
             const scalar pyrVol =
                 pyramidPointFaceRef
                 (
                     faces[faceI],
-                    ctrs[neighbour[faceI]]
+                    cNei
                 ).mag(points);
 
             if( pyrVol < minPyrVol )
@@ -1113,7 +1275,7 @@ bool checkFacePyramids
 
     if( nErrorPyrs > 0 )
     {
-        if( Pstream::master() )
+        if( report && Pstream::master() )
             WarningIn
             (
                 "bool checkFacePyramids("
@@ -1162,8 +1324,46 @@ void checkFaceSkewness
         if( changedFacePtr && !changedFacePtr->operator[](faceI) )
             continue;
 
+        // Same overflow hazard as checkFaceDotProduct: mag() squares its
+        // argument, and a collapsed cell gives a centroid component ~1e+289.
+        // findLowQualityFaces() calls this immediately after the dot-product
+        // check, so without this guard it faults on the next defective face.
+        // Component test with fabs first; sentinel is a large skewness so the
+        // face stays visible to the '>' threshold test downstream.
+        {
+            const scalar cmptCeilS = Foam::sqrt(GREAT);
+            const point& cO = centres[own[faceI]];
+            const point& cN = centres[nei[faceI]];
+            const point& fC = fCentres[faceI];
+            bool badGeom = false;
+            for(direction cmpt=0; cmpt<vector::nComponents; ++cmpt)
+            {
+                const scalar a = cO[cmpt], b = cN[cmpt], c = fC[cmpt];
+                if( a != a || b != b || c != c
+                 || Foam::mag(a) > cmptCeilS
+                 || Foam::mag(b) > cmptCeilS
+                 || Foam::mag(c) > cmptCeilS )
+                {
+                    badGeom = true;
+                    break;
+                }
+            }
+            if( badGeom )
+            {
+                faceSkewness[faceI] = GREAT;
+                continue;
+            }
+        }
+
         const scalar dOwn = mag(fCentres[faceI] - centres[own[faceI]]);
         const scalar dNei = mag(fCentres[faceI] - centres[nei[faceI]]);
+
+        // Coincident centres would divide by zero below.
+        if( (dOwn + dNei) < VSMALL )
+        {
+            faceSkewness[faceI] = GREAT;
+            continue;
+        }
 
         const point faceIntersection =
             centres[own[faceI]]*dNei/(dOwn+dNei)
@@ -1353,16 +1553,17 @@ bool checkFaceSkewness
 
     if( nWarnSkew > 0 )
     {
-        WarningIn
-        (
-            "checkFaceSkewness("
-            "const polyMeshGen&, const bool, const scalar,"
-            "labelHashSet*, const boolList*)"
-        )   << "Large face skewness detected.  Max skewness = " << maxSkew
-            << " Average skewness = " << sumSkew/faceSkewness.size()
-            << ".\nThis may impair the quality of the result." << nl
-            << nWarnSkew << " highly skew faces detected."
-            << endl;
+        if( report )
+            WarningIn
+            (
+                "checkFaceSkewness("
+                "const polyMeshGen&, const bool, const scalar,"
+                "labelHashSet*, const boolList*)"
+            )   << "Large face skewness detected.  Max skewness = " << maxSkew
+                << " Average skewness = " << sumSkew/faceSkewness.size()
+                << ".\nThis may impair the quality of the result." << nl
+                << nWarnSkew << " highly skew faces detected."
+                << endl;
 
         return true;
     }
@@ -1753,14 +1954,15 @@ bool checkFaceAngles
 
     if( nConcave > 0 )
     {
-        WarningIn
-        (
-            "bool checkFaceAngles("
-            "const polyMeshGen&, const bool, const scalar,"
-            " labelHashSet*, const boolList*)"
-        )   << nConcave  << " face points with severe concave angle (> "
-            << maxDeg << " deg) found.\n"
-            << endl;
+        if( report )
+            WarningIn
+            (
+                "bool checkFaceAngles("
+                "const polyMeshGen&, const bool, const scalar,"
+                " labelHashSet*, const boolList*)"
+            )   << nConcave  << " face points with severe concave angle (> "
+                << maxDeg << " deg) found.\n"
+                << endl;
 
         return true;
     }
@@ -1984,14 +2186,15 @@ bool checkFaceFlatness
 
     if( nWarped > 0 )
     {
-        WarningIn
-        (
-            "bool checkFaceFlatness("
-            "const polyMeshGen&, const bool, const scalar,"
-            " labelHashSet*, const boolList*)"
-        )   << nWarped  << " faces with severe warpage (flatness < "
-            << warnFlatness << ") found.\n"
-            << endl;
+        if( report )
+            WarningIn
+            (
+                "bool checkFaceFlatness("
+                "const polyMeshGen&, const bool, const scalar,"
+                " labelHashSet*, const boolList*)"
+            )   << nWarped  << " faces with severe warpage (flatness < "
+                << warnFlatness << ") found.\n"
+                << endl;
 
         return true;
     }

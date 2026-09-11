@@ -40,6 +40,9 @@ label boundaryLayers::findNewNodeLabel
     const label pKey
 ) const
 {
+    //- capSideVrtMap_ is patchI-keyed -- use findNewNodeLabelForPatch()
+    //- for cap-aware lookup. Normal prism path uses pKey/otherVrts_ only.
+
     const std::map
     <
         label, std::map<std::pair<label, label>, label>
@@ -75,6 +78,24 @@ label boundaryLayers::findNewNodeLabel
     }
 
     return newLabelForVertex_[pointI];
+}
+
+inline
+label boundaryLayers::findNewNodeLabelForPatch
+(
+    const label pointI,
+    const label patchI,
+    const label pKey
+) const
+{
+    if( !capSideVrtMap_.empty() )
+    {
+        const std::pair<label,label> capKey(pointI, patchI);
+        const auto capIt = capSideVrtMap_.find(capKey);
+        if( capIt != capSideVrtMap_.end() )
+            return capIt->second;
+    }
+    return findNewNodeLabel(pointI, pKey);
 }
 
 inline void boundaryLayers::createNewCellFromEdge

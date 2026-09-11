@@ -1,0 +1,14 @@
+wmake utilities/surfaceGenerateBoundingBox
+Making dependency list for source file surfaceGenerateBoundingBox.C
+g++ -std=c++14 -m64 -DLIB_NAME=libNULL.so -Dlinux64 -DWM_ARCH_OPTION=64 -DWM_DP -DWM_LABEL_SIZE=32 -Wall -Wextra -Wold-style-cast -Wnon-virtual-dtor -Wno-unused-parameter -Wno-invalid-offsetof -Wno-attributes -O3  -DNoRepository -ftemplate-depth-256 -DNoSizeType -I/opt/openfoam13/src/triSurface/lnInclude -I/opt/openfoam13/src/meshTools/lnInclude -I/opt/openfoam13/src/finiteVolume/lnInclude -I../../meshLibrary/lnInclude -IlnInclude -I. -I/opt/openfoam13/src/OpenFOAM/lnInclude -I/opt/openfoam13/src/OSspecific/POSIX/lnInclude   -fPIC -c surfaceGenerateBoundingBox.C -o Make/linux64GccDPInt32Opt/surfaceGenerateBoundingBox.o
+In file included from ../../meshLibrary/lnInclude/meshSubset.H:162,
+                 from ../../meshLibrary/lnInclude/triSurfPoints.H:40,
+                 from ../../meshLibrary/lnInclude/triSurf.H:40,
+                 from surfaceGenerateBoundingBox.C:32:
+../../meshLibrary/lnInclude/meshSubsetI.H: In member function ‘bool Foam::meshSubset::operator==(const Foam::meshSubset&) const’:
+../../meshLibrary/lnInclude/meshSubsetI.H:173:18: warning: self-comparison always evaluates to false [-Wtautological-compare]
+  173 |     if( ms.type_ != ms.type_ )
+      |         ~~~~~~~~ ^~ ~~~~~~~~
+g++ -std=c++14 -m64 -DLIB_NAME=libNULL.so -Dlinux64 -DWM_ARCH_OPTION=64 -DWM_DP -DWM_LABEL_SIZE=32 -Wall -Wextra -Wold-style-cast -Wnon-virtual-dtor -Wno-unused-parameter -Wno-invalid-offsetof -Wno-attributes -O3  -DNoRepository -ftemplate-depth-256 -DNoSizeType -I/opt/openfoam13/src/triSurface/lnInclude -I/opt/openfoam13/src/meshTools/lnInclude -I/opt/openfoam13/src/finiteVolume/lnInclude -I../../meshLibrary/lnInclude -IlnInclude -I. -I/opt/openfoam13/src/OpenFOAM/lnInclude -I/opt/openfoam13/src/OSspecific/POSIX/lnInclude   -fPIC -fuse-ld=bfd -Xlinker --add-needed -Xlinker --no-as-needed Make/linux64GccDPInt32Opt/surfaceGenerateBoundingBox.o -L/opt/openfoam13/platforms/linux64GccDPInt32Opt/lib \
+    -lmeshTools -ltriSurface -lfiniteVolume  -L/root/OpenFOAM/root-13/platforms/linux64GccDPInt32Opt/lib -lmeshLibrary -lOpenFOAM -ldl  \
+     -lm -o /root/OpenFOAM/root-13/platforms/linux64GccDPInt32Opt/bin/surfaceGenerateBoundingBox

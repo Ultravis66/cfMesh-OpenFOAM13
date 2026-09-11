@@ -30,6 +30,7 @@ Description
 #include "meshSurfacePartitioner.H"
 #include "triSurf.H"
 #include "triSurfacePartitioner.H"
+#include "sourceFeatureGraph.H"
 #include "demandDrivenData.H"
 #include "meshOctree.H"
 
@@ -51,11 +52,34 @@ void meshSurfaceMapper::createTriSurfacePartitioner() const
 {
     surfPartitionerPtr_ = new triSurfacePartitioner(meshOctree_.surface());
 }
+
+void meshSurfaceMapper::createSourceFeatureGraph() const
+{
+    sourceFeatureGraphPtr_ =
+        new sourceFeatureGraph
+        (
+            meshOctree_.surface(),
+            surfacePartitioner()
+        );
+}
+
+const sourceFeatureGraph& meshSurfaceMapper::sourceFeatures() const
+{
+    if( !sourceFeatureGraphPtr_ )
+        createSourceFeatureGraph();
+
+    return *sourceFeatureGraphPtr_;
+}
+
     
 void meshSurfaceMapper::clearOut()
 {
     if( deletePartitioner_ )
         deleteDemandDrivenData(surfaceEnginePartitionerPtr_);
+
+    // sourceFeatureGraph holds a reference to the triSurfacePartitioner,
+    // so destroy the graph before destroying the partitioner.
+    deleteDemandDrivenData(sourceFeatureGraphPtr_);
     deleteDemandDrivenData(surfPartitionerPtr_);
 }
 
@@ -69,9 +93,12 @@ meshSurfaceMapper::meshSurfaceMapper
 :
     surfaceEngine_(mse),
     meshOctree_(octree),
+    cornerSnapRelaxation_(0.25),
     surfaceEnginePartitionerPtr_(NULL),
     deletePartitioner_(true),
-    surfPartitionerPtr_(NULL)
+    surfPartitionerPtr_(NULL),
+    sourceFeatureGraphPtr_(NULL),
+    snapMinPyramidHeight_(1e-10)
 {
     if( Pstream::parRun() )
     {
@@ -91,7 +118,8 @@ meshSurfaceMapper::meshSurfaceMapper
     meshOctree_(octree),
     surfaceEnginePartitionerPtr_(&mPart),
     deletePartitioner_(false),
-    surfPartitionerPtr_(NULL)
+    surfPartitionerPtr_(NULL),
+    sourceFeatureGraphPtr_(NULL)
 {
     if( Pstream::parRun() )
     {

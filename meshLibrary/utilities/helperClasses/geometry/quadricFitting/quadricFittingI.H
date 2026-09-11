@@ -47,13 +47,15 @@ void quadricFitting::calculateNormalVector()
 
     mat /= otherPoints_.size();
 
-    //- find the eigenvalues of the tensor
-    const vector ev = eigenValues(mat);
-
-    //- estimate the normal as the eigenvector associated
-    //- to the smallest eigenvalue
+    //- Estimate the normal as the eigenvector associated
+    //- with the smallest eigenvalue.
+    //
+    //- OpenFOAM eigenVectors(symmTensor) internally sorts the
+    //- eigenvalues into ascending order and stores the corresponding
+    //- eigenvectors as tensor rows.  Therefore the first row
+    //- (xx, xy, xz) is the eigenvector for the smallest eigenvalue.
     const tensor evMat = eigenVectors(mat);
-    normal_ = vector(evMat.xx(), evMat.yx(), evMat.zx());
+    normal_ = vector(evMat.xx(), evMat.xy(), evMat.xz());
 }
 
 void quadricFitting::calculateCoordinateSystem()

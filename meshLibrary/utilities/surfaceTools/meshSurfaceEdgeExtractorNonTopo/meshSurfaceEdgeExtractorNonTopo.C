@@ -53,6 +53,46 @@ meshSurfaceEdgeExtractorNonTopo::meshSurfaceEdgeExtractorNonTopo
 
 // * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
 
+meshSurfaceEdgeExtractorNonTopo::meshSurfaceEdgeExtractorNonTopo
+(
+    polyMeshGen& mesh,
+    const meshOctree& octree,
+    const labelHashSet& protectedPoints,
+    const Map<label>& protectedPointPatches
+)
+:
+    mesh_(mesh),
+    meshOctree_(octree),
+    protectedPoints_(protectedPoints),
+    protectedPointPatches_(protectedPointPatches)
+{
+    decomposeBoundaryFaces();
+
+    remapBoundaryPoints();
+}
+
+// Staged constructor for callers which must rebuild boundary-point
+// constraint addressing after topology modification.
+meshSurfaceEdgeExtractorNonTopo::meshSurfaceEdgeExtractorNonTopo
+(
+    polyMeshGen& mesh,
+    const meshOctree& octree,
+    const bool deferRemap
+)
+:
+    mesh_(mesh),
+    meshOctree_(octree)
+{
+    decomposeBoundaryFaces();
+
+    if( !deferRemap )
+    {
+        remapBoundaryPoints();
+    }
+}
+
+
+
 meshSurfaceEdgeExtractorNonTopo::~meshSurfaceEdgeExtractorNonTopo()
 {}
 

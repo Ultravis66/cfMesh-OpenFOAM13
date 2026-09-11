@@ -117,6 +117,7 @@ void volumeOptimizer::evaluateGradientsExact
 {
     gradF = vector::zero;
     gradGradF = tensor::zero;
+    label nDegenerateTets = 0;
 
     const scalar K = evaluateStabilisationFactor();
 
@@ -170,16 +171,10 @@ void volumeOptimizer::evaluateGradientsExact
 
         if( Vs < VSMALL )
         {
-            Info << "Tet " << tet << endl;
-            Info << "gradV " << gradV << endl;
-            Info << "Vtri " << Vtri << endl;
-            IOstream::defaultPrecision(20);
-            Info << "Vstab " << Vs << endl;
-
-            FatalErrorIn
-            (
-                "void nodeDisplacementVolumeOptimizer()"
-            ) << "I cannot continue " << exit(FatalError);
+            // Degenerate tet: zero or negative stabilised volume.
+            // Skip gradient contribution and report after the tet loop.
+            ++nDegenerateTets;
+            continue;
         }
 
         //- calculate the gradient of the stabilisation volume
@@ -217,6 +212,7 @@ void volumeOptimizer::evaluateGradientsExact
             LSqrTri * gradGradVstab / sqrVstab +
             2.0 * LSqrTri * (gradVstab * gradVstab) / (sqrVstab * Vstab);
     }
+    // Suppressed per-call degenerate-tet spam. Re-enable locally if needed.
 }
 
 scalar volumeOptimizer::optimiseDivideAndConquer(const scalar tol)

@@ -445,9 +445,7 @@ inline void meshSurfaceOptimizer::lockBoundaryFaces(const labelListType& l)
     const faceList::subList& bFaces = surfaceEngine_.boundaryFaces();
     const labelList& bp = surfaceEngine_.bp();
 
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 20)
-    # endif
+    // Serial: |= LOCKED is read-modify-write, races on shared vertices unsafe
     forAll(lockedSurfaceFaces_, lfI)
     {
         const face& bf = bFaces[lockedSurfaceFaces_[lfI]];
@@ -491,6 +489,7 @@ inline void meshSurfaceOptimizer::lockBoundaryFaces(const labelListType& l)
 
         forAll(receivedData, i)
         {
+            if( !globalToLocal.found(receivedData[i]) ) continue;
             const label bpI = globalToLocal[receivedData[i]];
 
             vertexType_[bpI] |= LOCKED;
@@ -546,6 +545,7 @@ inline void meshSurfaceOptimizer::lockBoundaryPoints(const labelListType& l)
 
         forAll(receivedData, i)
         {
+            if( !globalToLocal.found(receivedData[i]) ) continue;
             const label bpI = globalToLocal[receivedData[i]];
 
             vertexType_[bpI] |= LOCKED;

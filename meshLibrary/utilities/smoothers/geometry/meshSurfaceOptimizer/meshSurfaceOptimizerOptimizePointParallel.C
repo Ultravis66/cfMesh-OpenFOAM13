@@ -135,6 +135,11 @@ void meshSurfaceOptimizer::nodeDisplacementLaplacianParallel
     forAll(receivedData, i)
     {
         const refLabelledPoint& lp = receivedData[i];
+
+        if( !globalToLocal.found(lp.objectLabel()) )
+            continue;
+
+        if( !globalToLocal.found(lp.objectLabel()) ) continue;
         const label bpI = globalToLocal[lp.objectLabel()];
 
         labelledPoint& lpd = localData[bpI];
@@ -152,6 +157,10 @@ void meshSurfaceOptimizer::nodeDisplacementLaplacianParallel
 
         //- create new point position
         const labelledPoint& lp = localData[bpI];
+
+        if( lp.pointLabel() <= 0 )
+            continue;
+
         const point newP = lp.coordinates() / lp.pointLabel();
 
         meshSurfaceEngineModifier surfaceModifier(surfaceEngine_);
@@ -241,6 +250,9 @@ void meshSurfaceOptimizer::nodeDisplacementLaplacianFCParallel
     forAll(receivedData, i)
     {
         const refLabelledPoint& lp = receivedData[i];
+        if( !globalToLocal.found(lp.objectLabel()) )
+            continue;
+        if( !globalToLocal.found(lp.objectLabel()) ) continue;
         const label bpI = globalToLocal[lp.objectLabel()];
 
         labelledPoint& lpd = localData[bpI];
@@ -266,15 +278,20 @@ void meshSurfaceOptimizer::nodeDisplacementLaplacianFCParallel
 
         //- create new point position
         const labelledPoint& lp = localData[bpI];
+
+        if( lp.pointLabel() <= 0 )
+        {
+            newPositions[pI] = points[bPoints[bpI]];
+            continue;
+        }
+
         const point newP = lp.coordinates() / lp.pointLabel();
 
         newPositions[pI] = newP;
     }
 
     meshSurfaceEngineModifier surfaceModifier(surfaceEngine_);
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 20)
-    # endif
+    // Serial apply: moveBoundaryVertexNoUpdate is not thread-safe
     forAll(newPositions, pI)
     {
         surfaceModifier.moveBoundaryVertexNoUpdate
@@ -328,7 +345,11 @@ void meshSurfaceOptimizer::edgeNodeDisplacementParallel
         {
             const edge& e = edges[bpEdges(bpI, epI)];
             const label pI = bp[e.otherVertex(bPoints[bpI])];
-            if( vertexType_[pI] & (EDGE+CORNER) )
+
+            if( pI < 0 || pI >= label(vertexType_.size()) )
+                continue;
+
+            if( vertexType_[pI] & (EDGE | CORNER) )
             {
                 neiPoints.append
                 (
@@ -385,8 +406,10 @@ void meshSurfaceOptimizer::edgeNodeDisplacementParallel
     forAll(receivedData, prI)
     {
         const refLabelledPoint& lp = receivedData[prI];
-        DynList<labelledPoint, 2>& lPts = mPts[lp.objectLabel()];
-        lPts.appendIfNotIn(receivedData[prI].lPoint());
+        std::map<label, DynList<labelledPoint, 2> >::iterator iter =
+            mPts.find(lp.objectLabel());
+        if( iter == mPts.end() ) continue;
+        iter->second.appendIfNotIn(lp.lPoint());
     }
 
     //- Finally, the data is ready to start smoothing
@@ -416,9 +439,7 @@ void meshSurfaceOptimizer::edgeNodeDisplacementParallel
         }
     }
 
-    # ifdef USE_OMP
-    # pragma omp parallel for schedule(dynamic, 20)
-    # endif
+    // Serial apply: moveBoundaryVertexNoUpdate is not thread-safe
     forAll(newPositions, pI)
         sm.moveBoundaryVertexNoUpdate(nodesToSmooth[pI], newPositions[pI]);
 }

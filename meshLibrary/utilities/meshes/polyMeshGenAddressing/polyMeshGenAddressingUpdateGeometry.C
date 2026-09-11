@@ -25,6 +25,7 @@ License
 
 #include "polyMeshGenAddressing.H"
 #include "demandDrivenData.H"
+#include "helperFunctions.H"
 
 # ifdef USE_OMP
 #include <omp.h>
@@ -45,6 +46,7 @@ void polyMeshGenAddressing::updateGeometry
     const pointFieldPMG& p = mesh_.points();
     const faceListPMG& faces = mesh_.faces();
 
+
     //- update face centres and face areas
     if( faceCentresPtr_ && faceAreasPtr_ )
     {
@@ -52,54 +54,74 @@ void polyMeshGenAddressing::updateGeometry
         vectorField& fAreas = *faceAreasPtr_;
 
         # ifdef USE_OMP
-        # pragma omp parallel for if( faces.size() > 100 ) \
+        # pragma omp parallel for if( false ) \
         schedule(dynamic, 10)
         # endif
         forAll(faces, faceI)
-            if( changedFace[faceI] )
+        {
+            if( !changedFace[faceI] ) continue;
+
+            const face& f = faces[faceI];
+            const label nPoints = f.size();
+            if( nPoints < 3 ) continue;
+
+            // Check all points are finite and reasonable before computation.
+            // Use GREAT (1e15) not VGREAT (1e37) -- large-but-finite coordinates
+            // can still overflow to inf during cross-product/magnitude ops.
+            bool anyInfPt = false;
+            for(label pI=0;pI<nPoints;++pI)
             {
-                const face& f = faces[faceI];
-                const label nPoints = f.size();
-
-                // If the face is a triangle, do a direct calculation for
-                // efficiency and to avoid round-off error-related problems
-                if (nPoints == 3)
-                {
-                    fCtrs[faceI] = (1.0/3.0)*(p[f[0]] + p[f[1]] + p[f[2]]);
-                    fAreas[faceI] =
-                        0.5*((p[f[1]] - p[f[0]])^(p[f[2]] - p[f[0]]));
-                }
-                else
-                {
-                    vector sumN = vector::zero;
-                    scalar sumA = 0.0;
-                    vector sumAc = vector::zero;
-
-                    point fCentre = p[f[0]];
-                    for(label pI=1;pI<nPoints;++pI)
-                    {
-                        fCentre += p[f[pI]];
-                    }
-
-                    fCentre /= nPoints;
-
-                    for(label pI=0;pI<nPoints;++pI)
-                    {
-                        const point& nextPoint = p[f.nextLabel(pI)];
-
-                        vector c = p[f[pI]] + nextPoint + fCentre;
-                        vector n = (nextPoint - p[f[pI]])^(fCentre - p[f[pI]]);
-                        scalar a = mag(n);
-
-                        sumN += n;
-                        sumA += a;
-                        sumAc += a*c;
-                    }
-
-                    fCtrs[faceI] = (1.0/3.0)*sumAc/(sumA + VSMALL);
-                    fAreas[faceI] = 0.5*sumN;
-                }
+                const point& pt = p[f[pI]];
+                const scalar px = pt.x(), py = pt.y(), pz = pt.z();
+                // NaN check: NaN != NaN; overflow check: component-wise, no sqrt
+                if( px != px || py != py || pz != pz ||
+                    px > GREAT || px < -GREAT ||
+                    py > GREAT || py < -GREAT ||
+                    pz > GREAT || pz < -GREAT )
+                    { anyInfPt = true; break; }
             }
+            if( anyInfPt )
+            {
+                fCtrs[faceI] = vector::zero;
+                fAreas[faceI] = vector::zero;
+                continue;
+            }
+
+            if (nPoints == 3)
+            {
+                fCtrs[faceI] = (1.0/3.0)*(p[f[0]] + p[f[1]] + p[f[2]]);
+                fAreas[faceI] =
+                    0.5*((p[f[1]] - p[f[0]])^(p[f[2]] - p[f[0]]));
+            }
+            else
+            {
+                vector sumN = vector::zero;
+                scalar sumA = 0.0;
+                vector sumAc = vector::zero;
+
+                point fCentre = p[f[0]];
+                for(label pI=1;pI<nPoints;++pI)
+                    fCentre += p[f[pI]];
+                fCentre /= nPoints;
+
+                for(label pI=0;pI<nPoints;++pI)
+                {
+                    const point& nextPoint = p[f.nextLabel(pI)];
+                    vector c = p[f[pI]] + nextPoint + fCentre;
+                    vector n = (nextPoint - p[f[pI]])^(fCentre - p[f[pI]]);
+                    scalar a = mag(n);
+                    sumN += n;
+                    sumA += a;
+                    sumAc += a*c;
+                }
+
+                if( sumA > SMALL )
+                    fCtrs[faceI] = (1.0/3.0)*sumAc/sumA;
+                else
+                    fCtrs[faceI] = fCentre;
+                fAreas[faceI] = 0.5*sumN;
+            }
+        }
     }
 
     //- update cell centres and cell volumes
@@ -114,7 +136,7 @@ void polyMeshGenAddressing::updateGeometry
         const cellListPMG& cells = mesh_.cells();
 
         # ifdef USE_OMP
-        # pragma omp parallel for if( cells.size() > 100 ) \
+        # pragma omp parallel for if( false ) \
         schedule(dynamic, 10)
         # endif
         forAll(cells, cellI)
@@ -136,11 +158,26 @@ void polyMeshGenAddressing::updateGeometry
 
                 //- estimate position of cell centre
                 vector cEst(vector::zero);
+                label nFiniteFaces = 0;
                 forAll(c, fI)
-                    cEst += fCtrs[c[fI]];
-                cEst /= c.size();
+                {
+                    const vector& fc = fCtrs[c[fI]];
+                    if( help::isnan(fc) || Foam::mag(fc) > GREAT )
+                        continue;
+                    cEst += fc;
+                    ++nFiniteFaces;
+                }
+                if( nFiniteFaces == 0 ) continue;
+                cEst /= nFiniteFaces;
 
                 forAll(c, fI)
+                {
+                    // Skip degenerate faces with non-finite or oversized geometry
+                    const vector& fa = fAreas[c[fI]];
+                    const vector& fc = fCtrs[c[fI]];
+                    if( Foam::mag(fa) > GREAT || help::isnan(fAreas[c[fI]]) ) continue;
+                    if( Foam::mag(fc) > GREAT || help::isnan(fCtrs[c[fI]]) ) continue;
+
                     if( own[c[fI]] == cellI )
                     {
                         // Calculate 3*face-pyramid volume
@@ -188,9 +225,11 @@ void polyMeshGenAddressing::updateGeometry
                         // Accumulate face-pyramid volume
                         cellVols[cellI] += pyr3Vol;
                     }
+                }
 
-                cellCtrs[cellI] /= cellVols[cellI];
-                cellVols[cellI] /= 3.0;
+                const scalar cellVolGuard = Foam::max(cellVols[cellI], VSMALL);
+                cellCtrs[cellI] /= cellVolGuard;
+                cellVols[cellI] = cellVolGuard / 3.0;
             }
         }
     }

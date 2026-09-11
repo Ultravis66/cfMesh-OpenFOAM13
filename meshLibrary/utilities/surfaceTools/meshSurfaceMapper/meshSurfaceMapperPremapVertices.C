@@ -134,8 +134,9 @@ void meshSurfaceMapper::preMapVertices(const label nIterations)
                 }
             }
 
-            forAll(bf, pI)
-                boundaryPointPatches[bp[bf[pI]]].appendIfNotIn(bestPatch);
+            if( bestPatch >= 0 )
+                forAll(bf, pI)
+                    boundaryPointPatches[bp[bf[pI]]].appendIfNotIn(bestPatch);
         }
 
         //- use the shrinking laplace first
@@ -219,7 +220,9 @@ void meshSurfaceMapper::preMapVertices(const label nIterations)
             forAll(receivedData, i)
             {
                 const labelledPointScalar& lps = receivedData[i];
+                if( !globalToLocal.found(lps.pointLabel()) ) continue;
 
+                if( !globalToLocal.found(lps.pointLabel()) ) continue;
                 const label bpI = globalToLocal[lps.pointLabel()];
 
                 labelledPointScalar& lp = preMapPositions[bpI];
@@ -239,6 +242,8 @@ void meshSurfaceMapper::preMapVertices(const label nIterations)
         {
             labelledPointScalar& lps = preMapPositions[bpI];
 
+            // Guard: isolated/nonmanifold points may have zero weight
+            if( lps.scalarValue() <= VSMALL ) continue;
             lps.coordinates() /= lps.scalarValue();
 
             const point& p = points[boundaryPoints[bpI]];
@@ -247,7 +252,12 @@ void meshSurfaceMapper::preMapVertices(const label nIterations)
             point pMap = p;
             scalar dSq;
 
-            if( boundaryPointPatches[bpI].size() == 1 )
+            if( boundaryPointPatches[bpI].size() == 0 )
+            {
+                // No patch found for this point -- skip projection
+                continue;
+            }
+            else if( boundaryPointPatches[bpI].size() == 1 )
             {
                 label nt;
                 meshOctree_.findNearestSurfacePointInRegion

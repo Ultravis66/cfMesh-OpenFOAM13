@@ -122,6 +122,7 @@ void partTetMesh::createParallelAddressing
     //- set the values according to other processors
     forAll(receivedData, i)
     {
+        if( !globalToLocalPointAddressing.found(receivedData[i]) ) continue;
         const label pointI = globalToLocalPointAddressing[receivedData[i]];
         
         if( nodeLabelForPoint[pointI] == -1 )
@@ -216,6 +217,7 @@ void partTetMesh::createParallelAddressing
     {
         const label gpI = receivedData[counter++];
         const label tgI = receivedData[counter++];
+        if( !globalToLocalPointAddressing.found(gpI) ) continue;
         const label pLabel =
             nodeLabelForPoint[globalToLocalPointAddressing[gpI]];
         

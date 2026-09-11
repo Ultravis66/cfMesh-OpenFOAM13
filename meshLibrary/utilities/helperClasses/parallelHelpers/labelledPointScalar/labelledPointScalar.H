@@ -79,6 +79,9 @@ class labelledPointScalar
             weight_(s)
         {}
             
+    //- Copy construct
+    labelledPointScalar(const labelledPointScalar&) = default;
+
     // Destructor
         ~labelledPointScalar()
         {}

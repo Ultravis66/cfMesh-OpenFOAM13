@@ -75,30 +75,24 @@ bool checkIrregularSurfaceConnections::checkAndFixIrregularConnections()
     Info << "Checking for irregular surface connections" << endl;
     
     bool finished;
-    
     labelHashSet badVertices;
-    
     do
     {
         finished = true;
-        
         while( checkAndFixCellGroupsAtBndVertices(badVertices, true) )
             finished = false;
-        
         while( checkEdgeFaceConnections(badVertices, true) )
             finished = false;
-        
         if( checkFaceGroupsAtBndVertices(badVertices, true) )
             finished = false;
     } while( !finished );
-    
     polyMeshGenModifier(mesh_).removeUnusedVertices();
-    
     Info << "Finished checking for irregular surface connections" << endl;
-    
+    // Note: returns badVertices.size()!=0, not whether topology changed.
+    // Changing this to track actual changes causes over-repair on
+    // sharp BL/periodic junctions (Rotor37). Leave original logic.
     if( returnReduce(badVertices.size(), sumOp<label>()) != 0 )
         return true;
-    
     return false;
 }
 

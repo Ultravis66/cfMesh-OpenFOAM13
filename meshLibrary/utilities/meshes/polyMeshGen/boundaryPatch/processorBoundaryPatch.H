@@ -72,6 +72,9 @@ public:
 
         processorBoundaryPatch(const word& name, const dictionary&);
 
+    //- Copy construct
+    processorBoundaryPatch(const processorBoundaryPatch&) = default;
+
     // Construct and return a clone
         virtual autoPtr<boundaryPatchBase> clone() const
         {

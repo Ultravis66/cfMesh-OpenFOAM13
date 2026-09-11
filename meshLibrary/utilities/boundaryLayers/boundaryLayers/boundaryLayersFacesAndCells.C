@@ -76,6 +76,10 @@ void boundaryLayers::createNewFacesAndCells(const boolList& treatPatches)
     forAll(bFaces, bfI)
         if( treatPatches[boundaryFacePatches[bfI]] )
         {
+            // Skip faces marked for complete BL suppression by gap/VT policy
+            if( suppressLayerAtBndFace_.size() > bfI
+             && suppressLayerAtBndFace_[bfI] )
+                continue;
             const face& f = bFaces[bfI];
 
             faceList cellFaces(f.size() + 2);
@@ -122,10 +126,12 @@ void boundaryLayers::createNewFacesAndCells(const boolList& treatPatches)
                         newBoundaryPatches.append(boundaryFacePatches[neiFace]);
                     }
                 }
-                else if( edgeFaces.sizeOfRow(edgeI) == 1 )
+                else if( edgeFaces.sizeOfRow(edgeI) == 1 && Pstream::parRun() )
                 {
+                    // Guard: otherProcPatchPtr only valid in parallel
                     const Map<label>& otherProcPatch = *otherProcPatchPtr;
-                    if( !treatPatches[otherProcPatch[edgeI]] )
+                    if( otherProcPatch.found(edgeI)
+                     && !treatPatches[otherProcPatch[edgeI]] )
                     {
                         newBoundaryFaces.appendList(newF);
                         newBoundaryOwners.append(cellsToAdd.size() + nOldCells);
@@ -244,6 +250,7 @@ void boundaryLayers::createNewFacesParallel
     //- create additional processor patches if needed
     forAll(treatedEdgeLabels, eI)
     {
+        if( !globalToLocal.found(treatedEdgeLabels[eI]) ) continue;
         const label beI = globalToLocal[treatedEdgeLabels[eI]];
 
         if( !otherProcToProcPatch.found(otherFaceProc[beI]) )
@@ -265,6 +272,7 @@ void boundaryLayers::createNewFacesParallel
     FixedList<label, 4> newF;
     forAll(treatedEdgeLabels, geI)
     {
+        if( !globalToLocal.found(treatedEdgeLabels[geI]) ) continue;
         const label beI = globalToLocal[treatedEdgeLabels[geI]];
 
         if( edgeFaces.sizeOfRow(beI) == 0 )
@@ -272,6 +280,7 @@ void boundaryLayers::createNewFacesParallel
 
         const label bfI = edgeFaces(beI, 0);
         const label pos = faceEdges.containsAtPosition(bfI, beI);
+        if( pos < 0 ) continue;  // guard: edge not found in face
         const edge e = bFaces[bfI].faceEdge(pos);
 
         if( otherFaceProc[beI] > Pstream::myProcNo() )

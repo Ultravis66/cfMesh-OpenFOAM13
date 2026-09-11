@@ -26,6 +26,7 @@ Description
 \*---------------------------------------------------------------------------*/
 
 #include "demandDrivenData.H"
+#include "helperFunctions.H"
 #include "meshOptimizer.H"
 #include "polyMeshGenAddressing.H"
 #include "meshSurfaceEngine.H"
@@ -75,13 +76,14 @@ void meshOptimizer::laplaceSmoother::laplacian
             const label nPointPoints = pPoints.sizeOfRow(pointI);
 
             if( nPointPoints == 0 )
-                return;
+                continue;
 
             for(label pI=0;pI<nPointPoints;++pI)
                 newP += points[pPoints(pointI, pI)];
 
             newP /= pPoints.sizeOfRow(pointI);
-            points[pointI] = newP;
+            if( !help::isnan(newP) && !help::isinf(newP) )
+                points[pointI] = newP;
         }
 
         laplacianParallel(procPoints, false);
@@ -133,7 +135,8 @@ void meshOptimizer::laplaceSmoother::laplacianSurface
             if( counter != 0 )
             {
                 newP /= counter;
-                points[pointI] = newP;
+                if( !help::isnan(newP) && !help::isinf(newP) )
+                    points[pointI] = newP;
             }
         }
 
@@ -185,8 +188,8 @@ void meshOptimizer::laplaceSmoother::laplacianPC
                 newP += centres[pointCells(pointI, pcI)];
 
             newP /= pointCells.sizeOfRow(pointI);
-
-            points[pointI] = newP;
+            if( !help::isnan(newP) && !help::isinf(newP) )
+                points[pointI] = newP;
         }
 
         laplacianPCParallel(procPoints);
@@ -234,6 +237,20 @@ void meshOptimizer::laplaceSmoother::laplacianWPC
                 continue;
             }
 
+            // Volume-sign guard: never move a vertex shared by a negVol cell.
+            // The quality smoother repositioning toward valid neighbours inverts them.
+            // untangleMeshFV owns negVol vertices; laplacianWPC must not touch them.
+            bool adjNegVol = false;
+            forAllRow(pointCells, pointI, pcI)
+            {
+                if( volumes[pointCells(pointI, pcI)] < scalar(0) )
+                {
+                    adjNegVol = true;
+                    break;
+                }
+            }
+            if( adjNegVol ) continue;
+
             point newP(vector::zero);
             scalar sumWeights(0.0);
             forAllRow(pointCells, pointI, pcI)
@@ -245,7 +262,8 @@ void meshOptimizer::laplaceSmoother::laplacianWPC
             }
 
             newP /= sumWeights;
-            points[pointI] = newP;
+            if( !help::isnan(newP) && !help::isinf(newP) )
+                points[pointI] = newP;
         }
 
         laplacianWPCParallel(procPoints);
@@ -264,10 +282,7 @@ void meshOptimizer::laplaceSmoother::updateMeshGeometry
 
     boolList chF(mesh_.faces().size(), false);
 
-    # ifdef USE_OMP
-    # pragma omp parallel for if( smoothPoints.size() > 100 ) \
-    schedule(dynamic, 20)
-    # endif
+    // Serial: multiple points share faces, parallel write to chF races
     forAll(smoothPoints, i)
     {
         const label pointI = smoothPoints[i];

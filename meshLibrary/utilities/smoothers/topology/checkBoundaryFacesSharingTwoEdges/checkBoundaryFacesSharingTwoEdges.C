@@ -65,9 +65,7 @@ void checkBoundaryFacesSharingTwoEdges::findFacesAtBndEdge()
     removeBndPoint_.setSize(pointEdges.size());
     removeBndPoint_ = true;
 
-    # ifdef USE_OMP
-    # pragma omp parallel for if( nIntFaces > 100 ) schedule(dynamic, 20)
-    # endif
+    // Serial: removeBndPoint_[bpI]=false races on shared boundary points
     for(label fI=0;fI<nIntFaces;++fI)
     {
         const face& f = faces[fI];
@@ -199,7 +197,10 @@ void checkBoundaryFacesSharingTwoEdges::findFacesAtBndEdge()
 
         //- set remove flag to false
         forAll(receivedData, i)
+        {
+            if( !globalToLocal.found(receivedData[i]) ) continue;
             removeBndPoint_[globalToLocal[receivedData[i]]] = false;
+        }
     }
 }
 
@@ -248,7 +249,9 @@ void checkBoundaryFacesSharingTwoEdges::findBndFacesAtBndVertex()
         label counter(0);
         while( counter < receivedData.size() )
         {
-            const label bpI = globalToLocal[receivedData[counter++]];
+            const label gpI_cb = receivedData[counter++];
+            if( !globalToLocal.found(gpI_cb) ) { ++counter; continue; }
+            const label bpI = globalToLocal[gpI_cb];
             nBndFacesAtBndPoint_[bpI] += receivedData[counter++];
         }
     }
@@ -284,7 +287,7 @@ void checkBoundaryFacesSharingTwoEdges::removeExcessiveVertices()
             newF.append(f[pI]);
         }
 
-        if( newF.size() < f.size() )
+        if( newF.size() >= 3 && newF.size() < f.size() )
         {
             face& mf = const_cast<face&>(f);
             mf.setSize(newF.size());
@@ -312,13 +315,17 @@ void checkBoundaryFacesSharingTwoEdges::removeExcessiveVertices()
             {
                 const label bpI = bp[f[pI]];
 
-                if( removeBndPoint_[bpI] && (nBndFacesAtBndPoint_[bpI] == 2) )
+                if(
+                    (bpI >= 0) &&
+                    removeBndPoint_[bpI] &&
+                    (nBndFacesAtBndPoint_[bpI] == 2)
+                )
                     continue;
 
                 newF.append(f[pI]);
             }
 
-            if( newF.size() < f.size() )
+            if( newF.size() >= 3 && newF.size() < f.size() )
             {
                 face& mf = const_cast<face&>(f);
                 mf.setSize(newF.size());
@@ -477,23 +484,30 @@ bool checkBoundaryFacesSharingTwoEdges::improveTopology()
         //- find cells which will be decomposed
         boolList decomposeCell(mesh_.cells().size(), false);
         const labelList& owner = mesh_.owner();
+        // Face decomposition is allowed; cell decomposition intentionally
+        // disabled here. Enabling decomposeCell[own]=true caused
+        // over-decomposition on sharp BL/periodic junctions (Rotor37).
+        // Re-enable only behind a flag after validation.
+        const bool decomposeOwnerCells = false;
         forAll(decomposeFace, faceI)
         {
-            if( decomposeFace[faceI] )
-                decomposeCell[owner[faceI]];
+            if( !decomposeFace[faceI] ) continue;
+            const label own = owner[faceI];
+            if( decomposeOwnerCells && own >= 0 && own < label(decomposeCell.size()) )
+                decomposeCell[own] = true;
         }
 
         //- decompose marked faces
         decomposeFaces(mesh_).decomposeMeshFaces(decomposeFace);
 
         //- decompose cells
-        VRWGraph pRegions(mesh_.points().size());
         decomposeCells dc(mesh_);
         dc.decomposeMesh(decomposeCell);
 
         changed = true;
     }
 
+    mesh_.clearAddressingData();
     polyMeshGenModifier(mesh_).removeUnusedVertices();
 
     return changed;

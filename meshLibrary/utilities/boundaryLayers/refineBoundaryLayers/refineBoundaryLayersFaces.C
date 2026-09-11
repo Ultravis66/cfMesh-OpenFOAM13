@@ -62,6 +62,52 @@ void refineBoundaryLayers::refineFace
         return;
     }
 
+    //- Defensive split-edge metadata guard.
+    //- refineFace() assumes splitEdgesAtPoint_, splitEdges_, and
+    //- newVerticesForSplitEdge_ are mutually consistent. Two-pass BL
+    //- repair can expose transition faces where this is not true.
+    //- Leave the face unrefined rather than segfaulting; the pass2
+    //- accept/reject gate will decide whether the mesh is usable.
+    bool splitMetaValid = true;
+    forAll(f, eI)
+    {
+        const label pntI = f[eI];
+        if( pntI < 0 || pntI >= label(splitEdgesAtPoint_.size()) )
+        {
+            splitMetaValid = false;
+            break;
+        }
+
+        forAllRow(splitEdgesAtPoint_, pntI, peI)
+        {
+            const label seI = splitEdgesAtPoint_(pntI, peI);
+            if( seI < 0
+             || seI >= label(splitEdges_.size())
+             || seI >= label(newVerticesForSplitEdge_.size()) )
+            {
+                splitMetaValid = false;
+                break;
+            }
+        }
+
+        if( !splitMetaValid )
+            break;
+    }
+
+    if( !splitMetaValid )
+    {
+        static label nInvalidSplitMetaFaces = 0;
+        if( ++nInvalidSplitMetaFaces <= 20 )
+            WarningIn("void refineBoundaryLayers::refineFace")
+                << "Invalid split-edge metadata for face " << f
+                << " - leaving unrefined, marking refinement invalid"
+                << endl;
+        refinementValid_ = false;
+        newFaces.setSize(1);
+        newFaces[0] = f;
+        return;
+    }
+
     //- direction 0 represents edges 0 and 2
     //- direction 1 represents edges 1 and 3
     if( (nLayersInDirection[0] <= 1) && (nLayersInDirection[1] <= 1) )
@@ -238,6 +284,47 @@ void refineBoundaryLayers::refineFace
     Pout << "nLayersDir1 " << nLayersDir1 << endl;
     # endif
 
+    //- Guard the directional split-edge indices before the matrix fill.
+    //- dir0Edges/dir1Edges come from edge-matching above, not from the
+    //- splitEdgesAtPoint_ row iteration the entry guard validates, so
+    //- they can independently be out of range on a transition face.
+    //- The matrix fill below dereferences these into splitEdges_ and
+    //- newVerticesForSplitEdge_ without bounds checks -- guard here.
+    {
+        const label seSz = label(splitEdges_.size());
+        const label nvSz = label(newVerticesForSplitEdge_.size());
+        bool dirEdgesValid = true;
+        if( dir0 >= 0 )
+        {
+            const label a = dir0Edges.first();
+            const label b = dir0Edges.second();
+            if( a < 0 || a >= seSz || a >= nvSz
+             || b < 0 || b >= seSz || b >= nvSz )
+                dirEdgesValid = false;
+        }
+        if( dirEdgesValid && dir1 >= 0 )
+        {
+            const label a = dir1Edges.first();
+            const label b = dir1Edges.second();
+            if( a < 0 || a >= seSz || a >= nvSz
+             || b < 0 || b >= seSz || b >= nvSz )
+                dirEdgesValid = false;
+        }
+        if( !dirEdgesValid )
+        {
+            static label nInvalidDirEdgeFaces = 0;
+            if( ++nInvalidDirEdgeFaces <= 20 )
+                WarningIn("void refineBoundaryLayers::refineFace")
+                    << "Invalid directional split-edge indices for face "
+                    << f << " - leaving unrefined, marking refinement"
+                    << " invalid" << endl;
+            refinementValid_ = false;
+            newFaces.setSize(1);
+            newFaces[0] = f;
+            return;
+        }
+    }
+
     //- map the face onto a matrix for easier orientation
     DynList<DynList<label> > facePoints;
     facePoints.setSize(nLayersDir0+1);
@@ -347,6 +434,188 @@ void refineBoundaryLayers::refineFace
     Pout << "Face points after creating vertices " << facePoints << endl;
     # endif
 
+    // -------------------------------------------------------------
+    // CFMitch V3.9 -- canonical split-edge segment insertion.
+    //
+    // Cases 2 and 4 below operate on only one terminal subface of a
+    // directionally refined face.  The legacy implementation inserted
+    // every interior vertex of the complete split edge into that one
+    // subface.  For N layers this produced an N-1 edge hairpin loop.
+    //
+    // Resolve the positions of the ACTUAL subface endpoints in the
+    // canonical split-edge row and insert only points strictly between
+    // those endpoints, in traversal order.
+    // -------------------------------------------------------------
+    auto appendCanonicalSegmentInterior =
+    [&]
+    (
+        DynList<label, 4>& targetFace,
+        const label splitEdgeI,
+        const label fromPoint,
+        const label toPoint
+    ) -> bool
+    {
+        if( fromPoint == toPoint )
+            return true;
+
+        if
+        (
+            splitEdgeI < 0
+         || splitEdgeI >= label(splitEdges_.size())
+         || splitEdgeI >= label(newVerticesForSplitEdge_.size())
+        )
+        {
+            refinementValid_ = false;
+
+            WarningIn
+            (
+                "refineBoundaryLayers::refineFace"
+            )
+                << "CFMITCH V3.9 EDGE SEGMENT LOOKUP FAIL:"
+                << " reason=splitEdgeOutOfRange"
+                << " splitEdgeI=" << splitEdgeI
+                << " splitEdges=" << splitEdges_.size()
+                << " vertexRows="
+                << newVerticesForSplitEdge_.size()
+                << endl;
+
+            return false;
+        }
+
+        const label rowSize =
+            newVerticesForSplitEdge_.sizeOfRow(splitEdgeI);
+
+        label fromRow = -1;
+        label toRow = -1;
+
+        forAllRow
+        (
+            newVerticesForSplitEdge_,
+            splitEdgeI,
+            rowI
+        )
+        {
+            const label pointI =
+                newVerticesForSplitEdge_
+                (
+                    splitEdgeI,
+                    rowI
+                );
+
+            if( pointI == fromPoint && fromRow < 0 )
+                fromRow = rowI;
+
+            if( pointI == toPoint && toRow < 0 )
+                toRow = rowI;
+        }
+
+        if
+        (
+            rowSize < 2
+         || fromRow < 0
+         || toRow < 0
+         || fromRow == toRow
+        )
+        {
+            refinementValid_ = false;
+
+            WarningIn
+            (
+                "refineBoundaryLayers::refineFace"
+            )
+                << "CFMITCH V3.9 EDGE SEGMENT LOOKUP FAIL:"
+                << " reason=endpointsNotResolved"
+                << " splitEdgeI=" << splitEdgeI
+                << " rowSize=" << rowSize
+                << " fromPoint=" << fromPoint
+                << " fromRow=" << fromRow
+                << " toPoint=" << toPoint
+                << " toRow=" << toRow
+                << endl;
+
+            return false;
+        }
+
+        const label step =
+            toRow > fromRow ? 1 : -1;
+
+        label nAppended = 0;
+
+        for
+        (
+            label rowI=fromRow+step;
+            rowI!=toRow;
+            rowI+=step
+        )
+        {
+            const label pointI =
+                newVerticesForSplitEdge_
+                (
+                    splitEdgeI,
+                    rowI
+                );
+
+            if
+            (
+                pointI == fromPoint
+             || pointI == toPoint
+            )
+            {
+                continue;
+            }
+
+            if
+            (
+                targetFace.size() == 0
+             || targetFace[targetFace.size()-1] != pointI
+            )
+            {
+                targetFace.append(pointI);
+                ++nAppended;
+            }
+        }
+
+        const label legacyWholeEdgeInterior =
+            Foam::max(label(0), rowSize-2);
+
+        const label nAvoided =
+            Foam::max
+            (
+                label(0),
+                legacyWholeEdgeInterior-nAppended
+            );
+
+        if( nAvoided > 0 )
+        {
+            static label nV39Reports = 0;
+            ++nV39Reports;
+
+            if( nV39Reports <= 50 )
+            {
+                Info
+                    << "CFMITCH V3.9 EDGE SEGMENT CONFORM:"
+                    << " splitEdgeI=" << splitEdgeI
+                    << " rowSize=" << rowSize
+                    << " fromRow=" << fromRow
+                    << " toRow=" << toRow
+                    << " appended=" << nAppended
+                    << " legacyWholeEdgeInterior="
+                    << legacyWholeEdgeInterior
+                    << " avoided=" << nAvoided
+                    << endl;
+            }
+            else if( nV39Reports == 51 )
+            {
+                Info
+                    << "CFMITCH V3.9 EDGE SEGMENT CONFORM:"
+                    << " further reports suppressed"
+                    << endl;
+            }
+        }
+
+        return true;
+    };
+
     //- Finally, create the faces
     for(label j=0;j<nLayersDir1;++j)
     {
@@ -375,22 +644,86 @@ void refineBoundaryLayers::refineFace
             f.append(facePoints[i+1][j]);
 
             if(
-                (dir1 != -1) &&
                 (i == (nLayersDir0 - 1)) &&
                 (j == (nLayersDir1 - 1))
             )
             {
-                # ifdef DEBUGLayer
-                Pout << "2. Adding additional points on edge " << endl;
-                # endif
+                label eLabel = -1;
 
-                //- add additional points on edge
-                const label eLabel = dir1Edges.second();
-                const label size =
-                    newVerticesForSplitEdge_.sizeOfRow(eLabel) - 1;
+                if( dir1 != -1 )
+                {
+                    eLabel = dir1Edges.second();
+                }
+                else
+                {
+                    // Partial refinement direction: dir1 could not be
+                    // constructed from a complete pair of opposite split
+                    // edges, but this perimeter edge may still itself be
+                    // a split edge.  Preserve its canonical split-point
+                    // chain so adjacent faces remain conformal.
+                    const edge pe
+                    (
+                        facePoints[nLayersDir0][0],
+                        facePoints[nLayersDir0][nLayersDir1]
+                    );
 
-                for(label index=j+1;index<size;++index)
-                    f.append(newVerticesForSplitEdge_(eLabel, index));
+                    static label nPartialDirCase2Attempts = 0;
+                    const label partialAttemptI =
+                        ++nPartialDirCase2Attempts;
+
+                    forAllRow(splitEdgesAtPoint_, pe.start(), peI)
+                    {
+                        const label seI =
+                            splitEdgesAtPoint_(pe.start(), peI);
+
+                        if( splitEdges_[seI] == pe )
+                        {
+                            eLabel = seI;
+                            break;
+                        }
+                    }
+
+                    if( partialAttemptI <= 50 )
+                    {
+                        label nInterior = 0;
+                        if( eLabel >= 0 )
+                        {
+                            nInterior =
+                                Foam::max
+                                (
+                                    label(0),
+                                    newVerticesForSplitEdge_.
+                                        sizeOfRow(eLabel) - 2
+                                );
+                        }
+
+                        Info << "PARTIALDIR_CASE2"
+                             << " attempt=" << partialAttemptI
+                             << " dir0=" << dir0
+                             << " dir1=" << dir1
+                             << " nLayersDir0=" << nLayersDir0
+                             << " nLayersDir1=" << nLayersDir1
+                             << " edge=" << pe
+                             << " eLabel=" << eLabel
+                             << " insertedCandidates=" << nInterior
+                             << endl;
+                    }
+                }
+
+                if
+                (
+                    eLabel >= 0
+                 && !appendCanonicalSegmentInterior
+                    (
+                        f,
+                        eLabel,
+                        facePoints[i+1][j],
+                        facePoints[i+1][j+1]
+                    )
+                )
+                {
+                    return;
+                }
             }
 
             f.append(facePoints[i+1][j+1]);
@@ -410,17 +743,225 @@ void refineBoundaryLayers::refineFace
 
             f.append(facePoints[i][j+1]);
 
-            if( (dir1 != -1) && (i == 0) && (j == (nLayersDir1 - 1)) )
+            if( (i == 0) && (j == (nLayersDir1 - 1)) )
             {
-                # ifdef DEBUGLayer
-                Pout << "4. Adding additional points on edge " << endl;
-                # endif
+                label eLabel = -1;
 
-                const label eLabel = dir1Edges.first();
-                const label size =
-                    newVerticesForSplitEdge_.sizeOfRow(eLabel) - 2;
-                for(label index=size;index>j;--index)
-                    f.append(newVerticesForSplitEdge_(eLabel, index));
+                if( dir1 != -1 )
+                {
+                    eLabel = dir1Edges.first();
+                }
+                else
+                {
+                    // Partial refinement direction.  This complete side
+                    // edge may still have a canonical split chain even
+                    // though the opposite edge required to form dir1
+                    // does not.
+                    const edge pe
+                    (
+                        facePoints[0][nLayersDir1],
+                        facePoints[0][0]
+                    );
+
+                    static label nPartialDirCase4Attempts = 0;
+                    const label partialAttemptI =
+                        ++nPartialDirCase4Attempts;
+
+                    forAllRow(splitEdgesAtPoint_, pe.start(), peI)
+                    {
+                        const label seI =
+                            splitEdgesAtPoint_(pe.start(), peI);
+
+                        if( splitEdges_[seI] == pe )
+                        {
+                            eLabel = seI;
+                            break;
+                        }
+                    }
+
+                    if( partialAttemptI <= 50 )
+                    {
+                        label nInterior = 0;
+                        if( eLabel >= 0 )
+                        {
+                            nInterior =
+                                Foam::max
+                                (
+                                    label(0),
+                                    newVerticesForSplitEdge_.
+                                        sizeOfRow(eLabel) - 2
+                                );
+                        }
+
+                        Info << "PARTIALDIR_CASE4"
+                             << " attempt=" << partialAttemptI
+                             << " dir0=" << dir0
+                             << " dir1=" << dir1
+                             << " nLayersDir0=" << nLayersDir0
+                             << " nLayersDir1=" << nLayersDir1
+                             << " edge=" << pe
+                             << " eLabel=" << eLabel
+                             << " insertedCandidates=" << nInterior
+                             << endl;
+                    }
+                }
+
+                if
+                (
+                    eLabel >= 0
+                 && !appendCanonicalSegmentInterior
+                    (
+                        f,
+                        eLabel,
+                        facePoints[i][j+1],
+                        facePoints[i][j]
+                    )
+                )
+                {
+                    return;
+                }
+            }
+
+            // ---------------------------------------------------------
+            // CFMitch V5.5 -- partial-direction collapsed-face
+            // canonicalization.
+            //
+            // A BL/no-BL transition can legitimately have only one active
+            // refinement direction.  In that case one edge of an otherwise
+            // quadrilateral child face may collapse to a single point:
+            //
+            //     (A A B C)  ->  (A B C)
+            //
+            // This is not an open/hairpin face.  It is a valid triangular
+            // transition face.  Downstream face sorting already supports
+            // generated faces whose size is not four.
+            //
+            // Canonicalize ONLY partial-direction faces here.  Remove
+            // consecutive duplicate vertices, including a duplicated
+            // closing vertex.  The existing V3.9 invariant below remains
+            // hard for every non-consecutive duplicate or any face that
+            // collapses below three vertices.
+            // ---------------------------------------------------------
+
+            const bool cfmitchPartialDirection =
+                (dir0 == -1) || (dir1 == -1);
+
+            if
+            (
+                cfmitchPartialDirection
+             && f.size() >= 2
+            )
+            {
+                DynList<label, 4> compactFace;
+
+                label effectiveSize = f.size();
+
+                // A polygon representation must not repeat its first point
+                // as an explicit final point.
+                if
+                (
+                    effectiveSize > 1
+                 && f[effectiveSize-1] == f[0]
+                )
+                {
+                    --effectiveSize;
+                }
+
+                for
+                (
+                    label fpI=0;
+                    fpI<effectiveSize;
+                    ++fpI
+                )
+                {
+                    if
+                    (
+                        compactFace.size() == 0
+                     || compactFace[compactFace.size()-1] != f[fpI]
+                    )
+                    {
+                        compactFace.append(f[fpI]);
+                    }
+                }
+
+                if( compactFace.size() != f.size() )
+                {
+                    static label nV55PartialCollapseReports = 0;
+                    ++nV55PartialCollapseReports;
+
+                    if( nV55PartialCollapseReports <= 50 )
+                    {
+                        Info
+                            << "CFMITCH V5.5 PARTIAL FACE COLLAPSE:"
+                            << " dir0=" << dir0
+                            << " dir1=" << dir1
+                            << " nLayersDir0=" << nLayersDir0
+                            << " nLayersDir1=" << nLayersDir1
+                            << " before=" << f
+                            << " after=" << compactFace
+                            << endl;
+                    }
+                    else if
+                    (
+                        nV55PartialCollapseReports == 51
+                    )
+                    {
+                        Info
+                            << "CFMITCH V5.5 PARTIAL FACE COLLAPSE:"
+                            << " further reports suppressed"
+                            << endl;
+                    }
+
+                    f = compactFace;
+                }
+            }
+
+            // V3.9 hard invariant remains in force after canonicalization:
+            // a valid mesh face cannot contain a repeated non-consecutive
+            // point and must contain at least three vertices.
+            bool generatedFaceValid =
+                f.size() >= 3;
+
+            label duplicatePoint = -1;
+
+            for
+            (
+                label fpI=0;
+                generatedFaceValid && fpI<f.size();
+                ++fpI
+            )
+            {
+                for
+                (
+                    label fpJ=fpI+1;
+                    fpJ<f.size();
+                    ++fpJ
+                )
+                {
+                    if( f[fpI] == f[fpJ] )
+                    {
+                        duplicatePoint = f[fpI];
+                        generatedFaceValid = false;
+                        break;
+                    }
+                }
+            }
+
+            if( !generatedFaceValid )
+            {
+                refinementValid_ = false;
+
+                WarningIn
+                (
+                    "refineBoundaryLayers::refineFace"
+                )
+                    << "CFMITCH V3.9 GENERATED FACE REJECT:"
+                    << " inputFace=" << f
+                    << " size=" << f.size()
+                    << " duplicatePoint=" << duplicatePoint
+                    << endl;
+
+                return;
             }
 
             newFaces.append(f);
@@ -826,16 +1367,264 @@ void refineBoundaryLayers::generateNewFaces()
     facesFromFace_.setSize(faces.size());
     newFaces_.clear();
 
+    // NONQUAD_EDGE_CONFORM
+    //
+    // A non-quad face must not be copied verbatim when one of its
+    // perimeter edges has been split by boundary-layer refinement.
+    //
+    // Example:
+    //
+    //     quad side:      A--p1--p2--B
+    //     triangle side:  A----------B
+    //
+    // Copying the triangle unchanged creates a T-junction and opens
+    // the neighbouring cell.  Keep the non-quad as a single polygon,
+    // but insert the canonical split-edge vertices along every
+    // affected perimeter edge.
+    label nNonQuadConformFaces = 0;
+    label nNonQuadChangedFaces = 0;
+    label nNonQuadInsertedVertices = 0;
+
+    auto storeEdgeConformingNonQuadFace =
+    [&]
+    (
+        const label faceI,
+        const face& oldFace
+    )
+    {
+        DynList<label, 64> conformedFace;
+        label nInsertedThisFace = 0;
+
+        // Append a point unless it would duplicate the immediately
+        // preceding point.  This also makes the operation safe for
+        // degenerate/zero-length split-edge chains where multiple
+        // entries may intentionally collapse onto one mesh point.
+        auto appendConsecutiveUnique =
+        [&]
+        (
+            const label pointI
+        )
+        {
+            if
+            (
+                conformedFace.size() == 0
+             || conformedFace[conformedFace.size()-1] != pointI
+            )
+            {
+                conformedFace.append(pointI);
+            }
+        };
+
+        forAll(oldFace, eI)
+        {
+            const edge fe = oldFace.faceEdge(eI);
+
+            appendConsecutiveUnique(oldFace[eI]);
+
+            label splitEdgeI = -1;
+
+            // splitEdgesAtPoint_ is reverse addressing of splitEdges_.
+            // If this point has no row, the face edge simply is not a
+            // split edge and requires no modification.
+            const label startPoint = fe.start();
+
+            if
+            (
+                startPoint >= 0
+             && startPoint < label(splitEdgesAtPoint_.size())
+            )
+            {
+                forAllRow
+                (
+                    splitEdgesAtPoint_,
+                    startPoint,
+                    peI
+                )
+                {
+                    const label seI =
+                        splitEdgesAtPoint_(startPoint, peI);
+
+                    if
+                    (
+                        seI < 0
+                     || seI >= label(splitEdges_.size())
+                     || seI >=
+                        label(newVerticesForSplitEdge_.size())
+                    )
+                    {
+                        refinementValid_ = false;
+
+                        WarningIn
+                        (
+                            "refineBoundaryLayers::generateNewFaces()"
+                        )
+                            << "Invalid split-edge metadata while "
+                            << "conforming non-quad face "
+                            << faceI
+                            << " edge " << fe
+                            << " splitEdgeI=" << seI
+                            << endl;
+
+                        return false;
+                    }
+
+                    if( splitEdges_[seI] == fe )
+                    {
+                        splitEdgeI = seI;
+                        break;
+                    }
+                }
+            }
+
+            if( splitEdgeI < 0 )
+                continue;
+
+            const edge& se = splitEdges_[splitEdgeI];
+            const label nEdgePoints =
+                newVerticesForSplitEdge_.
+                    sizeOfRow(splitEdgeI);
+
+            if( nEdgePoints < 2 )
+            {
+                refinementValid_ = false;
+
+                WarningIn
+                (
+                    "refineBoundaryLayers::generateNewFaces()"
+                )
+                    << "Invalid split-edge vertex chain while "
+                    << "conforming non-quad face "
+                    << faceI
+                    << " splitEdgeI=" << splitEdgeI
+                    << " rowSize=" << nEdgePoints
+                    << endl;
+
+                return false;
+            }
+
+            // Endpoints are already supplied by the original face.
+            // Insert only the interior canonical split vertices and
+            // respect the orientation of this face edge.
+            if( fe.start() == se.start() )
+            {
+                for
+                (
+                    label pI=1;
+                    pI<nEdgePoints-1;
+                    ++pI
+                )
+                {
+                    const label oldSize =
+                        conformedFace.size();
+
+                    appendConsecutiveUnique
+                    (
+                        newVerticesForSplitEdge_
+                        (
+                            splitEdgeI,
+                            pI
+                        )
+                    );
+
+                    if( conformedFace.size() > oldSize )
+                    {
+                        ++nInsertedThisFace;
+                        ++nNonQuadInsertedVertices;
+                    }
+                }
+            }
+            else
+            {
+                for
+                (
+                    label pI=nEdgePoints-2;
+                    pI>0;
+                    --pI
+                )
+                {
+                    const label oldSize =
+                        conformedFace.size();
+
+                    appendConsecutiveUnique
+                    (
+                        newVerticesForSplitEdge_
+                        (
+                            splitEdgeI,
+                            pI
+                        )
+                    );
+
+                    if( conformedFace.size() > oldSize )
+                    {
+                        ++nInsertedThisFace;
+                        ++nNonQuadInsertedVertices;
+                    }
+                }
+            }
+        }
+
+        // The face must still contain at least three distinct
+        // consecutive vertices.
+        if( conformedFace.size() < 3 )
+        {
+            refinementValid_ = false;
+
+            WarningIn
+            (
+                "refineBoundaryLayers::generateNewFaces()"
+            )
+                << "Edge-conforming non-quad face collapsed"
+                << " faceI=" << faceI
+                << " oldFace=" << oldFace
+                << " conformedFace=" << conformedFace
+                << endl;
+
+            return false;
+        }
+
+        facesFromFace_.append
+        (
+            faceI,
+            newFaces_.size()
+        );
+
+        newFaces_.appendList(conformedFace);
+
+        ++nNonQuadConformFaces;
+
+        if( nInsertedThisFace > 0 )
+        {
+            ++nNonQuadChangedFaces;
+
+            if( nNonQuadChangedFaces <= 50 )
+            {
+                Info << "NONQUAD_EDGE_CONFORM"
+                     << " face=" << faceI
+                     << " oldSize=" << oldFace.size()
+                     << " newSize=" << conformedFace.size()
+                     << " inserted=" << nInsertedThisFace
+                     << " oldPts=" << oldFace
+                     << " newPts=" << conformedFace
+                     << endl;
+            }
+        }
+
+        return true;
+    };
+
     //- split internal faces
     for(label faceI=0;faceI<nInternalFaces;++faceI)
     {
         const face& f = faces[faceI];
 
-        //- only quad faces can be split
+        //- Only quad faces are directionally subdivided.
+        //- Non-quads remain one polygon, but their perimeter must
+        //- conform to every canonical split-edge chain.
         if( f.size() != 4 )
         {
-            facesFromFace_.append(faceI, newFaces_.size());
-            newFaces_.appendList(f);
+            if( !storeEdgeConformingNonQuadFace(faceI, f) )
+                return;
+
             continue;
         }
 
@@ -857,10 +1646,22 @@ void refineBoundaryLayers::generateNewFaces()
 
                 if( edges[beI] == fe )
                 {
-                    //- this edge is attached to the boundary
-                    //- get the number of layers for neighbouring cells
-                    const label nSplits0 = nLayersAtBndFace_[beFaces(beI, 0)];
-                    const label nSplits1 = nLayersAtBndFace_[beFaces(beI, 1)];
+                    //- this edge is attached to the boundary.
+                    //- Guard: a boundary edge may have only one adjacent
+                    //- boundary face (patch seam). The boundary-face loop
+                    //- below already checks sizeOfRow(beI)!=2, but this
+                    //- internal-face loop did not -- unguarded beFaces
+                    //- reads segfault refineFace() when pass2 repair plans
+                    //- alter layer topology at such edges.
+                    if( beFaces.sizeOfRow(beI) != 2 )
+                        continue;
+                    const label bf0 = beFaces(beI, 0);
+                    const label bf1 = beFaces(beI, 1);
+                    if( bf0 < 0 || bf0 >= label(nLayersAtBndFace_.size())
+                     || bf1 < 0 || bf1 >= label(nLayersAtBndFace_.size()) )
+                        continue;
+                    const label nSplits0 = nLayersAtBndFace_[bf0];
+                    const label nSplits1 = nLayersAtBndFace_[bf1];
 
                     //- set the number of layers for the given direction
                     const label dir = eI % 2;
@@ -877,6 +1678,9 @@ void refineBoundaryLayers::generateNewFaces()
         //- refine the face
         DynList<DynList<label, 4>, 128> newFacesForFace;
         refineFace(f, nRefinementInDirection, newFacesForFace);
+
+        if( !refinementValid_ )
+            return;
 
         //- store decomposed faces
         forAll(newFacesForFace, fI)
@@ -904,11 +1708,14 @@ void refineBoundaryLayers::generateNewFaces()
         const face& bf = bFaces[bfI];
         const label faceI = startingBoundaryFace + bfI;
 
-        //- only quad faces can be split
+        //- Only quad faces are directionally subdivided.
+        //- Non-quads remain one polygon, but their perimeter must
+        //- conform to every canonical split-edge chain.
         if( bf.size() != 4 )
         {
-            facesFromFace_.append(faceI, newFaces_.size());
-            newFaces_.appendList(bf);
+            if( !storeEdgeConformingNonQuadFace(faceI, bf) )
+                return;
+
             continue;
         }
 
@@ -928,14 +1735,35 @@ void refineBoundaryLayers::generateNewFaces()
             if( neiFace == bfI )
                 neiFace = beFaces(beI, 1);
 
+            //- Guard neiFace and patch indices before dereferencing.
+            //- This access happens BEFORE refineFace(), so the entry
+            //- guard cannot protect it. Out-of-range neiFace/patches
+            //- crash generateNewFaces() directly. Fail closed: mark
+            //- refinement invalid and abort so the two-pass loop rejects.
+            if( neiFace < 0
+             || neiFace >= label(facePatches.size())
+             || neiFace >= label(nLayersAtBndFace_.size()) )
+            {
+                refinementValid_ = false;
+                return;
+            }
+            const label neiPatch = facePatches[neiFace];
+            const label currPatch = facePatches[bfI];
+            if( neiPatch < 0 || neiPatch >= label(layerAtPatch_.size())
+             || currPatch < 0 || currPatch >= label(layerAtPatch_.size()) )
+            {
+                refinementValid_ = false;
+                return;
+            }
+
             //- faces cannot be in the same layer
             const DynList<label>& neiLayers =
-                layerAtPatch_[facePatches[neiFace]];
+                layerAtPatch_[neiPatch];
 
             if( neiLayers.size() == 0 )
                 continue;
 
-            const DynList<label>& currLayers = layerAtPatch_[facePatches[bfI]];
+            const DynList<label>& currLayers = layerAtPatch_[currPatch];
 
             bool foundSame(false);
 
@@ -958,6 +1786,9 @@ void refineBoundaryLayers::generateNewFaces()
         //- refine the face
         DynList<DynList<label, 4>, 128> newFacesForFace;
         refineFace(bf, nRefinementInDirection, newFacesForFace);
+
+        if( !refinementValid_ )
+            return;
 
         //- store the refined faces
         forAll(newFacesForFace, fI)

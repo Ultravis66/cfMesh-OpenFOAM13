@@ -36,8 +36,12 @@ SourceFiles
 #define cartesianMeshGenerator_H
 
 #include "polyMeshGen.H"
+#include "Map.H"
+#include "HashSet.H"
+#include "boolList.H"
 #include "IOdictionary.H"
 #include "workflowControls.H"
+#include "meshQualityTypes.H"
 //#include "volFields.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -47,6 +51,7 @@ namespace Foam
 
 // Forward declarations
 class triSurf;
+class boundaryLayers;
 class meshOctree;
 class Time;
 
@@ -69,6 +74,7 @@ class cartesianMeshGenerator
         //- IOdictionary containing information about cell sizes, etc..
         IOdictionary meshDict_;
 
+
         //- pointer to the octree
         meshOctree* octreePtr_;
 
@@ -78,7 +84,76 @@ class cartesianMeshGenerator
         //- workflow controller
         workflowControls controller_;
 
+        //- BL/BL junction points passed from boundaryLayers to refineBoundaryLayers
+        labelHashSet blblJunctionPoints_;
+        labelHashSet blblAcuteCornerPoints_;
+        boolList blRampSeedPoints_; //- finite ramp seeds from BL+BL+neutral corners
+        labelList vtFaceRing_;
+        labelHashSet blGapActionPoints_;
+        wordList     blGapLoserPatchNames_;
+
+        // Final BL-height scale at simple BL/neutral contacts.
+        // Keys are stable mesh-point labels, not boundary-point indices.
+        Map<scalar> blNeutralLayerScaleAtMeshPoint_;
+
+        // ========================================================
+        // CFMITCH stable macro-BL lineage.
+        //
+        // Unlike blNeutralEdgePoints_ these are GLOBAL mesh-point
+        // labels and therefore survive boundary-point readdressing.
+        //
+        // base -> top is the exact macro extrusion pair.
+        // ========================================================
+
+        labelHashSet blNeutralBaseMeshPoints_;
+
+        Map<label> blNeutralBaseWallPatchAtMeshPoint_;
+
+        Map<label> blMacroTopForBaseMeshPoint_;
+
+        //- BL/no-BL transition edge points (boundary-point indices)
+        //- passed from boundaryLayers to post-BL mapper instances
+        //- to exclude from generic nearest-surface projection
+        labelHashSet blNoBlEdgePoints_;
+
+        //- BL-side patch index per interface point
+        //- used for patch-constrained projection instead of global search
+        Map<label> blNoBlPointPatch_;
+
+        //- BL/neutral edge points (blade/periodic junctions)
+        labelHashSet blNeutralEdgePoints_;
+
+        //- BL-side patch per neutral edge point
+        Map<label> blNeutralPointPatch_;
+
+        //- mesh points inside the boundary layer (from refineBoundaryLayers)
+        labelLongList blPoints_;
+        label nPointsBeforeBL_;
+        scalarField blLayerScale_;
+
+        //- true if optimiseFinalMesh() rejected and rolled back final untangle
+        bool finalUntangleRejected_;
+
+        //- True when optimizer output is improved but still contains
+        //  residual negVol cells. Surface re-projection/snap is unsafe,
+        //  but BL/refBL may still proceed under its own validation guards.
+        bool reprojUnsafe_;
+        //- Coarse history label for this mesh at pipeline exit.
+        //- Set during optimiseFinalMesh(); read by harness log.
+        MeshHistory meshHistory_;
+        //- bad pyramid faces from gate2 diagnostic in optimiseFinalMesh()
+        //- fed forward to refBoundaryLayers() for pre-refBL seed retraction
+        labelHashSet postOptBadFaces_;
+        labelHashSet postOptimizerReprojBlockedPts_;
+
     // Private member functions
+        //- trace global bad face indices to boundary-local bfI seed faces
+        //- for pre-refBL retraction via forceSingleLayerAtFaces()
+        labelHashSet traceToSeedFaces
+        (
+            const labelHashSet& badFaces,
+            const label nRings = 1
+        );
         //- create cartesian mesh
         void createCartesianMesh();
 
@@ -98,6 +173,12 @@ class cartesianMeshGenerator
         void optimiseMeshSurface();
 
         //- add boundary layers
+        //- Detect tight proximity/gap regions between BL patches and
+        //- suppress BL locally through boundaryLayers::setGapPoints().
+        void detectGapPoints(boundaryLayers& bl);
+        void detectTripleJunctions(boundaryLayers& bl);
+        void snapSurfaceBeforeBLRefinement();
+
         void generateBoundaryLayers();
 
         //- refine boundary layers

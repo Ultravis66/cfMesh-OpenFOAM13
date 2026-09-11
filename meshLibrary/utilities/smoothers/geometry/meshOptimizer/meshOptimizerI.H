@@ -88,7 +88,11 @@ inline void meshOptimizer::lockCells(const labelListType& l)
             fromOtherProc >> receivedData;
 
             forAll(receivedData, i)
-                lockedFace[start+receivedData[i]];
+            {
+                const label fIdx = receivedData[i];
+                if( fIdx >= 0 && fIdx < procBoundaries[patchI].patchSize() )
+                    lockedFace[start+fIdx] = true;
+            }
         }
     }
 
@@ -168,7 +172,11 @@ inline void meshOptimizer::lockFaces(const labelListType& lf)
             fromOtherProc >> receivedData;
 
             forAll(receivedData, i)
-                lockedFace[start+receivedData[i]];
+            {
+                const label fIdx = receivedData[i];
+                if( fIdx >= 0 && fIdx < procBoundaries[patchI].patchSize() )
+                    lockedFace[start+fIdx] = true;
+            }
         }
     }
 
@@ -224,9 +232,9 @@ inline void meshOptimizer::lockPoints(const labelListType& lp)
 
                 forAll(f, pI)
                 {
-                    if( vertexLocation_[pI] & LOCKED )
+                    if( vertexLocation_[f[pI]] & LOCKED )
                     {
-                        // send the face lable and the location in the face
+                        // send the face label and the location in the face
                         dataToSend.append(faceI-start);
                         dataToSend.append((f.size()-pI)%f.size());
                     }
@@ -257,10 +265,16 @@ inline void meshOptimizer::lockPoints(const labelListType& lp)
             fromOtherProc >> receivedData;
 
             label counter(0);
-            while( counter < receivedData.size() )
+            while( counter + 1 < receivedData.size() )
             {
-                const face& f = faces[start+receivedData[counter++]];
-                vertexLocation_[f[receivedData[counter++]]] |= LOCKED;
+                const label fIdx = receivedData[counter++];
+                const label pIdx = receivedData[counter++];
+                const label patchSize =
+                    procBoundaries[patchI].patchSize();
+                if( fIdx < 0 || fIdx >= patchSize ) continue;
+                const face& f = faces[start+fIdx];
+                if( pIdx < 0 || pIdx >= label(f.size()) ) continue;
+                vertexLocation_[f[pIdx]] |= LOCKED;
             }
         }
     }
