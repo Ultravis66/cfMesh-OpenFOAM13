@@ -1,3 +1,21 @@
+## Comprehensive `meshDict` example
+
+The following example collects the major cfMesh and CFMitch controls used during development of this OpenFOAM Foundation 13 fork.
+
+It is intended as a **reference configuration**, not as a recommended configuration for every geometry. Many of the controls are experimental, geometry-specific, legacy, diagnostic, or mutually exclusive.
+
+For new difficult boundary-layer cases, the recommended starting point is generally:
+
+```text
+boundaryLayerArchitecture constraintPlanner;
+autoDetectBoundaryJunctions true;
+cfmitchV10KCrossPatchLayerSync true;
+cfmitchV9MergePeriodicFaceFans true;
+```
+
+with other repair or diagnostic mechanisms enabled only when required.
+
+```cpp
 FoamFile
 {
     version   2.0;
@@ -7,109 +25,452 @@ FoamFile
     object    meshDict;
 }
 
-writeLineageDiagnostics false;
-writeLineageStages (postBLCreate postOptimize postRefBL final);
 
+// ============================================================================
+// GENERAL DIAGNOSTICS
+// ============================================================================
+
+// Optional lineage diagnostics.
+writeLineageDiagnostics false;
+
+writeLineageStages
+(
+    postBLCreate
+    postOptimize
+    postRefBL
+    final
+);
+
+
+// ============================================================================
+// INPUT GEOMETRY
+// ============================================================================
 
 surfaceFile "constant/triSurface/Rotor37_cfmesh.stl";
 
-dirtyRecoverableMaxNegVol 10;
-enableRung2TJSmoother true; // EXPERIMENT
-enablePostBLRescue true;
-rung2MaxRings 4; // need more rings for interior movable points // EXPERIMENT -- default 5, testing recovery of 6-10 cell cases
+
+// ============================================================================
+// BASE CARTESIAN MESH
+// ============================================================================
+
+maxCellSize       0.003;
+boundaryCellSize  0.001;
+minCellSize       0.0005;
+
+// Point known to lie inside the fluid domain.
+insideMesh (0.214 0.000 0.025);
+
+
+// ============================================================================
+// SURFACE REFINEMENT
+// ============================================================================
+
+localRefinement
+{
+    blade_1
+    {
+        cellSize 0.0005;
+    }
+
+    blade_2
+    {
+        cellSize 0.0005;
+    }
+
+    blade_3
+    {
+        cellSize 0.0005;
+    }
+
+    blade_4
+    {
+        cellSize 0.0005;
+    }
+
+    hub
+    {
+        cellSize 0.001;
+    }
+
+    shroud
+    {
+        cellSize 0.001;
+    }
+
+    periodic_1
+    {
+        cellSize 0.0005;
+    }
+
+    periodic_2
+    {
+        cellSize 0.0005;
+    }
+}
+
+
+// ============================================================================
+// OPTIONAL VOLUMETRIC / OBJECT REFINEMENT
+// ============================================================================
+
+objectRefinements
+{
+    fineBox
+    {
+        type      box;
+        centre    (0.214 0.0 0.025);
+
+        lengthX   0.20;
+        lengthY   0.10;
+        lengthZ   0.10;
+
+        cellSize  0.0005;
+    }
+
+    transitionBox
+    {
+        type      box;
+        centre    (0.214 0.0 0.025);
+
+        lengthX   0.30;
+        lengthY   0.15;
+        lengthZ   0.15;
+
+        cellSize  0.001;
+    }
+}
+
+
+// ============================================================================
+// OPTIONAL GEOMETRY PREPROCESSING
+// ============================================================================
 
 geometryPreprocessing
 {
     active                true;
     reportOnly            false;
+
     weldNearPoints        false;
     selectiveWeld         false;
+
     weldTolerance         1e-4;
+
     autoScaleWithCellSize false;
     minFeatureToCellRatio 0.20;
+
     writeDiagnostics      false;
 }
 
-maxCellSize 0.003;
-boundaryCellSize 0.001;
-minCellSize 0.0005;
-insideMesh (0.214 0.000 0.025);
 
-localRefinement
-{
-    blade_1    { cellSize 0.0005; }
-    blade_2    { cellSize 0.0005; }
-    blade_3    { cellSize 0.0005; }
-    blade_4    { cellSize 0.0005; }
-    hub        { cellSize 0.001; }
-    shroud     { cellSize 0.001; }
-    periodic_1 { cellSize 0.0005; }
-    periodic_2 { cellSize 0.0005; }
-}
+// ============================================================================
+// GLOBAL RECOVERY / EXPERIMENTAL CONTROLS
+// ============================================================================
+
+// Number of negative-volume cells which may be considered recoverable by
+// selected repair stages.
+dirtyRecoverableMaxNegVol 10;
+
+// Experimental triple-junction smoother.
+enableRung2TJSmoother true;
+
+// Experimental post-BL rescue path.
+enablePostBLRescue true;
+
+// Number of rings available to the rung-2 repair mechanism.
+rung2MaxRings 4;
+
+
+// ============================================================================
+// BOUNDARY LAYERS
+// ============================================================================
 
 boundaryLayers
 {
-    blSharpEdgeAngleDeg 85;
-    useContactLinePolicy true;
-    useContactLineHeightSmoother true;
-    writeContactLineHeightSmootherAtlas true;
-    contactLineSmootherMaxGrowth 1.5;
-    contactLineSmootherMinCollapse 0.05;
-    contactLineSmootherMaxMoveFraction 0.25;
-    contactLineSmootherIterations 1;
-    contactLineSmootherMinHeight 1e-8;
-    useHardBLBLCapCells true;
-    useHardBLBLCapVertexInsertion true;
-    useHardBLBLReducedCells true;
-    useHardBLBLAsymmetricCapFaces false;
-    hardBLBLCapScale 0.10;
-    nLayers 0;
-    patchRoles
+    // ========================================================================
+    // BL ARCHITECTURE
+    // ========================================================================
+
+    // Available development architectures:
+    //
+    // classicCfMesh
+    // legacyEnhanced
+    // constraintPlanner
+    //
+    // constraintPlanner is the current primary development architecture.
+
+    boundaryLayerArchitecture constraintPlanner;
+
+
+    // ========================================================================
+    // CONSTRAINT PLANNER
+    // ========================================================================
+
+    constraintPlanner
     {
-        wall        (blade_1 blade_2 blade_3 blade_4 hub shroud);
-        blade       (blade_1 blade_2 blade_3 blade_4);
-        hub         (hub);
-        shroud      (shroud);
-        periodic    (periodic_1 periodic_2);
-        inletOutlet (inlet outlet);
+        // Maximum permitted neighboring layer-count difference.
+        maxLayerStep 2;
+
+        // Minimum neutral-boundary projection scaling.
+        neutralProjectionFloor 0.0;
+
+        heightPlanner
+        {
+            enabled          false;
+
+            maxEdgeRatio     1.50;
+            maxMoveFraction  0.05;
+            iterations       1;
+        }
     }
 
-    terminationPatches (inlet outlet);
 
-    // BL/BL junction detection
-    blblFeatureAngleDeg     35.0;
+    // ========================================================================
+    // PRE-REFINEMENT COUPLED BL OPTIMISATION
+    // ========================================================================
+
+    // Experimental coupled one-layer optimiser.
+    cfmitchPreRefBLCoupledOptimisation false;
+
+    // Actually commit the coupled optimiser result.
+    cfmitchPreRefBLCoupledCommit false;
+
+    cfmitchPreRefBLMinHairRatio 0.50;
+
+    cfmitchPreRefBLNormalSmoothingIterations 2;
+
+
+    // ========================================================================
+    // AUTOMATIC BOUNDARY-JUNCTION DISCOVERY
+    // ========================================================================
+
+    // Automatically classify multi-patch boundary junctions from actual
+    // topology and resolved BL intent.
+    //
+    // This replaces the need for some geometry-specific hard-coded
+    // triple-junction definitions.
+    autoDetectBoundaryJunctions true;
+
+
+    // ========================================================================
+    // SHARP-EDGE / FEATURE CONTROLS
+    // ========================================================================
+
+    blSharpEdgeAngleDeg 85;
+
+    blblFeatureAngleDeg      35.0;
     blblCornerAcuteThreshold 0.5;
-    lockAcuteCornerPoints   true;
 
-    // Acute corner local taper (seeded from blblAcuteCornerPoints_)
-    acuteCornerRing0        0.0;
-    acuteCornerRing1        0.02;
-    acuteCornerRing2        0.05;
-    acuteCornerRing3        0.15;
-    acuteCornerRing4        0.35;
-    acuteCornerRing5        0.60;
-    acuteCornerRing6        1.00;
+    lockAcuteCornerPoints true;
 
-    acuteCornerCapLayers    false;
 
-    // Enable boundary layer optimisation pass
-    optimiseLayer           false;
-    optimiseLayerBuffer     false;
+    // ========================================================================
+    // ACUTE-CORNER LOCAL TAPER
+    // ========================================================================
 
-    // Virtual topology: suppress BL at acute triple-junctions
-    virtualTopologyExclusion  true;
-    virtualTopoRing0          0.05;
-    virtualTopoRing1          0.15;
-    virtualTopoRing2          0.40;
+    acuteCornerRing0 0.00;
+    acuteCornerRing1 0.02;
+    acuteCornerRing2 0.05;
+    acuteCornerRing3 0.15;
+    acuteCornerRing4 0.35;
+    acuteCornerRing5 0.60;
+    acuteCornerRing6 1.00;
 
-    // Post-BL repair: classify periodic transition faces and avoid unsafe flips
+    acuteCornerCapLayers false;
+
+
+    // ========================================================================
+    // PATCH ROLES
+    // ========================================================================
+
+    patchRoles
+    {
+        wall
+        (
+            blade_1
+            blade_2
+            blade_3
+            blade_4
+            hub
+            shroud
+        );
+
+        blade
+        (
+            blade_1
+            blade_2
+            blade_3
+            blade_4
+        );
+
+        hub
+        (
+            hub
+        );
+
+        shroud
+        (
+            shroud
+        );
+
+        periodic
+        (
+            periodic_1
+            periodic_2
+        );
+
+        inletOutlet
+        (
+            inlet
+            outlet
+        );
+    }
+
+
+    // ========================================================================
+    // BL TERMINATION PATCHES
+    // ========================================================================
+
+    terminationPatches
+    (
+        inlet
+        outlet
+    );
+
+
+    // ========================================================================
+    // CONTACT-LINE POLICY
+    // ========================================================================
+
+    useContactLinePolicy true;
+
+    useContactLineHeightSmoother true;
+
+    writeContactLineHeightSmootherAtlas true;
+
+    contactLineSmootherMaxGrowth       1.5;
+    contactLineSmootherMinCollapse     0.05;
+    contactLineSmootherMaxMoveFraction 0.25;
+    contactLineSmootherIterations      1;
+    contactLineSmootherMinHeight       1e-8;
+
+
+    // ========================================================================
+    // HARD BL/BL JUNCTION HANDLING
+    // ========================================================================
+
+    useHardBLBLCapCells             true;
+    useHardBLBLCapVertexInsertion   true;
+    useHardBLBLReducedCells         true;
+    useHardBLBLAsymmetricCapFaces   false;
+
+    hardBLBLCapScale 0.10;
+
+
+    // ========================================================================
+    // LEGACY / EXPLICIT TRIPLE-JUNCTION CONTROLS
+    // ========================================================================
+
+    // These remain useful for explicit geometry-specific control, although
+    // autoDetectBoundaryJunctions is preferred where topology can determine
+    // the relationship automatically.
+
+    tripleJunctionSuppressPatches
+    (
+        hub
+        shroud
+    );
+
+    tripleJunctionFaceRingExclusion true;
+
+    tripleJunctionProtectedRing0Scale 0.5;
+
+    tripleJunctionWallPatches
+    (
+        blade_1
+        blade_2
+        blade_3
+        blade_4
+    );
+
+    tripleJunctionNeutralPatches
+    (
+        periodic_1
+        periodic_2
+    );
+
+
+    // ========================================================================
+    // VIRTUAL-TOPOLOGY EXCLUSION
+    // ========================================================================
+
+    virtualTopologyExclusion true;
+
+    virtualTopoRing0 0.05;
+    virtualTopoRing1 0.15;
+    virtualTopoRing2 0.40;
+
+
+    // ========================================================================
+    // PERIODIC TRANSITION PROTECTION
+    // ========================================================================
+
     periodicTransitionProtection true;
-    periodicTransitionSkipFlip   true;
-    periodicTransitionPatches    (periodic_1 periodic_2);
 
-    // Gap/proximity detection: suppress BL where BL patches are too close
-    detectGaps            true;
-    gapThreshold          1e-5;
+    periodicTransitionSkipFlip true;
+
+    periodicTransitionPatches
+    (
+        periodic_1
+        periodic_2
+    );
+
+
+    // ========================================================================
+    // CFMITCH PERIODIC FACE-FAN REPAIR
+    // ========================================================================
+
+    // Proven periodic face-fan reconstruction used in the Rotor37 v1.0.0
+    // regression.
+    cfmitchV9MergePeriodicFaceFans true;
+
+
+    // ========================================================================
+    // CROSS-PATCH BL LAYER SYNCHRONISATION
+    // ========================================================================
+
+    // Older skew-driven experimental retreat path.
+    cfmitchV10GCrossPatchSkewRetreat false;
+
+    // Current final-layer-count reconciliation across real BL/BL patch seams.
+    // This was required to eliminate the remaining internal Rotor37
+    // cross-patch skew failures.
+    cfmitchV10KCrossPatchLayerSync true;
+
+
+    // ========================================================================
+    // PERIODIC NORMAL-REJECTION PROOF / COMMIT
+    // ========================================================================
+
+    // Diagnostic proof stage.
+    cfmitchV11BProbeNormalRejected true;
+
+    // Commit only normal-rejected periodic repairs which pass the proof.
+    cfmitchV11CCommitProvenNormalRejected true;
+
+
+    // ========================================================================
+    // GAP / CLEARANCE DETECTION
+    // ========================================================================
+
+    // Current gap handling uses explicit patch pairs.
+    //
+    // This is NOT yet a complete automatic turbomachinery tip-clearance
+    // planner.
+
+    detectGaps true;
+
+    gapThreshold 1e-5;
+
     gapPatchPairs
     (
         (blade_1 shroud)
@@ -117,141 +478,373 @@ boundaryLayers
         (blade_3 shroud)
         (blade_4 shroud)
     );
-    gapSuppressPatches (shroud hub);
-    tripleJunctionSuppressPatches (hub shroud);
-    tripleJunctionFaceRingExclusion true;
-    tripleJunctionProtectedRing0Scale 0.5;
-    tripleJunctionWallPatches     (blade_1 blade_2 blade_3 blade_4);
-    tripleJunctionNeutralPatches  (periodic_1 periodic_2);  // suppress shroud+hub BL, protect blade
 
-    // Post-optimizer surface re-projection (Layer 3 constraint recovery)
-    postBLSnap                          true;
-    postBLSnapTolerance                 1e-4;
-    postBLSnapAllowedPyramidIncrease    25;
-    postBLSnapAllowedPyramidIncreaseFraction 0.001;
+    gapSuppressPatches
+    (
+        shroud
+        hub
+    );
 
-    // Surface-constrained optimizer: re-project boundary pts during optimization
-    constrainOptimizerBoundaryMotion true;
 
-    // Limited-displacement incremental re-projection after optimizeMeshFV
-    postOptimizerReprojStepFraction     0.005;
-    postOptimizerReprojPasses           10;
+    // ========================================================================
+    // GAP CONFLICT ARBITRATION
+    // ========================================================================
 
-    gapConflictMode       autoThickness;
+    gapConflictMode autoThickness;
+
     gapLoserRing1Suppress false;
+
     gapLoserRing1MaxLayers 3;
     gapLoserRing2MaxLayers 3;
+
     blTerminationRing1MaxLayers 3;
     blTerminationRing2MaxLayers 3;
-    gapFaceRingExclusion  true;
-    postOptBLRetraction     false;
+
+
+    // ========================================================================
+    // GAP FACE-RING EXCLUSION / TAPER
+    // ========================================================================
+
+    gapFaceRingExclusion true;
+
+    gapFaceRing0Scale 0.02;
+    gapFaceRing1Scale 0.05;
+    gapFaceRing2Scale 0.20;
+    gapFaceRing3Scale 0.50;
+
+
+    // ========================================================================
+    // POST-OPTIMIZER BL RETRACTION
+    // ========================================================================
+
+    postOptBLRetraction false;
+
     postOptBLRetractionRings 1;
 
-    // ---------------------------------------------------------------
+
+    // ========================================================================
     // PRE-refBL SNAPSHOT
-    // Takes a copy of the mesh state before refineLayers() runs.
-    // Required by the two-pass repair loop below.
-    // Safe to leave true -- no cost unless preRefBLAutoRepair fires.
-    // ---------------------------------------------------------------
-    preRefBLSnapshot        true;
+    // ========================================================================
 
-    // ---------------------------------------------------------------
-    // POST-refBL REPAIR -- TWO MECHANISMS, USE ONE OR THE OTHER.
+    // Save the valid mesh state before refineLayers().
     //
-    // MECHANISM 1 (NEW -- preferred): Two-pass in-scope repair loop.
-    //   Pass 1: run refineLayers(), detect bad pyramid faces, trace
-    //           them to provenance bfI seeds (computed fresh, in-scope).
-    //   Pass 2: restore pre-refBL snapshot, apply BLRepairPlan
-    //           (tapered caps + thickness scales per junction type),
-    //           re-run refineLayers(), accept only if negVol no worse
-    //           AND badPyramids lower. Restore pass-1 if rejected.
-    //   Enable:  preRefBLAutoRepair true
-    //   Requires: preRefBLSnapshot true
-    //
-    // MECHANISM 2 (OLD -- manual debug/replay only): File-based
-    //   provenance retraction. Reads bfI seeds written by a previous
-    //   run and retracts those faces before refineLayers(). Seeds are
-    //   stale the moment any code, refinement, or optimizer change
-    //   occurs. Never combine with preRefBLAutoRepair true.
-    //   To use: set postRefBLProvenanceRetraction true AND ensure
-    //   postRefBLProvenanceSeedFile is current for this mesh state.
-    //
-    // CURRENT STATE: Mechanism 1 active, Mechanism 2 disabled.
-    // ---------------------------------------------------------------
+    // Required for the current transactional two-pass repair mechanism.
 
-    // Mechanism 1 -- two-pass in-scope repair (NEW)
-    preRefBLAutoRepair      true;
+    preRefBLSnapshot true;
 
-    // Mechanism 2 -- file-based replay (OLD, manual debug only)
+
+    // ========================================================================
+    // TRANSACTIONAL POST-refBL REPAIR
+    // ========================================================================
+
+    // Preferred mechanism:
+    //
+    // Pass 1:
+    //   refine BL
+    //   detect hard failures
+    //   trace failure provenance
+    //
+    // Pass 2:
+    //   restore snapshot
+    //   apply locally modified BL constraints
+    //   regenerate BL
+    //
+    // Commit only if the candidate is safer.
+
+    preRefBLAutoRepair true;
+
+
+    // ========================================================================
+    // LEGACY FILE-BASED PROVENANCE REPLAY
+    // ========================================================================
+
+    // Debug/replay mechanism only.
+    //
+    // Do not normally combine this with preRefBLAutoRepair.
+
     postRefBLProvenanceRetraction false;
-    postRefBLProvenanceSeedFile postRefBL_provenanceSeedBfI.labels;
 
-    // Ring caps and thickness scales used by Mechanism 1 repair plans.
-    // wall-wall junctions (blade/hub, blade/shroud): conservative.
-    // wall-periodic junctions: moderate.
+    postRefBLProvenanceSeedFile
+        postRefBL_provenanceSeedBfI.labels;
+
+
+    // ========================================================================
+    // PROVENANCE REPAIR RINGS
+    // ========================================================================
+
     postRefBLRing0MaxLayers 3;
     postRefBLRing1MaxLayers 4;
     postRefBLRing2MaxLayers 0;
+
     postRefBLRing0ThicknessScale 0.60;
     postRefBLRing1ThicknessScale 0.80;
     postRefBLRing2ThicknessScale 1.00;
-    gapFaceRing0Scale     0.02;
-    gapFaceRing1Scale     0.05;
-    gapFaceRing2Scale     0.20;
-    gapFaceRing3Scale     0.50;
 
-    // Snap settings
-    cornerSnapRelaxation 0.25;
-    cornerSnapIterations 1;
-    edgeSnapRelaxation   1.0;
-    edgeSnapIterations   1;
-    snapMinPyramidHeight 1e-10;
-    postBLSnap           true;
+
+    // ========================================================================
+    // PROSPECTIVE FRONT CAPS
+    // ========================================================================
+
+    // Current prospective safe-depth reconstruction / cap mechanism.
+    cfmitchV52bApplyFrontCaps true;
+
+
+    // ========================================================================
+    // QUAD-FAN ESCAPE
+    // ========================================================================
+
+    // Converts selected problematic internal quads into a face-centre fan.
+    //
+    // Development implementation is intended for deterministic serial/OMP1
+    // operation.
+    cfmitchV57QuadFanEscape true;
+
+
+    // ========================================================================
+    // LAYER OPTIMISATION
+    // ========================================================================
+
+    optimiseLayer       false;
+    optimiseLayerBuffer false;
+
     postRefineBLOptimisation true;
 
-    // BL transition ramp — smooth 6-ring taper
+
+    // ========================================================================
+    // SURFACE-CONSTRAINED OPTIMIZER
+    // ========================================================================
+
+    constrainOptimizerBoundaryMotion true;
+
+
+    // ========================================================================
+    // LIMITED POST-OPTIMIZER REPROJECTION
+    // ========================================================================
+
+    postOptimizerReprojStepFraction 0.005;
+
+    postOptimizerReprojPasses 10;
+
+
+    // ========================================================================
+    // POST-BL SNAP
+    // ========================================================================
+
+    postBLSnap true;
+
+    postBLSnapTolerance 1e-4;
+
+    postBLSnapAllowedPyramidIncrease 25;
+
+    postBLSnapAllowedPyramidIncreaseFraction 0.001;
+
+
+    // ========================================================================
+    // SNAP CONTROLS
+    // ========================================================================
+
+    cornerSnapRelaxation 0.25;
+    cornerSnapIterations 1;
+
+    edgeSnapRelaxation   1.0;
+    edgeSnapIterations   1;
+
+    snapMinPyramidHeight 1e-10;
+
+
+    // ========================================================================
+    // BL TRANSITION TAPER
+    // ========================================================================
+
     layerScaleRing1 0.25;
-    flowTerminationTaperFloor 0.25;
-    periodicNeutralTaperFloor 0.20;
     layerScaleRing2 0.50;
     layerScaleRing3 0.45;
     layerScaleRing4 0.65;
     layerScaleRing5 0.80;
     layerScaleRing6 1.00;
 
-    thicknessRatio          1.3;
-    maxFirstLayerThickness  1e-4;
+    flowTerminationTaperFloor   0.25;
+    periodicNeutralTaperFloor   0.20;
+
+
+    // ========================================================================
+    // OPTIONAL BL/BL JUNCTION LAYER-COUNT RAMP
+    // ========================================================================
+
+    enableBlblJunctionLayerCountRamp false;
+
+
+    // ========================================================================
+    // GLOBAL DEFAULT BL PARAMETERS
+    // ========================================================================
+
+    // Global default. Setting nLayers=0 allows patchBoundaryLayers to define
+    // the active BL surfaces individually.
+
+    nLayers 0;
+
+    thicknessRatio 1.30;
+
+    maxFirstLayerThickness 1e-4;
+
+
+    // ========================================================================
+    // PATCH-SPECIFIC BL PARAMETERS
+    // ========================================================================
 
     patchBoundaryLayers
     {
-        blade_1 { nLayers 3; thicknessRatio 1.2; maxFirstLayerThickness 5e-5; }
-        blade_2 { nLayers 3; thicknessRatio 1.2; maxFirstLayerThickness 5e-5; }
-        blade_3 { nLayers 3; thicknessRatio 1.2; maxFirstLayerThickness 5e-5; }
-        blade_4 { nLayers 3; thicknessRatio 1.2; maxFirstLayerThickness 5e-5; }
-        hub     { nLayers 3; thicknessRatio 1.3; maxFirstLayerThickness 1e-4; }
-        shroud  { nLayers 3; thicknessRatio 1.3; maxFirstLayerThickness 1e-4; }
-        inlet   { nLayers 0; }
-        outlet  { nLayers 0; }
-        periodic_1 { nLayers 0; }
-        periodic_2 { nLayers 0; }
+        blade_1
+        {
+            nLayers                15;
+            thicknessRatio         1.30;
+            maxFirstLayerThickness 5e-5;
+        }
+
+        blade_2
+        {
+            nLayers                15;
+            thicknessRatio         1.30;
+            maxFirstLayerThickness 5e-5;
+        }
+
+        blade_3
+        {
+            nLayers                15;
+            thicknessRatio         1.30;
+            maxFirstLayerThickness 5e-5;
+        }
+
+        blade_4
+        {
+            nLayers                15;
+            thicknessRatio         1.30;
+            maxFirstLayerThickness 5e-5;
+        }
+
+        hub
+        {
+            nLayers                15;
+            thicknessRatio         1.30;
+            maxFirstLayerThickness 1e-4;
+        }
+
+        shroud
+        {
+            nLayers                15;
+            thicknessRatio         1.30;
+            maxFirstLayerThickness 1e-4;
+        }
+
+        inlet
+        {
+            nLayers 0;
+        }
+
+        outlet
+        {
+            nLayers 0;
+        }
+
+        periodic_1
+        {
+            nLayers 0;
+        }
+
+        periodic_2
+        {
+            nLayers 0;
+        }
     }
 }
 
+
+// ============================================================================
+// BOUNDARY RENAMING
+// ============================================================================
+
 renameBoundary
 {
-    defaultName     walls;
-    defaultType     wall;
+    defaultName walls;
+    defaultType wall;
+
     newPatchNames
     {
-        inlet      { newName inlet;      type patch; }
-        outlet     { newName outlet;     type patch; }
-        hub        { newName hub;        type wall;  }
-        shroud     { newName shroud;     type wall;  }
-        periodic_1 { newName periodic_1; type patch; }
-        periodic_2 { newName periodic_2; type patch; }
-        blade_1    { newName blade_1;    type wall;  }
-        blade_2    { newName blade_2;    type wall;  }
-        blade_3    { newName blade_3;    type wall;  }
-        blade_4    { newName blade_4;    type wall;  }
+        inlet
+        {
+            newName inlet;
+            type    patch;
+        }
+
+        outlet
+        {
+            newName outlet;
+            type    patch;
+        }
+
+        hub
+        {
+            newName hub;
+            type    wall;
+        }
+
+        shroud
+        {
+            newName shroud;
+            type    wall;
+        }
+
+        periodic_1
+        {
+            newName periodic_1;
+            type    patch;
+        }
+
+        periodic_2
+        {
+            newName periodic_2;
+            type    patch;
+        }
+
+        blade_1
+        {
+            newName blade_1;
+            type    wall;
+        }
+
+        blade_2
+        {
+            newName blade_2;
+            type    wall;
+        }
+
+        blade_3
+        {
+            newName blade_3;
+            type    wall;
+        }
+
+        blade_4
+        {
+            newName blade_4;
+            type    wall;
+        }
     }
 }
+```
+
+### Important notes
+
+Several controls above should **not simply be enabled together because they exist**.
+
+In particular:
+
+- `preRefBLAutoRepair` is the preferred transactional repair mechanism.
+- `postRefBLProvenanceRetraction` is an older manual/replay mechanism and should normally remain disabled.
+- `cfmitchV10GCrossPatchSkewRetreat` is an older experimental approach; `cfmitchV10KCrossPatchLayerSync` is the preferred seam-layer reconciliation mechanism.
+- `cfmitchV11BProbeNormalRejected` is diagnostic/proof infrastructure; `cfmitchV11CCommitProvenNormalRejected` performs the corresponding proof-gated commit.
+- `gapPatchPairs` are still manually specified. Automatic topological junction discovery does not yet automatically solve non-touching blade-tip/shroud clearances.
+- `cfmitchV57QuadFanEscape` is a specialized repair mechanism and should not be treated as a universally required option.
+- `OMP_NUM_THREADS=1` remains the recommended deterministic development/regression mode.
+
+This sample should therefore be treated as a **control reference**, not a recommendation to turn every switch on.
