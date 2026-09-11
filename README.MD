@@ -59,7 +59,6 @@ Rotor37 exercises blade/hub/shroud junctions, periodic boundaries, sharp trailin
 
 ---
 
-## Propeller regression
 <p align="center">
   <img src="NASA_Rotor_37_1.png" alt="NASA Rotor37 mesh overview" width="48%">
   <img src="NASA_Rotor_37_2.png" alt="NASA Rotor37 blade and endwall mesh" width="48%">
@@ -73,6 +72,7 @@ Rotor37 exercises blade/hub/shroud junctions, periodic boundaries, sharp trailin
 <p align="center">
   <em>NASA Rotor37 regression mesh showing the blade passages, endwalls, periodic-sector boundaries, and near-wall boundary-layer structure.</em>
 </p>
+## Propeller regression
 The second major regression is a complex marine-propeller geometry with a very thin wall-normal boundary layer.
 
 | Metric | Result |
