@@ -3217,7 +3217,7 @@ void cartesianMeshGenerator::detectTripleJunctions
             {
                 classification = "BL_BL_NEUTRAL";
                 ++nBLBLNeutral;
-    
+
                 // Existing triple-junction machinery is specifically
                 // the BL+BL+neutral protection mechanism.
                 autoTriplePoints.insert(bPoints[bpI]);
@@ -3326,11 +3326,11 @@ void cartesianMeshGenerator::detectTripleJunctions
                 )
                 << endl;
         }
-    
+
         // Feed only the semantically equivalent BL+BL+neutral class
         // into the established triple-junction planner machinery.
         bl.addTripleJunctionPoints(autoTriplePoints);
-    
+
         Info
             << "CFMITCH AUTO_BOUNDARY_JUNCTION_APPLIED:"
             << " points=" << autoTriplePoints.size()
@@ -3338,7 +3338,7 @@ void cartesianMeshGenerator::detectTripleJunctions
             << " patchNamesRequired=no"
             << " patchTypesRestricted=no"
             << endl;
-    
+
         return;
     }
     if( !bndL.found("tripleJunctionSuppressPatches") )
@@ -8054,7 +8054,7 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                     // Preserve the already accepted Q2 state
                                     // before returning to Q0 for the cumulative
                                     // candidate.
-                                    
+
                                     // V10E V3: newly retained BL topology.
                                     v51mActiveBLProvenance =
                                         refLayers2.cellToBaseBndFace();
