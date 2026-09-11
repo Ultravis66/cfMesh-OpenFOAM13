@@ -6,3 +6,15 @@ cfMesh.*
 **/Make/**/*
 _archive/
 *.bak_*
+
+# CFMitch local development artifacts
+README.MD.pre_*
+*.pre_*
+*.orig_*
+*.failed_*
+*.bak
+*.log
+log.*
+build_*.log
+run_*.log
+*:Zone.Identifier
