@@ -4,6 +4,19 @@ A heavily modified and actively developed fork of **cfMesh** for **OpenFOAM Foun
 
 This fork is aimed particularly at geometries where conventional boundary-layer extrusion becomes fragile: turbomachinery, propellers, very thin near-wall layers, periodic-sector boundaries, sharp features, multi-patch junctions, and strong refinement transitions.
 
+Upcoming work (to do list): 
+- Improve deterministic behavior during parallel meshing.
+- Port to OpenFOAM Foundation 14.
+- Eliminate remaining advanced checkMesh geometry failures.
+- Continue improving high-aspect-ratio boundary-layer and multi-patch junction quality.
+- Generalize automatic gap and tip-clearance detection.
+- Further improve periodic-interface and cross-patch boundary-layer handling.
+- Consolidate experimental repair logic into a cleaner production architecture.
+- Build automated regression and mesh-quality acceptance testing.
+- Improve performance and scalability on large meshes.
+- Expand documentation, example cases, and CFD validation.
+
+
 > **Current release: v1.0.0**
 >
 > **Target platform: OpenFOAM Foundation 13**
