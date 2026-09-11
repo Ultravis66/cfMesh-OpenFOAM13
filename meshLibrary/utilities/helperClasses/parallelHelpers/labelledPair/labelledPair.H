@@ -77,6 +77,9 @@ class labelledPair
             pair_(lp)
         {}
 
+    //- Copy construct
+    labelledPair(const labelledPair&) = default;
+
     // Destructor
         ~labelledPair()
         {}

@@ -327,6 +327,13 @@ class boundaryLayers
             const boolList& treatPatches
         );
 
+        //- CFMitch connected BL/neutral seam constraint.
+        //
+        // Runs after local candidate macro vertices exist but before
+        // old/new coordinate swap, while original boundary geometry
+        // remains authoritative.
+        void constrainNeutralSeamCandidatesBeforeSwap();
+
         //- create new vertices such that layers for selected patches
         //- are generated in a single run
         void createNewVertices
@@ -575,6 +582,19 @@ public:
             return blNeutralEdgePoints_;
         }
 
+        //- Exact old-mesh-point -> newly-created base-point lineage
+        //  for the initial macro BL extrusion.
+        //
+        //  After coordinate swapping:
+        //
+        //      old mesh-point label = macro-layer/top point
+        //      mapped new label     = physical wall/base point
+        //
+        const labelLongList& newLabelForVertexMap() const
+        {
+            return newLabelForVertex_;
+        }
+
         //- return BL-side patch per neutral edge point
         const Map<label>& blNeutralPointPatch() const
         {
@@ -603,6 +623,26 @@ public:
         {
             gapZonePoints_ = gpts;
         }
+        // CFMITCH AUTO_BOUNDARY_JUNCTIONS API
+        // Read-only access to the already-resolved per-patch BL intent.
+        // This is deliberately independent of patch name/type semantics.
+        inline label numberOfLayersForPatch(const label patchI) const
+        {
+            if
+            (
+                patchI < 0
+             || patchI >= label(nLayersForPatch_.size())
+            )
+                return 0;
+
+            return nLayersForPatch_[patchI];
+        }
+
+        inline bool patchHasBoundaryLayers(const label patchI) const
+        {
+            return numberOfLayersForPatch(patchI) > 0;
+        }
+
         void setTripleJunctionPoints(const labelHashSet& pts)
         {
             tripleJunctionPoints_ = pts;

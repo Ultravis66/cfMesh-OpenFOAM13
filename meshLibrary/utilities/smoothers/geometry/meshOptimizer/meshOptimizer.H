@@ -302,6 +302,20 @@ public:
         //- and skewness
         void optimizeLowQualityFaces(const label maxNumIterations = 10);
 
+        //- CFMitch V6.1:
+        //- optimise only an explicitly supplied face population.
+        //-
+        //- Unlike optimizeLowQualityFaces(), this does not call the generic
+        //- cfMesh low-quality selector.  It is intended for bounded,
+        //- transactionally validated repair populations selected by an
+        //- external quality metric (for example exact OpenFOAM skewness).
+        void optimizeSelectedFaces
+        (
+            const labelHashSet& selectedFaces,
+            const label maxNumIterations = 1,
+            const direction additionalLayers = 0
+        );
+
         //- perform optimization of cells near the boundary
         //- the use shall specify the number of iterations and the number
         //- of cell layers which shall be taken into account

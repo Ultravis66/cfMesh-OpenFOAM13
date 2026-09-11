@@ -139,7 +139,7 @@ bool processorBoundaryPatch::operator!=(const processorBoundaryPatch& wp) const
     {
         return true;
     }
-    else if( type_ != wp.name_ )
+    else if( type_ != wp.type_ )
     {
         return true;
     }

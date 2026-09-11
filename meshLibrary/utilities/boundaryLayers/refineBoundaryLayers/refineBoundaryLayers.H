@@ -125,6 +125,15 @@ class refineBoundaryLayers
         //- the next fresh boundary-layer construction.
         bool cfmitchV52bApplyFrontCaps_;
 
+    //- CFMitch V5.7a experimental internal quad-fan escape.
+    //
+    //  Replaces a physically shared-base-invalid regular BL quad
+    //  with four triangular sibling faces around the existing
+    //  OpenFOAM face centre.  Disabled by default.
+    bool cfmitchV57QuadFanEscape_;
+    //- V10K: synchronize final layer counts across actual type1/type1 cross-patch seams.
+    bool cfmitchV10KCrossPatchLayerSync_;
+
         //- information about existing boundary layers at patches
         //- only available layers
         List<DynList<label> > layerAtPatch_;
@@ -175,6 +184,20 @@ class refineBoundaryLayers
         //- Final upstream BL-height scale at simple BL/neutral contacts.
         //- Key is a stable mesh-point label.
         Map<scalar> neutralLayerScaleAtMeshPoint_;
+
+        // ============================================================
+        // CFMITCH V8A NEUTRAL SEAM LAYER BACKOFF
+        //
+        // Stable GLOBAL mesh-point labels of physical wall/base
+        // points at BL/neutral contacts.
+        //
+        // These are intentionally NOT boundary-point indices because
+        // bpI addressing changes after macro BL topology creation.
+        // ============================================================
+
+        labelHashSet neutralSeamBackoffMeshPoints_;
+        label neutralSeamBackoffMaxLayers_;
+
 
         //- gap conflict arbitration data for local split-edge layer capping.
         //- gapActionPoints_: mesh point labels of loser-side gap zone points.
@@ -588,6 +611,21 @@ public:
         {
             neutralLayerScaleAtMeshPoint_ = scale;
         }
+
+        // ============================================================
+        // CFMITCH V8A NEUTRAL SEAM LAYER BACKOFF
+        // ============================================================
+
+        void setNeutralSeamBackoff
+        (
+            const labelHashSet& pts,
+            const label maxLayers
+        )
+        {
+            neutralSeamBackoffMeshPoints_ = pts;
+            neutralSeamBackoffMaxLayers_ = maxLayers;
+        }
+
 
         //- set gap conflict arbitration data for local split-edge layer capping
         void setGapActionPoints(const labelHashSet& pts)

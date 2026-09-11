@@ -4623,6 +4623,1089 @@ void refineBoundaryLayers::generateNewCells()
                 sizeof(v52aBacktrackFactors)
                /sizeof(v52aBacktrackFactors[0]);
 
+            // ==========================================================
+            // CFMitch V5.9a -- ITERATIVE TRANSACTIONAL ROW REPAIR
+            //
+            // This is the first COMMITTED upstream face-tet geometry
+            // repair.
+            //
+            // Evidence leading here:
+            //
+            //   V5.8a next-core-row motion:
+            //       zero shared-base recovery.
+            //
+            //   V5.8b failed-row coherent motion:
+            //       material recovery (~12.5% in the final invocation).
+            //
+            //   V5.8c one-hair axial motion:
+            //       weak recovery.
+            //
+            //   V5.8d one-vertex planarization:
+            //       weak recovery and frequent hard/soft regressions.
+            //
+            // Therefore:
+            //
+            //   * preserve row 0 and row 1/h1;
+            //   * move an entire failed layer row coherently;
+            //   * require the target interface to become shared-base clean;
+            //   * require the SEED column shared-failure population to fall;
+            //   * require the complete affected-parent shared-failure
+            //     population to fall;
+            //   * permit no increase in concavity, one-sided face-tet
+            //     failures or >70-degree BL interfaces;
+            //   * preserve positive child volume;
+            //   * pass the existing V2.9 full affected-parent
+            //     volume/pyramid hard gate;
+            //   * commit only after every gate passes;
+            //   * rescan and repeat, making shared-failure count monotonic.
+            //
+            // Topology is unchanged here. V5.7 remains downstream as the
+            // topology escape for survivors.
+            // ==========================================================
+
+            const scalar v59aFractions[] =
+            {
+                scalar(0.02),
+                scalar(0.05),
+                scalar(0.10),
+                scalar(0.20),
+                scalar(0.35),
+                scalar(0.50)
+            };
+
+            const label nV59aFractions =
+                sizeof(v59aFractions)
+               /sizeof(v59aFractions[0]);
+
+            labelList v59aFractionHits
+            (
+                nV59aFractions,
+                label(0)
+            );
+
+            label v59aColumnsSeen = 0;
+            label v59aColumnsEligible = 0;
+            label v59aColumnsChanged = 0;
+            label v59aColumnsFullyCleaned = 0;
+
+            label v59aH1Protected = 0;
+            label v59aAffectedUnsupported = 0;
+            label v59aBaselineHardReject = 0;
+
+            label v59aPasses = 0;
+            label v59aAttempts = 0;
+            label v59aLocalPromising = 0;
+            label v59aAccepted = 0;
+
+            label v59aWallwardAccepted = 0;
+            label v59aCorewardAccepted = 0;
+
+            label v59aRejectRowInvalid = 0;
+            label v59aRejectLocalHard = 0;
+            label v59aRejectLocalSoft = 0;
+            label v59aRejectLocalNoGain = 0;
+            label v59aRejectAffectedHard = 0;
+            label v59aRejectAffectedSoft = 0;
+            label v59aRejectVolumeFloor = 0;
+
+            label v59aNoProgress = 0;
+            label v59aAcceptedMaxColumn = 0;
+
+            label v59aSeedSharedBefore = 0;
+            label v59aSeedSharedAfter = 0;
+
+            label v59aAffectedSharedBefore = 0;
+            label v59aAffectedSharedAfter = 0;
+
+
+            struct V59aSoftScore
+            {
+                label invalid;
+                label concave;
+                label faceTet;
+                label sharedTet;
+                label severe;
+                label nonOrthError;
+
+                V59aSoftScore()
+                :
+                    invalid(0),
+                    concave(0),
+                    faceTet(0),
+                    sharedTet(0),
+                    severe(0),
+                    nonOrthError(0)
+                {}
+            };
+
+
+            // ----------------------------------------------------------
+            // Complete BL-soft quality of every coarse parent touched by
+            // the candidate seed edges.
+            //
+            // Type-0:
+            //   one exact replacement cell.
+            //
+            // Type-1:
+            //   all exact prospective BL children plus every completed
+            //   cross-layer shared interface.
+            //
+            // Type-2/3:
+            //   fail closed.
+            // ----------------------------------------------------------
+            auto v59aEvaluateAffectedSoft =
+            [&]
+            (
+                const std::set<label>& affected,
+                V59aSoftScore& score
+            ) -> bool
+            {
+                score = V59aSoftScore();
+
+                for
+                (
+                    std::set<label>::const_iterator
+                        cIt=affected.begin();
+                    cIt!=affected.end();
+                    ++cIt
+                )
+                {
+                    const label cellI = *cIt;
+
+                    if
+                    (
+                        cellI < 0
+                     || cellI >= nCells
+                    )
+                    {
+                        ++score.invalid;
+                        return false;
+                    }
+
+                    if( refType[cellI] == 0 )
+                    {
+                        DynList
+                        <
+                            DynList<label,8>,
+                            10
+                        > childFaces;
+
+                        if
+                        (
+                            !v29BuildType0Cell
+                            (
+                                cellI,
+                                childFaces
+                            )
+                        )
+                        {
+                            ++score.invalid;
+                            return false;
+                        }
+
+                        V52aChildMetrics metrics;
+
+                        if
+                        (
+                            !v52aMeasureChild
+                            (
+                                childFaces,
+                                metrics
+                            )
+                        )
+                        {
+                            ++score.invalid;
+                            return false;
+                        }
+
+                        score.concave += metrics.concave;
+                        score.faceTet += metrics.badFaceTet;
+
+                        continue;
+                    }
+
+                    if( refType[cellI] != 1 )
+                    {
+                        ++score.invalid;
+                        return false;
+                    }
+
+                    DynList
+                    <
+                        DynList
+                        <
+                            DynList<label,8>,
+                            10
+                        >,
+                        64
+                    > children;
+
+                    if
+                    (
+                        !v29BuildOrientedType1Children
+                        (
+                            cellI,
+                            children
+                        )
+                     || children.size() == 0
+                    )
+                    {
+                        ++score.invalid;
+                        return false;
+                    }
+
+                    List<V52aChildMetrics>
+                        metrics(children.size());
+
+                    forAll(children, childI)
+                    {
+                        if
+                        (
+                            !v52aMeasureChild
+                            (
+                                children[childI],
+                                metrics[childI]
+                            )
+                        )
+                        {
+                            ++score.invalid;
+                            return false;
+                        }
+
+                        score.concave +=
+                            metrics[childI].concave;
+
+                        score.faceTet +=
+                            metrics[childI].badFaceTet;
+                    }
+
+                    for
+                    (
+                        label childI=0;
+                        childI<label(children.size())-1;
+                        ++childI
+                    )
+                    {
+                        label invalid = 0;
+                        label badShared = 0;
+                        label severe = 0;
+                        label nonOrthError = 0;
+                        scalar angle = scalar(0);
+                        scalar bestShared = -GREAT;
+
+                        v52aInterfaceMetrics
+                        (
+                            children[childI],
+                            metrics[childI].centre,
+                            children[childI+1],
+                            metrics[childI+1].centre,
+                            invalid,
+                            badShared,
+                            severe,
+                            nonOrthError,
+                            angle,
+                            bestShared
+                        );
+
+                        score.invalid += invalid;
+                        score.sharedTet += badShared;
+                        score.severe += severe;
+                        score.nonOrthError += nonOrthError;
+
+                        if
+                        (
+                            invalid
+                         || nonOrthError
+                        )
+                            return false;
+                    }
+                }
+
+                return score.invalid == 0;
+            };
+
+
+            // ==========================================================
+            // COMMITTED REPAIR PASS
+            // ==========================================================
+
+            for
+            (
+                label parentCellI=0;
+                parentCellI<nCells;
+                ++parentCellI
+            )
+            {
+                if( refType[parentCellI] != 1 )
+                    continue;
+
+                ++v59aColumnsSeen;
+
+                DynList
+                <
+                    DynList<DynList<label,8>,10>,
+                    64
+                > children;
+
+                DynList<label,16> parentEdges;
+
+                if
+                (
+                    !v29Type1Edges
+                    (
+                        parentCellI,
+                        parentEdges
+                    )
+                 || !v29BuildOrientedType1Children
+                    (
+                        parentCellI,
+                        children
+                    )
+                 || children.size() < 2
+                )
+                    continue;
+
+                const label requestedLayers =
+                    children.size();
+
+                std::set<label> affected;
+
+                if
+                (
+                    !v29AffectedParents
+                    (
+                        parentEdges,
+                        affected
+                    )
+                )
+                {
+                    ++v59aAffectedUnsupported;
+                    continue;
+                }
+
+                V29Score initialHard;
+
+                if
+                (
+                    !v29EvaluateSet
+                    (
+                        affected,
+                        initialHard
+                    )
+                 || initialHard.invalid != 0
+                 || initialHard.negative != 0
+                 || initialHard.badPyr != 0
+                )
+                {
+                    ++v59aBaselineHardReject;
+                    continue;
+                }
+
+                ++v59aColumnsEligible;
+
+                label acceptedThisColumn = 0;
+
+                // Shared-tet count is strictly monotonic downward for every
+                // accepted transaction, therefore more passes than twice the
+                // number of layer interfaces should never be necessary.
+                const label maxPasses =
+                    2*requestedLayers + 2;
+
+                for
+                (
+                    label repairPass=0;
+                    repairPass<maxPasses;
+                    ++repairPass
+                )
+                {
+                    ++v59aPasses;
+
+                    List<V52aChildMetrics>
+                        baseMetrics(requestedLayers);
+
+                    bool seedHardClean = true;
+
+                    label baseConcave = 0;
+                    label baseFaceTet = 0;
+                    label baseShared = 0;
+                    label baseSevere = 0;
+
+                    DynList<label,32> badRows;
+
+                    forAll(children, childI)
+                    {
+                        if
+                        (
+                            !v52aMeasureChild
+                            (
+                                children[childI],
+                                baseMetrics[childI]
+                            )
+                        )
+                        {
+                            seedHardClean = false;
+                            break;
+                        }
+
+                        if
+                        (
+                            v52aChildFailureMask
+                            (
+                                baseMetrics[childI]
+                            )
+                          & v52aHardFailureBits
+                        )
+                        {
+                            seedHardClean = false;
+                            break;
+                        }
+
+                        baseConcave +=
+                            baseMetrics[childI].concave;
+
+                        baseFaceTet +=
+                            baseMetrics[childI].badFaceTet;
+                    }
+
+                    bool h1Bad = false;
+
+                    if( seedHardClean )
+                    {
+                        for
+                        (
+                            label wallStep=1;
+                            wallStep<requestedLayers;
+                            ++wallStep
+                        )
+                        {
+                            const label coreChildI =
+                                requestedLayers
+                              - 1
+                              - wallStep;
+
+                            const label wallChildI =
+                                coreChildI + 1;
+
+                            label invalid = 0;
+                            label badShared = 0;
+                            label severe = 0;
+                            label nonOrthError = 0;
+                            scalar angle = scalar(0);
+                            scalar bestShared = -GREAT;
+
+                            v52aInterfaceMetrics
+                            (
+                                children[coreChildI],
+                                baseMetrics[coreChildI].centre,
+                                children[wallChildI],
+                                baseMetrics[wallChildI].centre,
+                                invalid,
+                                badShared,
+                                severe,
+                                nonOrthError,
+                                angle,
+                                bestShared
+                            );
+
+                            if
+                            (
+                                invalid
+                             || nonOrthError
+                            )
+                            {
+                                seedHardClean = false;
+                                break;
+                            }
+
+                            baseShared += badShared;
+                            baseSevere += severe;
+
+                            if( badShared )
+                            {
+                                if( wallStep == 1 )
+                                    h1Bad = true;
+                                else
+                                    badRows.append(wallStep);
+                            }
+                        }
+                    }
+
+                    if( h1Bad )
+                        ++v59aH1Protected;
+
+                    if( !seedHardClean )
+                    {
+                        ++v59aBaselineHardReject;
+                        break;
+                    }
+
+                    if( badRows.size() == 0 )
+                    {
+                        if( acceptedThisColumn > 0 )
+                            ++v59aColumnsFullyCleaned;
+
+                        break;
+                    }
+
+                    v59aSeedSharedBefore += baseShared;
+
+                    V29Score baseAffectedHard;
+
+                    if
+                    (
+                        !v29EvaluateSet
+                        (
+                            affected,
+                            baseAffectedHard
+                        )
+                     || baseAffectedHard.invalid != 0
+                     || baseAffectedHard.negative != 0
+                     || baseAffectedHard.badPyr != 0
+                    )
+                    {
+                        ++v59aBaselineHardReject;
+                        break;
+                    }
+
+                    V59aSoftScore baseAffectedSoft;
+
+                    if
+                    (
+                        !v59aEvaluateAffectedSoft
+                        (
+                            affected,
+                            baseAffectedSoft
+                        )
+                     || baseAffectedSoft.nonOrthError != 0
+                    )
+                    {
+                        ++v59aBaselineHardReject;
+                        break;
+                    }
+
+                    v59aAffectedSharedBefore +=
+                        baseAffectedSoft.sharedTet;
+
+                    bool acceptedPass = false;
+
+                    for
+                    (
+                        label badRowI=0;
+                        badRowI<label(badRows.size())
+                     && !acceptedPass;
+                        ++badRowI
+                    )
+                    {
+                        const label failedRow =
+                            badRows[badRowI];
+
+                        const label coreChildI =
+                            requestedLayers
+                          - 1
+                          - failedRow;
+
+                        const label wallChildI =
+                            coreChildI + 1;
+
+                        if
+                        (
+                            failedRow < 2
+                         || coreChildI < 0
+                         || wallChildI < 0
+                         || coreChildI >= requestedLayers
+                         || wallChildI >= requestedLayers
+                        )
+                        {
+                            ++v59aRejectRowInvalid;
+                            continue;
+                        }
+
+                        std::map<label,point>
+                            originalRow;
+
+                        bool rowValid = true;
+
+                        forAll(parentEdges, edgeI)
+                        {
+                            const label seI =
+                                parentEdges[edgeI];
+
+                            if
+                            (
+                                seI < 0
+                             || seI >= label(splitEdges_.size())
+                             || seI >=
+                                label
+                                (
+                                    newVerticesForSplitEdge_.
+                                        size()
+                                )
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            const label rowSize =
+                                newVerticesForSplitEdge_.
+                                    sizeOfRow(seI);
+
+                            if
+                            (
+                                failedRow <= 1
+                             || failedRow >= rowSize-1
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            const label movingPointI =
+                                newVerticesForSplitEdge_
+                                (
+                                    seI,
+                                    failedRow
+                                );
+
+                            if
+                            (
+                                movingPointI < 0
+                             || movingPointI >=
+                                label(v29Points.size())
+                             || movingPointI ==
+                                splitEdges_[seI].start()
+                             || movingPointI ==
+                                splitEdges_[seI].end()
+                            )
+                            {
+                                rowValid = false;
+                                break;
+                            }
+
+                            originalRow[movingPointI] =
+                                v29Points[movingPointI];
+                        }
+
+                        if
+                        (
+                            !rowValid
+                         || originalRow.empty()
+                        )
+                        {
+                            ++v59aRejectRowInvalid;
+                            continue;
+                        }
+
+                        for
+                        (
+                            label fractionI=0;
+                            fractionI<nV59aFractions
+                         && !acceptedPass;
+                            ++fractionI
+                        )
+                        {
+                            const scalar fraction =
+                                v59aFractions[fractionI];
+
+                            // 0 = wallward
+                            // 1 = coreward
+                            for
+                            (
+                                label direction=0;
+                                direction<2;
+                                ++direction
+                            )
+                            {
+                                ++v59aAttempts;
+
+                                forAll(parentEdges, edgeI)
+                                {
+                                    const label seI =
+                                        parentEdges[edgeI];
+
+                                    const label movingPointI =
+                                        newVerticesForSplitEdge_
+                                        (
+                                            seI,
+                                            failedRow
+                                        );
+
+                                    const label targetPointI =
+                                        newVerticesForSplitEdge_
+                                        (
+                                            seI,
+                                            direction == 0
+                                          ? failedRow-1
+                                          : failedRow+1
+                                        );
+
+                                    const point oldP =
+                                        originalRow.at
+                                        (
+                                            movingPointI
+                                        );
+
+                                    v29Points[movingPointI] =
+                                        oldP
+                                      + fraction
+                                       *(
+                                            v29Points[targetPointI]
+                                          - oldP
+                                        );
+                                }
+
+
+                                // --------------------------------------
+                                // Cheap/seed-local screening first.
+                                // --------------------------------------
+                                List<V52aChildMetrics>
+                                    trialMetrics(requestedLayers);
+
+                                bool localHardOK = true;
+
+                                label trialConcave = 0;
+                                label trialFaceTet = 0;
+                                label trialShared = 0;
+                                label trialSevere = 0;
+
+                                bool targetStillBad = false;
+                                bool volumeFloorOK = true;
+
+                                forAll(children, childI)
+                                {
+                                    if
+                                    (
+                                        !v52aMeasureChild
+                                        (
+                                            children[childI],
+                                            trialMetrics[childI]
+                                        )
+                                    )
+                                    {
+                                        localHardOK = false;
+                                        break;
+                                    }
+
+                                    if
+                                    (
+                                        v52aChildFailureMask
+                                        (
+                                            trialMetrics[childI]
+                                        )
+                                      & v52aHardFailureBits
+                                    )
+                                    {
+                                        localHardOK = false;
+                                        break;
+                                    }
+
+                                    if
+                                    (
+                                        trialMetrics[childI].volume
+                                          < scalar(0.50)
+                                           *baseMetrics[childI].volume
+                                    )
+                                        volumeFloorOK = false;
+
+                                    trialConcave +=
+                                        trialMetrics[childI].concave;
+
+                                    trialFaceTet +=
+                                        trialMetrics[childI].badFaceTet;
+                                }
+
+                                if( localHardOK )
+                                {
+                                    for
+                                    (
+                                        label wallStep=1;
+                                        wallStep<requestedLayers;
+                                        ++wallStep
+                                    )
+                                    {
+                                        const label trialCoreI =
+                                            requestedLayers
+                                          - 1
+                                          - wallStep;
+
+                                        const label trialWallI =
+                                            trialCoreI + 1;
+
+                                        label invalid = 0;
+                                        label badShared = 0;
+                                        label severe = 0;
+                                        label nonOrthError = 0;
+                                        scalar angle = scalar(0);
+                                        scalar bestShared = -GREAT;
+
+                                        v52aInterfaceMetrics
+                                        (
+                                            children[trialCoreI],
+                                            trialMetrics
+                                            [
+                                                trialCoreI
+                                            ].centre,
+                                            children[trialWallI],
+                                            trialMetrics
+                                            [
+                                                trialWallI
+                                            ].centre,
+                                            invalid,
+                                            badShared,
+                                            severe,
+                                            nonOrthError,
+                                            angle,
+                                            bestShared
+                                        );
+
+                                        if
+                                        (
+                                            invalid
+                                         || nonOrthError
+                                        )
+                                        {
+                                            localHardOK = false;
+                                            break;
+                                        }
+
+                                        trialShared += badShared;
+                                        trialSevere += severe;
+
+                                        if
+                                        (
+                                            wallStep == failedRow
+                                         && badShared
+                                        )
+                                            targetStillBad = true;
+                                    }
+                                }
+
+                                if( !localHardOK )
+                                {
+                                    ++v59aRejectLocalHard;
+                                }
+                                else if( !volumeFloorOK )
+                                {
+                                    ++v59aRejectVolumeFloor;
+                                }
+                                else if
+                                (
+                                    trialConcave > baseConcave
+                                 || trialFaceTet > baseFaceTet
+                                 || trialSevere > baseSevere
+                                )
+                                {
+                                    ++v59aRejectLocalSoft;
+                                }
+                                else if
+                                (
+                                    targetStillBad
+                                 || trialShared >= baseShared
+                                )
+                                {
+                                    ++v59aRejectLocalNoGain;
+                                }
+                                else
+                                {
+                                    ++v59aLocalPromising;
+
+                                    // ----------------------------------
+                                    // Full affected-parent HARD gate.
+                                    // ----------------------------------
+                                    V29Score trialAffectedHard;
+
+                                    bool affectedHardOK =
+                                    (
+                                        v29EvaluateSet
+                                        (
+                                            affected,
+                                            trialAffectedHard
+                                        )
+                                     && trialAffectedHard.invalid == 0
+                                     && trialAffectedHard.negative == 0
+                                     && trialAffectedHard.badPyr == 0
+                                    );
+
+                                    if
+                                    (
+                                        affectedHardOK
+                                     && baseAffectedHard.minPositiveVol
+                                        < GREAT/scalar(2)
+                                     && trialAffectedHard.minPositiveVol
+                                        < scalar(0.50)
+                                         *baseAffectedHard.minPositiveVol
+                                    )
+                                    {
+                                        affectedHardOK = false;
+                                    }
+
+                                    if( !affectedHardOK )
+                                    {
+                                        ++v59aRejectAffectedHard;
+                                    }
+                                    else
+                                    {
+                                        // ------------------------------
+                                        // Full affected-parent SOFT gate.
+                                        // ------------------------------
+                                        V59aSoftScore
+                                            trialAffectedSoft;
+
+                                        const bool affectedSoftEval =
+                                            v59aEvaluateAffectedSoft
+                                            (
+                                                affected,
+                                                trialAffectedSoft
+                                            );
+
+                                        const bool affectedSoftOK =
+                                        (
+                                            affectedSoftEval
+                                         && trialAffectedSoft.invalid == 0
+                                         && trialAffectedSoft.nonOrthError == 0
+                                         && trialAffectedSoft.sharedTet
+                                                < baseAffectedSoft.sharedTet
+                                         && trialAffectedSoft.concave
+                                                <= baseAffectedSoft.concave
+                                         && trialAffectedSoft.faceTet
+                                                <= baseAffectedSoft.faceTet
+                                         && trialAffectedSoft.severe
+                                                <= baseAffectedSoft.severe
+                                        );
+
+                                        if( !affectedSoftOK )
+                                        {
+                                            ++v59aRejectAffectedSoft;
+                                        }
+                                        else
+                                        {
+                                            // ==========================
+                                            // COMMIT.
+                                            //
+                                            // Do NOT restore originalRow.
+                                            // Next repair pass starts from
+                                            // this accepted geometry.
+                                            // ==========================
+                                            ++v59aAccepted;
+                                            ++acceptedThisColumn;
+
+                                            ++v59aFractionHits
+                                            [
+                                                fractionI
+                                            ];
+
+                                            if( direction == 0 )
+                                                ++v59aWallwardAccepted;
+                                            else
+                                                ++v59aCorewardAccepted;
+
+                                            v59aSeedSharedAfter +=
+                                                trialShared;
+
+                                            v59aAffectedSharedAfter +=
+                                                trialAffectedSoft.sharedTet;
+
+                                            acceptedPass = true;
+                                        }
+                                    }
+                                }
+
+
+                                if( acceptedPass )
+                                    break;
+
+
+                                // Exact prospective rollback.
+                                for
+                                (
+                                    std::map<label,point>::
+                                        const_iterator
+                                        pIt=originalRow.begin();
+                                    pIt!=originalRow.end();
+                                    ++pIt
+                                )
+                                {
+                                    v29Points[pIt->first] =
+                                        pIt->second;
+                                }
+                            }
+                        }
+                    }
+
+
+                    if( !acceptedPass )
+                    {
+                        ++v59aNoProgress;
+                        break;
+                    }
+                }
+
+
+                if( acceptedThisColumn > 0 )
+                {
+                    ++v59aColumnsChanged;
+
+                    v59aAcceptedMaxColumn =
+                        Foam::max
+                        (
+                            v59aAcceptedMaxColumn,
+                            acceptedThisColumn
+                        );
+                }
+            }
+
+
+            Info
+                << "CFMITCH V5.9a ITERATIVE ROW REPAIR:"
+                << " columnsSeen=" << v59aColumnsSeen
+                << " eligible=" << v59aColumnsEligible
+                << " columnsChanged=" << v59aColumnsChanged
+                << " columnsFullyCleaned=" << v59aColumnsFullyCleaned
+                << " h1Protected=" << v59aH1Protected
+                << " affectedUnsupported="
+                << v59aAffectedUnsupported
+                << " baselineHardReject="
+                << v59aBaselineHardReject
+                << " passes=" << v59aPasses
+                << " attempts=" << v59aAttempts
+                << " localPromising=" << v59aLocalPromising
+                << " accepted=" << v59aAccepted
+                << " maxAcceptedPerColumn="
+                << v59aAcceptedMaxColumn
+                << " wallwardAccepted="
+                << v59aWallwardAccepted
+                << " corewardAccepted="
+                << v59aCorewardAccepted
+                << " fractionHits=" << v59aFractionHits
+                << " rejectRowInvalid="
+                << v59aRejectRowInvalid
+                << " rejectLocalHard="
+                << v59aRejectLocalHard
+                << " rejectLocalSoft="
+                << v59aRejectLocalSoft
+                << " rejectLocalNoGain="
+                << v59aRejectLocalNoGain
+                << " rejectVolumeFloor="
+                << v59aRejectVolumeFloor
+                << " rejectAffectedHard="
+                << v59aRejectAffectedHard
+                << " rejectAffectedSoft="
+                << v59aRejectAffectedSoft
+                << " noProgress=" << v59aNoProgress
+                << " seedSharedBefore="
+                << v59aSeedSharedBefore
+                << " seedSharedAfter="
+                << v59aSeedSharedAfter
+                << " affectedSharedBefore="
+                << v59aAffectedSharedBefore
+                << " affectedSharedAfter="
+                << v59aAffectedSharedAfter
+                << " h1Moved=false"
+                << " topologyChanged=false"
+                << " committed=true"
+                << endl;
+
+
             for(label parentCellI=0; parentCellI<nCells; ++parentCellI)
             {
                 if( refType[parentCellI] != 1 )
@@ -5776,6 +6859,165 @@ void refineBoundaryLayers::generateNewCells()
         return newCellI;
     };
 
+    // ============================================================
+    // CFMITCH V10I TYPE2 BIRTH LINEAGE
+    //
+    // Diagnostic only.
+    //
+    // Record final child-cell labels at the exact moment they are
+    // allocated by generateNewCells().  Cell labels remain stable
+    // through the later face reconstruction, so this can be joined
+    // directly against V10F owner/neighbour cell labels.
+    //
+    // One CSV is written per generateNewCells() invocation so a
+    // rejected construction attempt can never overwrite provenance
+    // belonging to another candidate.
+    //
+    // No points, faces, topology, layer counts, or acceptance
+    // decisions are changed.
+    // ============================================================
+    static label v10iInvocationCounter = 0;
+
+    const label v10iInvocation =
+        ++v10iInvocationCounter;
+
+    const fileName v10iCsvName
+    (
+        "CFMITCH_V10I_type2Birth_"
+      + Foam::name(v10iInvocation)
+      + ".csv"
+    );
+
+    OFstream v10iType2BirthCsv(v10iCsvName);
+
+    v10iType2BirthCsv
+        << "invocation,cell,parent,refType,localChild,"
+        << "bfI0,bfI1,patch0,patch1,layers0,layers1,"
+        << "generatedChildren,nFaces"
+        << nl;
+
+    label v10iType2Parents = 0;
+    label v10iType2Children = 0;
+
+    // ============================================================
+    // CFMITCH V10J TYPE1 CROSS-PATCH LINEAGE
+    //
+    // Diagnostic only.
+    //
+    // The V10I Rotor37 audit proved that the accepted BL contains
+    // zero refType-2 parents even though all 49 internal skew>4
+    // faces are BL_BL_CROSS_PATCH.
+    //
+    // Therefore identify neighbouring ORIGINAL refType-1 parents
+    // whose active BL boundary faces belong to different patches.
+    // Their children are the independent BL columns meeting at
+    // the suspected lateral seam.
+    //
+    // No geometry, topology, points, layer counts, or acceptance
+    // decisions are changed.
+    // ============================================================
+
+    labelList v10jParentPatch(refType.size(), -1);
+    boolList v10jCrossPatchParent(refType.size(), false);
+    labelList v10jCrossPatchDegree(refType.size(), 0);
+
+    forAll(refType, parentCellI)
+    {
+        if
+        (
+            refType[parentCellI] == 1
+         && cellToBfI[parentCellI] >= 0
+         && cellToBfI[parentCellI] <
+            label(exactVolumeFacePatch.size())
+        )
+        {
+            v10jParentPatch[parentCellI] =
+                exactVolumeFacePatch[cellToBfI[parentCellI]];
+        }
+    }
+
+    const labelList& v10jOwner =
+        mesh_.owner();
+
+    const labelList& v10jNeighbour =
+        mesh_.neighbour();
+
+    label v10jCrossPatchOriginalFaces = 0;
+    labelHashSet v10jCrossPatchOriginalParents;
+
+    for
+    (
+        label faceI=0;
+        faceI<label(v10jNeighbour.size());
+        ++faceI
+    )
+    {
+        const label own =
+            v10jOwner[faceI];
+
+        const label nei =
+            v10jNeighbour[faceI];
+
+        if
+        (
+            own < 0
+         || nei < 0
+         || own >= label(refType.size())
+         || nei >= label(refType.size())
+        )
+            continue;
+
+        if
+        (
+            refType[own] != 1
+         || refType[nei] != 1
+        )
+            continue;
+
+        const label op =
+            v10jParentPatch[own];
+
+        const label np =
+            v10jParentPatch[nei];
+
+        if
+        (
+            op < 0
+         || np < 0
+         || op == np
+        )
+            continue;
+
+        v10jCrossPatchParent[own] = true;
+        v10jCrossPatchParent[nei] = true;
+
+        ++v10jCrossPatchDegree[own];
+        ++v10jCrossPatchDegree[nei];
+
+        v10jCrossPatchOriginalParents.insert(own);
+        v10jCrossPatchOriginalParents.insert(nei);
+
+        ++v10jCrossPatchOriginalFaces;
+    }
+
+    const fileName v10jCsvName
+    (
+        "CFMITCH_V10J_type1CrossPatchBirth_"
+      + Foam::name(v10iInvocation)
+      + ".csv"
+    );
+
+    OFstream v10jCsv(v10jCsvName);
+
+    v10jCsv
+        << "invocation,cell,parent,localChild,"
+        << "bfI,patch,patchName,nLayers,wallLayer,"
+        << "generatedChildren,nFaces,crossPatchDegree"
+        << nl;
+
+    label v10jRecordedParents = 0;
+    label v10jRecordedChildren = 0;
+
     forAll(nCellsFromCell, cellI)
     {
         if( refType[cellI] == 0 )
@@ -6128,6 +7370,80 @@ void refineBoundaryLayers::generateNewCells()
                 exactVolumeLocalChild[newCellI] = cI;
                 exactVolumeRefType[newCellI] = 1;
 
+                if
+                (
+                    cellI >= 0
+                 && cellI < label(v10jCrossPatchParent.size())
+                 && v10jCrossPatchParent[cellI]
+                )
+                {
+                    const label v10jBfI =
+                        cellToBfI[cellI];
+
+                    const label v10jPatch =
+                        (
+                            v10jBfI >= 0
+                         && v10jBfI <
+                            label(exactVolumeFacePatch.size())
+                        )
+                      ? exactVolumeFacePatch[v10jBfI]
+                      : -1;
+
+                    const label v10jNLayers =
+                        (
+                            v10jBfI >= 0
+                         && v10jBfI <
+                            label(nLayersAtBndFace_.size())
+                        )
+                      ? nLayersAtBndFace_[v10jBfI]
+                      : -1;
+
+                    // Type-1 child numbering is CORE -> WALL.
+                    // wallLayer=0 therefore means wall-adjacent.
+                    const label v10jWallLayer =
+                        (
+                            v10jNLayers > 0
+                        )
+                      ? v10jNLayers - 1 - cI
+                      : -1;
+
+                    word v10jPatchName("?");
+
+                    if
+                    (
+                        v10jPatch >= 0
+                     && v10jPatch <
+                        label(childSweepBoundaries.size())
+                    )
+                    {
+                        v10jPatchName =
+                            childSweepBoundaries
+                            [
+                                v10jPatch
+                            ].patchName();
+                    }
+
+                    if( cI == 0 )
+                        ++v10jRecordedParents;
+
+                    ++v10jRecordedChildren;
+
+                    v10jCsv
+                        << v10iInvocation << ','
+                        << newCellI << ','
+                        << cellI << ','
+                        << cI << ','
+                        << v10jBfI << ','
+                        << v10jPatch << ','
+                        << v10jPatchName << ','
+                        << v10jNLayers << ','
+                        << v10jWallLayer << ','
+                        << cellsFromCell.size() << ','
+                        << nc.size() << ','
+                        << v10jCrossPatchDegree[cellI]
+                        << nl;
+                }
+
                 newCellsFromCell.append(cellI, newCellI);
 
                 cell& c = cells[newCellI];
@@ -6437,6 +7753,46 @@ void refineBoundaryLayers::generateNewCells()
                 256
             >& cellsFromCell =
                 refEdgeHex.newCells();
+
+            // ----------------------------------------------------
+            // V10I: exact parent-side junction context.
+            //
+            // type2BfI[] was obtained from the two active boundary
+            // faces validated by the V3.6 preflight above.
+            // ----------------------------------------------------
+            const label v10iLayers0 =
+            (
+                type2BfI[0] >= 0
+             && type2BfI[0] < label(nLayersAtBndFace_.size())
+            )
+              ? nLayersAtBndFace_[type2BfI[0]]
+              : -1;
+
+            const label v10iLayers1 =
+            (
+                type2BfI[1] >= 0
+             && type2BfI[1] < label(nLayersAtBndFace_.size())
+            )
+              ? nLayersAtBndFace_[type2BfI[1]]
+              : -1;
+
+            const label v10iPatch0 =
+            (
+                type2BfI[0] >= 0
+             && type2BfI[0] < label(exactVolumeFacePatch.size())
+            )
+              ? exactVolumeFacePatch[type2BfI[0]]
+              : -1;
+
+            const label v10iPatch1 =
+            (
+                type2BfI[1] >= 0
+             && type2BfI[1] < label(exactVolumeFacePatch.size())
+            )
+              ? exactVolumeFacePatch[type2BfI[1]]
+              : -1;
+
+            ++v10iType2Parents;
 
             forAll(cellsFromCell, cI)
             {
@@ -6860,6 +8216,24 @@ void refineBoundaryLayers::generateNewCells()
                 const label newCellI =
                     checkedNewCellLabel(cellI, cI, refType[cellI]);
                 cellToBaseBndFace_[newCellI] = cellToBfI[cellI];
+
+                ++v10iType2Children;
+
+                v10iType2BirthCsv
+                    << v10iInvocation << ','
+                    << newCellI << ','
+                    << cellI << ','
+                    << refType[cellI] << ','
+                    << cI << ','
+                    << type2BfI[0] << ','
+                    << type2BfI[1] << ','
+                    << v10iPatch0 << ','
+                    << v10iPatch1 << ','
+                    << v10iLayers0 << ','
+                    << v10iLayers1 << ','
+                    << cellsFromCell.size() << ','
+                    << nc.size()
+                    << nl;
 
                 newCellsFromCell.append(cellI, newCellI);
 
@@ -7408,6 +8782,2154 @@ void refineBoundaryLayers::generateNewCells()
             c[fI] = newFaceLabel[c[fI]];
     }
 
+    // =================================================================
+    // CFMITCH V5.7a QUAD-FAN ESCAPE
+    //
+    // Mechanism established by cfmitchTetLocationDiag:
+    //
+    //   * ordinary cross-layer quad shared-base failures are reproduced
+    //     exactly by physical owner/neighbour triangle-plane clearance;
+    //
+    //   * a four-triangle fan through the existing OpenFOAM face centre
+    //     virtually recovers ~96.56% of those failures;
+    //
+    //   * this topology escape requires zero movement of the four
+    //     existing BL vertices.
+    //
+    // IMPORTANT:
+    //
+    // This runs only AFTER the normal BL child cells and final face labels
+    // have been constructed.  Therefore four fan triangles are explicitly
+    // attached to the SAME two already-existing cells.  They are NOT put
+    // through facesFromFace_, whose row multiplicity has layer-position
+    // semantics in the ordinary child-cell generators.
+    //
+    // V5.7a is deliberately SERIAL-ONLY and capped at 2048 applied faces
+    // for the first topology-plumbing experiment.
+    // =================================================================
+
+    if( cfmitchV57QuadFanEscape_ )
+    {
+        const label v57ApplyCap = 2048;
+
+        if( Pstream::parRun() )
+        {
+            Info
+                << "CFMITCH V5.7a QUAD-FAN:"
+                << " enabled=yes"
+                << " applied=0"
+                << " reason=serialOnly"
+                << endl;
+        }
+        else
+        {
+            // The final faces/cells were just reconstructed above.
+            // Invalidate old addressing before asking polyMeshGen for
+            // owner/neighbour and geometric centres of THIS topology.
+            meshModifier.clearAll();
+
+            const label v57NInternal =
+                mesh_.nInternalFaces();
+
+            const label v57OldFaceCount =
+                faces.size();
+
+            const label v57OldPointCount =
+                mesh_.points().size();
+
+            const labelList v57Owner(mesh_.owner());
+            const labelList v57Neighbour(mesh_.neighbour());
+
+            const vectorField v57FaceCentres
+            (
+                mesh_.addressingData().faceCentres()
+            );
+
+            const vectorField v57FaceAreas
+            (
+                mesh_.addressingData().faceAreas()
+            );
+
+            const vectorField v57CellCentres
+            (
+                mesh_.addressingData().cellCentres()
+            );
+
+            pointFieldPMG& v57Points =
+                meshModifier.pointsAccess();
+
+            boolList v57Selected(v57NInternal, false);
+
+            label v57RegularColumnQuads = 0;
+            label v57PhysicalFail = 0;
+            label v57Recoverable = 0;
+            label v57SelectedCount = 0;
+
+            label v57Degenerate = 0;
+            label v57NotSix = 0;
+            label v57NotSameColumn = 0;
+
+            // CFMITCH V5.7b accumulated post-fan hard-admission telemetry.
+            label v57HardEvaluated = 0;
+            label v57HardSafe = 0;
+            label v57HardRejected = 0;
+            label v57HardRejectInvalid = 0;
+            label v57HardRejectVolume = 0;
+            label v57HardRejectPyramid = 0;
+            label v57HardRejectNonOrth = 0;
+
+            scalar v57SelectedClearMin = GREAT;
+            scalar v57SelectedClearMax = -GREAT;
+            scalar v57SelectedClearSum = scalar(0);
+
+            const label v57BoundaryStart =
+                boundaries.size()
+              ? boundaries[0].patchStart()
+              : label(faces.size());
+
+            bool v57LayoutOK =
+            (
+                v57BoundaryStart == v57NInternal
+             && v57Owner.size() == v57OldFaceCount
+             && v57Neighbour.size() == v57OldFaceCount
+             && v57FaceCentres.size() == v57OldFaceCount
+             && v57FaceAreas.size() == v57OldFaceCount
+             && v57CellCentres.size() == cells.size()
+             && v57Points.size() == v57OldPointCount
+            );
+
+            if( !v57LayoutOK )
+            {
+                Info
+                    << "CFMITCH V5.7a QUAD-FAN LAYOUT REJECT:"
+                    << " nInternal=" << v57NInternal
+                    << " boundaryStart=" << v57BoundaryStart
+                    << " faces=" << v57OldFaceCount
+                    << " owner=" << v57Owner.size()
+                    << " neighbour=" << v57Neighbour.size()
+                    << " faceCentres=" << v57FaceCentres.size()
+                    << " faceAreas=" << v57FaceAreas.size()
+                    << " cells=" << cells.size()
+                    << " cellCentres=" << v57CellCentres.size()
+                    << " points=" << v57Points.size()
+                    << endl;
+            }
+            else
+            {
+                // -----------------------------------------------------
+                // =====================================================
+            // CFMITCH V5.7b ACCUMULATED HARD ADMISSION
+            //
+            // V5.7a checked each prospective fan against PRE-FAN cached
+            // cell centres.  But replacing one quad by four triangles
+            // changes primitiveMesh's face-weighted cell-centre calculation.
+            //
+            // A cell may also contain more than one selected fan.  Therefore
+            // every tentative candidate below is evaluated against the full
+            // ACCUMULATED virtual topology represented by v57Selected.
+            //
+            // This is a read-only prospective transaction.  The real mesh
+            // topology is not changed until the existing V5.7 apply block.
+            // =====================================================
+
+            // ---------------------------------------------------------
+            // Exact OpenFOAM face::areaAndCentre() parity for an existing
+            // old face.  This mirrors v1OFFaceCentreArea below.
+            // ---------------------------------------------------------
+
+            auto v57OFFaceCentreArea =
+            [&]
+            (
+                const face& f,
+                point& fCtr,
+                vector& fArea
+            ) -> bool
+            {
+                const label nPoints =
+                    f.size();
+
+                if( nPoints < 3 )
+                    return false;
+
+                forAll(f, pi)
+                {
+                    const label pointI =
+                        f[pi];
+
+                    if
+                    (
+                        pointI < 0
+                     || pointI >= label(v57Points.size())
+                    )
+                        return false;
+                }
+
+                if( nPoints == 3 )
+                {
+                    const point& p0 =
+                        v57Points[f[0]];
+
+                    const point& p1 =
+                        v57Points[f[1]];
+
+                    const point& p2 =
+                        v57Points[f[2]];
+
+                    fArea =
+                        scalar(0.5)
+                       *((p1-p0)^(p2-p0));
+
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *(p0+p1+p2);
+
+                    return
+                    (
+                        !help::isnan(fCtr)
+                     && !help::isinf(fCtr)
+                     && std::isfinite(mag(fArea))
+                    );
+                }
+
+                point pAvg(vector::zero);
+
+                forAll(f, pi)
+                    pAvg += v57Points[f[pi]];
+
+                pAvg /= scalar(nPoints);
+
+                vector sumA(vector::zero);
+
+                forAll(f, pi)
+                {
+                    const point& fp =
+                        v57Points[f[pi]];
+
+                    const point& fpNext =
+                        v57Points[f.nextLabel(pi)];
+
+                    const vector a =
+                        (fpNext-fp)^(pAvg-fp);
+
+                    sumA += a;
+                }
+
+                const scalar sumAMag =
+                    mag(sumA);
+
+                if
+                (
+                    !std::isfinite(sumAMag)
+                 || sumAMag <= rootVSmall
+                )
+                    return false;
+
+                const vector sumAHat =
+                    normalised(sumA);
+
+                scalar sumAn = scalar(0);
+                vector sumAnc(vector::zero);
+
+                forAll(f, pi)
+                {
+                    const point& fp =
+                        v57Points[f[pi]];
+
+                    const point& fpNext =
+                        v57Points[f.nextLabel(pi)];
+
+                    const vector a =
+                        (fpNext-fp)^(pAvg-fp);
+
+                    const vector c =
+                        fp + fpNext + pAvg;
+
+                    const scalar an =
+                        a & sumAHat;
+
+                    sumAn += an;
+                    sumAnc += an*c;
+                }
+
+                fArea =
+                    scalar(0.5)*sumA;
+
+                if( sumAn > vSmall )
+                {
+                    fCtr =
+                        (scalar(1)/scalar(3))
+                       *sumAnc/sumAn;
+                }
+                else
+                {
+                    fCtr = pAvg;
+                }
+
+                return
+                (
+                    !help::isnan(fCtr)
+                 && !help::isinf(fCtr)
+                 && std::isfinite(mag(fArea))
+                );
+            };
+
+
+            // ---------------------------------------------------------
+            // Geometry for one face in the virtual topology.
+            //
+            // pieceI=0 for an untouched old face.
+            //
+            // A selected old quad contributes:
+            //   piece 0 = p0 p1 x
+            //   piece 1 = p1 p2 x
+            //   piece 2 = p2 p3 x
+            //   piece 3 = p3 p0 x
+            //
+            // x is exactly the point the existing APPLY code will append:
+            // v57FaceCentres[oldFaceI].
+            // ---------------------------------------------------------
+
+            auto v57VirtualFaceCentreArea =
+            [&]
+            (
+                const label oldFaceI,
+                const label pieceI,
+                point& fCtr,
+                vector& fArea
+            ) -> bool
+            {
+                if
+                (
+                    oldFaceI < 0
+                 || oldFaceI >= v57OldFaceCount
+                )
+                    return false;
+
+                const bool split =
+                (
+                    oldFaceI < v57NInternal
+                 && v57Selected[oldFaceI]
+                );
+
+                if( !split )
+                {
+                    if( pieceI != 0 )
+                        return false;
+
+                    return
+                        v57OFFaceCentreArea
+                        (
+                            faces[oldFaceI],
+                            fCtr,
+                            fArea
+                        );
+                }
+
+                if( pieceI < 0 || pieceI >= 4 )
+                    return false;
+
+                const face& f =
+                    faces[oldFaceI];
+
+                if( f.size() != 4 )
+                    return false;
+
+                const label aI =
+                    f[pieceI];
+
+                const label bI =
+                    f[(pieceI+1)%4];
+
+                if
+                (
+                    aI < 0
+                 || bI < 0
+                 || aI >= label(v57Points.size())
+                 || bI >= label(v57Points.size())
+                )
+                    return false;
+
+                const point& a =
+                    v57Points[aI];
+
+                const point& b =
+                    v57Points[bI];
+
+                const point& x =
+                    v57FaceCentres[oldFaceI];
+
+                fCtr =
+                    (scalar(1)/scalar(3))
+                   *(a+b+x);
+
+                fArea =
+                    scalar(0.5)
+                   *((b-a)^(x-a));
+
+                const scalar areaMag =
+                    mag(fArea);
+
+                return
+                (
+                    !help::isnan(fCtr)
+                 && !help::isinf(fCtr)
+                 && std::isfinite(areaMag)
+                 && areaMag > rootVSmall
+                );
+            };
+
+
+            // ---------------------------------------------------------
+            // Exact signed OpenFOAM-style cell centre/volume under the
+            // accumulated virtual fan topology.
+            //
+            // Mirrors v1OFCellCentreVolume / primitiveMesh:
+            //
+            //   cEst = arithmetic mean of all virtual face centres
+            //   pyr3 = Sf & (Cf-cEst), outward for this cell
+            //   C    = sum(pyr3*Cp)/sum(pyr3)
+            // ---------------------------------------------------------
+
+            auto v57VirtualCellCentreVolume =
+            [&]
+            (
+                const label cellI,
+                point& cellCtr,
+                scalar& cellVol
+            ) -> bool
+            {
+                if
+                (
+                    cellI < 0
+                 || cellI >= label(cells.size())
+                )
+                    return false;
+
+                const cell& c =
+                    cells[cellI];
+
+                if( c.empty() )
+                    return false;
+
+                label nVirtualFaces = 0;
+
+                forAll(c, cfI)
+                {
+                    const label oldFaceI =
+                        c[cfI];
+
+                    if
+                    (
+                        oldFaceI < 0
+                     || oldFaceI >= v57OldFaceCount
+                    )
+                        return false;
+
+                    nVirtualFaces +=
+                    (
+                        oldFaceI < v57NInternal
+                     && v57Selected[oldFaceI]
+                    )
+                  ? label(4)
+                  : label(1);
+                }
+
+                if( nVirtualFaces <= 0 )
+                    return false;
+
+                point cEst(vector::zero);
+
+                forAll(c, cfI)
+                {
+                    const label oldFaceI =
+                        c[cfI];
+
+                    const label nPieces =
+                    (
+                        oldFaceI < v57NInternal
+                     && v57Selected[oldFaceI]
+                    )
+                  ? label(4)
+                  : label(1);
+
+                    for
+                    (
+                        label pieceI=0;
+                        pieceI<nPieces;
+                        ++pieceI
+                    )
+                    {
+                        point fc(vector::zero);
+                        vector fa(vector::zero);
+
+                        if
+                        (
+                            !v57VirtualFaceCentreArea
+                            (
+                                oldFaceI,
+                                pieceI,
+                                fc,
+                                fa
+                            )
+                        )
+                            return false;
+
+                        cEst += fc;
+                    }
+                }
+
+                cEst /= scalar(nVirtualFaces);
+
+                point weightedCentre(vector::zero);
+                scalar vol3 = scalar(0);
+
+                forAll(c, cfI)
+                {
+                    const label oldFaceI =
+                        c[cfI];
+
+                    const label nPieces =
+                    (
+                        oldFaceI < v57NInternal
+                     && v57Selected[oldFaceI]
+                    )
+                  ? label(4)
+                  : label(1);
+
+                    for
+                    (
+                        label pieceI=0;
+                        pieceI<nPieces;
+                        ++pieceI
+                    )
+                    {
+                        point fc(vector::zero);
+                        vector fa(vector::zero);
+
+                        if
+                        (
+                            !v57VirtualFaceCentreArea
+                            (
+                                oldFaceI,
+                                pieceI,
+                                fc,
+                                fa
+                            )
+                        )
+                            return false;
+
+                        scalar pyr3Vol =
+                            fa & (fc-cEst);
+
+                        if( v57Owner[oldFaceI] != cellI )
+                            pyr3Vol *= scalar(-1);
+
+                        const point pc =
+                            scalar(0.75)*fc
+                          + scalar(0.25)*cEst;
+
+                        weightedCentre +=
+                            pyr3Vol*pc;
+
+                        vol3 +=
+                            pyr3Vol;
+                    }
+                }
+
+                if( Foam::mag(vol3) > vSmall )
+                    cellCtr = weightedCentre/vol3;
+                else
+                    cellCtr = cEst;
+
+                cellVol =
+                    vol3/scalar(3);
+
+                return
+                (
+                    !help::isnan(cellCtr)
+                 && !help::isinf(cellCtr)
+                 && std::isfinite(cellVol)
+                );
+            };
+
+
+            // ---------------------------------------------------------
+            // Hard quality of one old face under the current accumulated
+            // virtual topology.
+            //
+            // For untouched polygon faces, use pyramidPointFaceRef exactly
+            // as the established V1 OF-parity evaluator does.
+            //
+            // For selected fan triangles, the exact signed pyramid volume
+            // is Sf & (Cf-C)/3.
+            // ---------------------------------------------------------
+
+            auto v57AuditOldFaceHard =
+            [&]
+            (
+                const label oldFaceI,
+                bool& badInvalid,
+                bool& badVolume,
+                bool& badPyramid,
+                bool& badNonOrth
+            )
+            {
+                if
+                (
+                    oldFaceI < 0
+                 || oldFaceI >= v57OldFaceCount
+                )
+                {
+                    badInvalid = true;
+                    return;
+                }
+
+                const label own =
+                    v57Owner[oldFaceI];
+
+                const label nei =
+                    v57Neighbour[oldFaceI];
+
+                if
+                (
+                    own < 0
+                 || own >= label(cells.size())
+                 || nei < -1
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return;
+                }
+
+                point ownCc(vector::zero);
+                scalar ownVol = scalar(0);
+
+                if
+                (
+                    !v57VirtualCellCentreVolume
+                    (
+                        own,
+                        ownCc,
+                        ownVol
+                    )
+                )
+                {
+                    badInvalid = true;
+                    return;
+                }
+
+                if( ownVol <= scalar(0) )
+                    badVolume = true;
+
+                point neiCc(vector::zero);
+                scalar neiVol = scalar(0);
+
+                if( nei >= 0 )
+                {
+                    if
+                    (
+                        !v57VirtualCellCentreVolume
+                        (
+                            nei,
+                            neiCc,
+                            neiVol
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    if( neiVol <= scalar(0) )
+                        badVolume = true;
+                }
+
+                const bool split =
+                (
+                    oldFaceI < v57NInternal
+                 && v57Selected[oldFaceI]
+                );
+
+                if( !split )
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            0,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    const scalar ownerPyrVol =
+                        pyramidPointFaceRef
+                        (
+                            faces[oldFaceI],
+                            ownCc
+                        ).mag(v57Points);
+
+                    if( !std::isfinite(ownerPyrVol) )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    if( ownerPyrVol > SMALL )
+                        badPyramid = true;
+
+                    if( nei >= 0 )
+                    {
+                        const scalar neighbourPyrVol =
+                            pyramidPointFaceRef
+                            (
+                                faces[oldFaceI],
+                                neiCc
+                            ).mag(v57Points);
+
+                        if( !std::isfinite(neighbourPyrVol) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( neighbourPyrVol < -SMALL )
+                            badPyramid = true;
+
+                        const vector d =
+                            neiCc-ownCc;
+
+                        const scalar orthogonality =
+                            (d & fa)
+                           /(
+                                mag(d)*mag(fa)
+                              + rootVSmall
+                            );
+
+                        if( !std::isfinite(orthogonality) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( orthogonality <= SMALL )
+                            badNonOrth = true;
+                    }
+
+                    return;
+                }
+
+                // Selected old quad: audit its four prospective triangles.
+                for(label pieceI=0; pieceI<4; ++pieceI)
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            pieceI,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    // Positive means correctly oriented for the owner.
+                    const scalar ownerMargin =
+                        (
+                            fa
+                          & (fc-ownCc)
+                        )/scalar(3);
+
+                    if( !std::isfinite(ownerMargin) )
+                    {
+                        badInvalid = true;
+                        return;
+                    }
+
+                    if( ownerMargin < -SMALL )
+                        badPyramid = true;
+
+                    if( nei >= 0 )
+                    {
+                        // Same stored winding is reversed relative to the
+                        // neighbour cell, so positive neighbour margin is:
+                        const scalar neighbourMargin =
+                           -(
+                                fa
+                              & (fc-neiCc)
+                            )/scalar(3);
+
+                        if( !std::isfinite(neighbourMargin) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( neighbourMargin < -SMALL )
+                            badPyramid = true;
+
+                        const vector d =
+                            neiCc-ownCc;
+
+                        const scalar orthogonality =
+                            (d & fa)
+                           /(
+                                mag(d)*mag(fa)
+                              + rootVSmall
+                            );
+
+                        if( !std::isfinite(orthogonality) )
+                        {
+                            badInvalid = true;
+                            return;
+                        }
+
+                        if( orthogonality <= SMALL )
+                            badNonOrth = true;
+                    }
+                }
+            };
+
+
+            // ---------------------------------------------------------
+            // CFMITCH V5.7c INCREMENTAL SEVERE-NONORTH ADMISSION
+            //
+            // Exact OpenFOAM-13 checkMesh severe-face parity:
+            //
+            //     dDotS =
+            //         (d & S)/(mag(d)*mag(S) + vSmall)
+            //
+            // checkMesh default nonOrthThreshold = 70 degrees,
+            // and a face is severe when:
+            //
+            //     dDotS < cos(70 degrees)
+            //
+            // Do NOT reject a candidate merely because its local
+            // neighbourhood already contains a severe face.
+            //
+            // Instead count the exact local severe-face population
+            // before and after the tentative fan and reject only an
+            // INCREASE.
+            //
+            // An untouched old face contributes one prospective face.
+            // A selected old quad contributes its four prospective
+            // triangle faces exactly as written by V5.7.
+            // ---------------------------------------------------------
+
+            const scalar v57SevereNonOrthThreshold =
+                scalar(0.34202014332566873304);
+
+
+            auto v57CountOldFaceSevere =
+            [&]
+            (
+                const label oldFaceI,
+                label& severeCount,
+                bool& badInvalid
+            ) -> bool
+            {
+                if
+                (
+                    oldFaceI < 0
+                 || oldFaceI >= v57OldFaceCount
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                const label own =
+                    v57Owner[oldFaceI];
+
+                const label nei =
+                    v57Neighbour[oldFaceI];
+
+                if
+                (
+                    own < 0
+                 || own >= label(cells.size())
+                 || nei < -1
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                // Uncoupled boundary faces are not part of the
+                // internal-face non-orthogonality population.
+                if( nei < 0 )
+                    return true;
+
+                point ownCc(vector::zero);
+                point neiCc(vector::zero);
+
+                scalar ownVol = scalar(0);
+                scalar neiVol = scalar(0);
+
+                if
+                (
+                    !v57VirtualCellCentreVolume
+                    (
+                        own,
+                        ownCc,
+                        ownVol
+                    )
+                 || !v57VirtualCellCentreVolume
+                    (
+                        nei,
+                        neiCc,
+                        neiVol
+                    )
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                const vector d =
+                    neiCc-ownCc;
+
+                const bool split =
+                (
+                    oldFaceI < v57NInternal
+                 && v57Selected[oldFaceI]
+                );
+
+                if( !split )
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            0,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    const scalar dDotS =
+                        (d & fa)
+                       /(
+                            mag(d)*mag(fa)
+                          + vSmall
+                        );
+
+                    if( !std::isfinite(dDotS) )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    if
+                    (
+                        dDotS
+                      < v57SevereNonOrthThreshold
+                    )
+                    {
+                        ++severeCount;
+                    }
+
+                    return true;
+                }
+
+                // Selected old quad: four prospective triangles.
+                for(label pieceI=0; pieceI<4; ++pieceI)
+                {
+                    point fc(vector::zero);
+                    vector fa(vector::zero);
+
+                    if
+                    (
+                        !v57VirtualFaceCentreArea
+                        (
+                            oldFaceI,
+                            pieceI,
+                            fc,
+                            fa
+                        )
+                    )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    const scalar dDotS =
+                        (d & fa)
+                       /(
+                            mag(d)*mag(fa)
+                          + vSmall
+                        );
+
+                    if( !std::isfinite(dDotS) )
+                    {
+                        badInvalid = true;
+                        return false;
+                    }
+
+                    if
+                    (
+                        dDotS
+                      < v57SevereNonOrthThreshold
+                    )
+                    {
+                        ++severeCount;
+                    }
+                }
+
+                return true;
+            };
+
+
+            auto v57CountLocalSevere =
+            [&]
+            (
+                const label own,
+                const label nei,
+                label& severeCount,
+                bool& badInvalid
+            ) -> bool
+            {
+                severeCount = 0;
+                badInvalid = false;
+
+                if
+                (
+                    own < 0
+                 || nei < 0
+                 || own >= label(cells.size())
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                const cell& ownCell =
+                    cells[own];
+
+                const cell& neiCell =
+                    cells[nei];
+
+                // Count all old faces incident on owner.
+                forAll(ownCell, cfI)
+                {
+                    if
+                    (
+                        !v57CountOldFaceSevere
+                        (
+                            ownCell[cfI],
+                            severeCount,
+                            badInvalid
+                        )
+                    )
+                    {
+                        return false;
+                    }
+                }
+
+                // Count neighbour-cell faces not already present in
+                // ownerCell.  This prevents counting their shared
+                // interface twice.
+                forAll(neiCell, cfI)
+                {
+                    const label oldFaceI =
+                        neiCell[cfI];
+
+                    bool alreadyCounted = false;
+
+                    forAll(ownCell, ownCfI)
+                    {
+                        if
+                        (
+                            ownCell[ownCfI]
+                         == oldFaceI
+                        )
+                        {
+                            alreadyCounted = true;
+                            break;
+                        }
+                    }
+
+                    if( alreadyCounted )
+                        continue;
+
+                    if
+                    (
+                        !v57CountOldFaceSevere
+                        (
+                            oldFaceI,
+                            severeCount,
+                            badInvalid
+                        )
+                    )
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            };
+
+
+            label v57SoftEvaluated = 0;
+            label v57SoftAccepted = 0;
+            label v57SoftRejected = 0;
+            label v57SoftRejectInvalid = 0;
+            label v57SoftRejectSevereIncrease = 0;
+
+            label v57SoftRejectAddedSevereFaces = 0;
+            label v57SoftRejectMaxAddedSevere = 0;
+
+
+            // ---------------------------------------------------------
+            // Exact local transaction for a tentative candidate.
+            //
+            // The caller has already set v57Selected[faceI]=true.
+            //
+            // Auditing every old face incident on owner and neighbour is
+            // important: changing either cell centre can make an UNCHANGED
+            // neighbouring face fail a pyramid or non-orthogonality test.
+            //
+            // Previously selected fans on these cells are automatically
+            // re-evaluated using the updated accumulated virtual centres.
+            // ---------------------------------------------------------
+
+            auto v57CandidateHardSafe =
+            [&]
+            (
+                const label own,
+                const label nei,
+                bool& badInvalid,
+                bool& badVolume,
+                bool& badPyramid,
+                bool& badNonOrth
+            ) -> bool
+            {
+                badInvalid = false;
+                badVolume = false;
+                badPyramid = false;
+                badNonOrth = false;
+
+                if
+                (
+                    own < 0
+                 || nei < 0
+                 || own >= label(cells.size())
+                 || nei >= label(cells.size())
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                point ownCc(vector::zero);
+                point neiCc(vector::zero);
+
+                scalar ownVol = scalar(0);
+                scalar neiVol = scalar(0);
+
+                if
+                (
+                    !v57VirtualCellCentreVolume
+                    (
+                        own,
+                        ownCc,
+                        ownVol
+                    )
+                 || !v57VirtualCellCentreVolume
+                    (
+                        nei,
+                        neiCc,
+                        neiVol
+                    )
+                )
+                {
+                    badInvalid = true;
+                    return false;
+                }
+
+                if
+                (
+                    ownVol <= scalar(0)
+                 || neiVol <= scalar(0)
+                )
+                    badVolume = true;
+
+                const cell& ownCell =
+                    cells[own];
+
+                forAll(ownCell, cfI)
+                {
+                    v57AuditOldFaceHard
+                    (
+                        ownCell[cfI],
+                        badInvalid,
+                        badVolume,
+                        badPyramid,
+                        badNonOrth
+                    );
+
+                    if( badInvalid )
+                        break;
+                }
+
+                if( !badInvalid )
+                {
+                    const cell& neiCell =
+                        cells[nei];
+
+                    forAll(neiCell, cfI)
+                    {
+                        v57AuditOldFaceHard
+                        (
+                            neiCell[cfI],
+                            badInvalid,
+                            badVolume,
+                            badPyramid,
+                            badNonOrth
+                        );
+
+                        if( badInvalid )
+                            break;
+                    }
+                }
+
+                return
+                (
+                    !badInvalid
+                 && !badVolume
+                 && !badPyramid
+                 && !badNonOrth
+                );
+            };
+
+
+            // Selection pass against the frozen pre-fan topology.
+                //
+                // Restriction to equal cellToBaseBndFace_ provenance
+                // isolates successive children of the same BL column,
+                // rather than side faces between neighbouring columns.
+                // -----------------------------------------------------
+
+                for
+                (
+                    label faceI = 0;
+                    faceI < v57NInternal;
+                    ++faceI
+                )
+                {
+                    const face& f = faces[faceI];
+
+                    if( f.size() != 4 )
+                        continue;
+
+                    const label own = v57Owner[faceI];
+                    const label nei = v57Neighbour[faceI];
+
+                    if
+                    (
+                        own < 0
+                     || nei < 0
+                     || own >= label(cells.size())
+                     || nei >= label(cells.size())
+                    )
+                        continue;
+
+                    if
+                    (
+                        cells[own].size() != 6
+                     || cells[nei].size() != 6
+                    )
+                    {
+                        ++v57NotSix;
+                        continue;
+                    }
+
+                    if
+                    (
+                        own >= label(cellToBaseBndFace_.size())
+                     || nei >= label(cellToBaseBndFace_.size())
+                    )
+                    {
+                        ++v57NotSameColumn;
+                        continue;
+                    }
+
+                    const label ownBf =
+                        cellToBaseBndFace_[own];
+
+                    const label neiBf =
+                        cellToBaseBndFace_[nei];
+
+                    if
+                    (
+                        ownBf < 0
+                     || neiBf < 0
+                     || ownBf != neiBf
+                    )
+                    {
+                        ++v57NotSameColumn;
+                        continue;
+                    }
+
+                    ++v57RegularColumnQuads;
+
+                    const point& p0 = v57Points[f[0]];
+                    const point& p1 = v57Points[f[1]];
+                    const point& p2 = v57Points[f[2]];
+                    const point& p3 = v57Points[f[3]];
+
+                    const vector n012 =
+                        (p1-p0) ^ (p2-p0);
+
+                    const vector n023 =
+                        (p2-p0) ^ (p3-p0);
+
+                    const vector n013 =
+                        (p1-p0) ^ (p3-p0);
+
+                    const vector n123 =
+                        (p2-p1) ^ (p3-p1);
+
+                    const scalar m012 = mag(n012);
+                    const scalar m023 = mag(n023);
+                    const scalar m013 = mag(n013);
+                    const scalar m123 = mag(n123);
+
+                    if
+                    (
+                        m012 <= rootVSmall
+                     || m023 <= rootVSmall
+                     || m013 <= rootVSmall
+                     || m123 <= rootVSmall
+                    )
+                    {
+                        ++v57Degenerate;
+                        continue;
+                    }
+
+                    // -------------------------------------------------
+                    // Exact physical sign analogue of the OpenFOAM
+                    // shared-base test for the two quad diagonals.
+                    //
+                    // Face winding is owner -> neighbour.
+                    // Correct owner side     => negative signed distance.
+                    // Correct neighbour side => positive signed distance.
+                    // -------------------------------------------------
+
+                    const scalar own012 =
+                        (
+                            (v57CellCentres[own]-p0)
+                          & n012
+                        ) / m012;
+
+                    const scalar own023 =
+                        (
+                            (v57CellCentres[own]-p0)
+                          & n023
+                        ) / m023;
+
+                    const scalar nei012 =
+                        (
+                            (v57CellCentres[nei]-p0)
+                          & n012
+                        ) / m012;
+
+                    const scalar nei023 =
+                        (
+                            (v57CellCentres[nei]-p0)
+                          & n023
+                        ) / m023;
+
+                    const scalar diag02Owner =
+                        Foam::min(-own012, -own023);
+
+                    const scalar diag02Neighbour =
+                        Foam::min(nei012, nei023);
+
+                    const scalar diag02Common =
+                        Foam::min
+                        (
+                            diag02Owner,
+                            diag02Neighbour
+                        );
+
+                    const scalar own013 =
+                        (
+                            (v57CellCentres[own]-p0)
+                          & n013
+                        ) / m013;
+
+                    const scalar own123 =
+                        (
+                            (v57CellCentres[own]-p1)
+                          & n123
+                        ) / m123;
+
+                    const scalar nei013 =
+                        (
+                            (v57CellCentres[nei]-p0)
+                          & n013
+                        ) / m013;
+
+                    const scalar nei123 =
+                        (
+                            (v57CellCentres[nei]-p1)
+                          & n123
+                        ) / m123;
+
+                    const scalar diag13Owner =
+                        Foam::min(-own013, -own123);
+
+                    const scalar diag13Neighbour =
+                        Foam::min(nei013, nei123);
+
+                    const scalar diag13Common =
+                        Foam::min
+                        (
+                            diag13Owner,
+                            diag13Neighbour
+                        );
+
+                    const scalar originalBestCommon =
+                        Foam::max
+                        (
+                            diag02Common,
+                            diag13Common
+                        );
+
+                    // Existing quad already has a physical shared base.
+                    if( originalBestCommon > scalar(0) )
+                        continue;
+
+                    ++v57PhysicalFail;
+
+                    // -------------------------------------------------
+                    // Virtual four-triangle fan through the EXISTING
+                    // OpenFOAM face centre.
+                    // -------------------------------------------------
+
+                    const point fc =
+                        v57FaceCentres[faceI];
+
+                    scalar fanCommon = GREAT;
+                    bool fanValid = true;
+
+                    for(label fp=0; fp<4; ++fp)
+                    {
+                        const point& a =
+                            v57Points[f[fp]];
+
+                        const point& b =
+                            v57Points[f[(fp+1)%4]];
+
+                        const vector fn =
+                            (b-a) ^ (fc-a);
+
+                        const scalar fm =
+                            mag(fn);
+
+                        if( fm <= rootVSmall )
+                        {
+                            fanValid = false;
+                            break;
+                        }
+
+                        const scalar ownSigned =
+                            (
+                                (v57CellCentres[own]-a)
+                              & fn
+                            ) / fm;
+
+                        const scalar neiSigned =
+                            (
+                                (v57CellCentres[nei]-a)
+                              & fn
+                            ) / fm;
+
+                        const scalar thisCommon =
+                            Foam::min
+                            (
+                                -ownSigned,
+                                neiSigned
+                            );
+
+                        fanCommon =
+                            Foam::min
+                            (
+                                fanCommon,
+                                thisCommon
+                            );
+                    }
+
+                    if
+                    (
+                        !fanValid
+                     || !(fanCommon > scalar(0))
+                    )
+                        continue;
+
+                    ++v57Recoverable;
+
+                    // -------------------------------------------------
+                    // V5.7c accumulated hard + incremental severe
+                    // non-orthogonality admission.
+                    //
+                    // Candidate sequence:
+                    //
+                    //   current accumulated topology
+                    //       -> tentative fan
+                    //       -> existing V5.7b hard audit
+                    //       -> severe count before/after
+                    //
+                    // Reject the candidate only if it creates a net
+                    // increase in the exact local OpenFOAM >70-degree
+                    // face population.
+                    // -------------------------------------------------
+                    if( v57SelectedCount < v57ApplyCap )
+                    {
+                        ++v57HardEvaluated;
+
+                        // Tentative transaction.  No actual mesh topology
+                        // has changed yet.
+                        v57Selected[faceI] = true;
+
+                        bool hardInvalid = false;
+                        bool hardVolume = false;
+                        bool hardPyramid = false;
+                        bool hardNonOrth = false;
+
+                        const bool hardSafe =
+                            v57CandidateHardSafe
+                            (
+                                own,
+                                nei,
+                                hardInvalid,
+                                hardVolume,
+                                hardPyramid,
+                                hardNonOrth
+                            );
+
+                        if( !hardSafe )
+                        {
+                            // Exact prospective rollback.
+                            v57Selected[faceI] = false;
+
+                            ++v57HardRejected;
+
+                            if( hardInvalid )
+                                ++v57HardRejectInvalid;
+
+                            if( hardVolume )
+                                ++v57HardRejectVolume;
+
+                            if( hardPyramid )
+                                ++v57HardRejectPyramid;
+
+                            if( hardNonOrth )
+                                ++v57HardRejectNonOrth;
+
+                            continue;
+                        }
+
+                        ++v57HardSafe;
+                        ++v57SoftEvaluated;
+
+                        // -------------------------------------------------
+                        // Baseline accumulated state BEFORE this fan.
+                        //
+                        // Previously accepted fans remain selected.
+                        // Only this candidate is temporarily rolled back.
+                        // -------------------------------------------------
+                        v57Selected[faceI] = false;
+
+                        label severeBefore = 0;
+                        bool severeBeforeInvalid = false;
+
+                        const bool severeBeforeOk =
+                            v57CountLocalSevere
+                            (
+                                own,
+                                nei,
+                                severeBefore,
+                                severeBeforeInvalid
+                            );
+
+                        if
+                        (
+                            !severeBeforeOk
+                         || severeBeforeInvalid
+                        )
+                        {
+                            ++v57SoftRejected;
+                            ++v57SoftRejectInvalid;
+
+                            // Candidate remains rolled back.
+                            continue;
+                        }
+
+                        // -------------------------------------------------
+                        // Exact accumulated state AFTER this fan.
+                        // -------------------------------------------------
+                        v57Selected[faceI] = true;
+
+                        label severeAfter = 0;
+                        bool severeAfterInvalid = false;
+
+                        const bool severeAfterOk =
+                            v57CountLocalSevere
+                            (
+                                own,
+                                nei,
+                                severeAfter,
+                                severeAfterInvalid
+                            );
+
+                        if
+                        (
+                            !severeAfterOk
+                         || severeAfterInvalid
+                        )
+                        {
+                            v57Selected[faceI] = false;
+
+                            ++v57SoftRejected;
+                            ++v57SoftRejectInvalid;
+
+                            continue;
+                        }
+
+                        if( severeAfter > severeBefore )
+                        {
+                            const label addedSevere =
+                                severeAfter-severeBefore;
+
+                            v57Selected[faceI] = false;
+
+                            ++v57SoftRejected;
+                            ++v57SoftRejectSevereIncrease;
+
+                            v57SoftRejectAddedSevereFaces +=
+                                addedSevere;
+
+                            v57SoftRejectMaxAddedSevere =
+                                Foam::max
+                                (
+                                    v57SoftRejectMaxAddedSevere,
+                                    addedSevere
+                                );
+
+                            continue;
+                        }
+
+                        ++v57SoftAccepted;
+                        ++v57SelectedCount;
+
+                        v57SelectedClearMin =
+                            Foam::min
+                            (
+                                v57SelectedClearMin,
+                                fanCommon
+                            );
+
+                        v57SelectedClearMax =
+                            Foam::max
+                            (
+                                v57SelectedClearMax,
+                                fanCommon
+                            );
+
+                        v57SelectedClearSum += fanCommon;
+                    }
+                }
+
+                Info
+                    << "CFMITCH V5.7c QUAD-FAN SELECT:"
+                    << " regularColumnQuads="
+                    << v57RegularColumnQuads
+                    << " physicalFail=" << v57PhysicalFail
+                    << " recoverable=" << v57Recoverable
+                    << " hardEvaluated=" << v57HardEvaluated
+                    << " hardSafe=" << v57HardSafe
+                    << " hardRejected=" << v57HardRejected
+                    << " hardRejectInvalid=" << v57HardRejectInvalid
+                    << " hardRejectVolume=" << v57HardRejectVolume
+                    << " hardRejectPyramid=" << v57HardRejectPyramid
+                    << " hardRejectNonOrth=" << v57HardRejectNonOrth
+                    << " softEvaluated=" << v57SoftEvaluated
+                    << " softAccepted=" << v57SoftAccepted
+                    << " softRejected=" << v57SoftRejected
+                    << " softRejectInvalid=" << v57SoftRejectInvalid
+                    << " softRejectSevereIncrease="
+                    << v57SoftRejectSevereIncrease
+                    << " softRejectAddedSevereFaces="
+                    << v57SoftRejectAddedSevereFaces
+                    << " softRejectMaxAddedSevere="
+                    << v57SoftRejectMaxAddedSevere
+                    << " selected=" << v57SelectedCount
+                    << " cap=" << v57ApplyCap
+                    << " degenerate=" << v57Degenerate
+                    << " notSix=" << v57NotSix
+                    << " notSameColumn=" << v57NotSameColumn
+                    << " selectedClearMin="
+                    << (
+                           v57SelectedCount
+                         ? v57SelectedClearMin
+                         : scalar(0)
+                       )
+                    << " selectedClearAvg="
+                    << (
+                           v57SelectedCount
+                         ? v57SelectedClearSum
+                          /scalar(v57SelectedCount)
+                         : scalar(0)
+                       )
+                    << " selectedClearMax="
+                    << (
+                           v57SelectedCount
+                         ? v57SelectedClearMax
+                         : scalar(0)
+                       )
+                    << endl;
+
+                if( v57SelectedCount > 0 )
+                {
+                    // -------------------------------------------------
+                    // Prefix number of selected old internal faces.
+                    //
+                    // An unsplit old face maps to:
+                    //
+                    //   oldI + 3*(number of selected faces before oldI)
+                    //
+                    // A split face maps to four consecutive positions
+                    // beginning at that same location.
+                    // -------------------------------------------------
+
+                    labelList v57Prefix
+                    (
+                        v57NInternal + 1,
+                        0
+                    );
+
+                    for
+                    (
+                        label faceI=0;
+                        faceI<v57NInternal;
+                        ++faceI
+                    )
+                    {
+                        v57Prefix[faceI+1] =
+                            v57Prefix[faceI]
+                          + (
+                                v57Selected[faceI]
+                              ? label(1)
+                              : label(0)
+                            );
+                    }
+
+                    const label v57NFan =
+                        v57Prefix[v57NInternal];
+
+                    if( v57NFan != v57SelectedCount )
+                    {
+                        refinementValid_ = false;
+
+                        WarningIn
+                        (
+                            "void refineBoundaryLayers::generateNewCells()"
+                        )
+                            << "CFMITCH V5.7a prefix mismatch:"
+                            << " selected=" << v57SelectedCount
+                            << " prefix=" << v57NFan
+                            << endl;
+
+                        return;
+                    }
+
+                    labelList v57OldToNew
+                    (
+                        v57OldFaceCount,
+                        -1
+                    );
+
+                    labelList v57FanBase
+                    (
+                        v57NInternal,
+                        -1
+                    );
+
+                    labelList v57FanPoint
+                    (
+                        v57NInternal,
+                        -1
+                    );
+
+                    // -------------------------------------------------
+                    // Append one fan point per selected quad.
+                    // -------------------------------------------------
+
+                    const label v57NewPointCount =
+                        v57OldPointCount + v57NFan;
+
+                    v57Points.setSize(v57NewPointCount);
+
+                    label v57PointCursor =
+                        v57OldPointCount;
+
+                    for
+                    (
+                        label faceI=0;
+                        faceI<v57NInternal;
+                        ++faceI
+                    )
+                    {
+                        if( !v57Selected[faceI] )
+                            continue;
+
+                        v57FanPoint[faceI] =
+                            v57PointCursor;
+
+                        v57Points[v57PointCursor] =
+                            v57FaceCentres[faceI];
+
+                        ++v57PointCursor;
+                    }
+
+                    if( v57PointCursor != v57NewPointCount )
+                    {
+                        refinementValid_ = false;
+
+                        WarningIn
+                        (
+                            "void refineBoundaryLayers::generateNewCells()"
+                        )
+                            << "CFMITCH V5.7a point allocation mismatch"
+                            << endl;
+
+                        return;
+                    }
+
+                    // -------------------------------------------------
+                    // Establish old -> new face labels.
+                    // -------------------------------------------------
+
+                    for
+                    (
+                        label faceI=0;
+                        faceI<v57NInternal;
+                        ++faceI
+                    )
+                    {
+                        const label base =
+                            faceI
+                          + 3*v57Prefix[faceI];
+
+                        v57OldToNew[faceI] = base;
+
+                        if( v57Selected[faceI] )
+                            v57FanBase[faceI] = base;
+                    }
+
+                    for
+                    (
+                        label faceI=v57NInternal;
+                        faceI<v57OldFaceCount;
+                        ++faceI
+                    )
+                    {
+                        v57OldToNew[faceI] =
+                            faceI + 3*v57NFan;
+                    }
+
+                    const label v57NewInternal =
+                        v57NInternal + 3*v57NFan;
+
+                    const label v57NewFaceCount =
+                        v57OldFaceCount + 3*v57NFan;
+
+                    // -------------------------------------------------
+                    // Resize face array.
+                    //
+                    // Move boundary block first, from the back, so no
+                    // source face is overwritten.
+                    // -------------------------------------------------
+
+                    faces.setSize(v57NewFaceCount);
+
+                    for
+                    (
+                        label oldFaceI=v57OldFaceCount-1;
+                        oldFaceI>=v57NInternal;
+                        --oldFaceI
+                    )
+                    {
+                        const label newFaceI =
+                            v57OldToNew[oldFaceI];
+
+                        if( newFaceI != oldFaceI )
+                        {
+                            faces[newFaceI].transfer
+                            (
+                                faces[oldFaceI]
+                            );
+                        }
+                    }
+
+                    // -------------------------------------------------
+                    // Rebuild internal face block from the back.
+                    // -------------------------------------------------
+
+                    for
+                    (
+                        label oldFaceI=v57NInternal-1;
+                        oldFaceI>=0;
+                        --oldFaceI
+                    )
+                    {
+                        const label newBase =
+                            v57OldToNew[oldFaceI];
+
+                        if( !v57Selected[oldFaceI] )
+                        {
+                            if( newBase != oldFaceI )
+                            {
+                                faces[newBase].transfer
+                                (
+                                    faces[oldFaceI]
+                                );
+                            }
+
+                            continue;
+                        }
+
+                        const face oldFace
+                        (
+                            faces[oldFaceI]
+                        );
+
+                        if( oldFace.size() != 4 )
+                        {
+                            refinementValid_ = false;
+
+                            WarningIn
+                            (
+                                "void refineBoundaryLayers::generateNewCells()"
+                            )
+                                << "CFMITCH V5.7a selected non-quad:"
+                                << " face=" << oldFaceI
+                                << " size=" << oldFace.size()
+                                << endl;
+
+                            return;
+                        }
+
+                        const label x =
+                            v57FanPoint[oldFaceI];
+
+                        // Triangle 0: p0 p1 x
+                        faces[newBase+0].setSize(3);
+                        faces[newBase+0][0] = oldFace[0];
+                        faces[newBase+0][1] = oldFace[1];
+                        faces[newBase+0][2] = x;
+
+                        // Triangle 1: p1 p2 x
+                        faces[newBase+1].setSize(3);
+                        faces[newBase+1][0] = oldFace[1];
+                        faces[newBase+1][1] = oldFace[2];
+                        faces[newBase+1][2] = x;
+
+                        // Triangle 2: p2 p3 x
+                        faces[newBase+2].setSize(3);
+                        faces[newBase+2][0] = oldFace[2];
+                        faces[newBase+2][1] = oldFace[3];
+                        faces[newBase+2][2] = x;
+
+                        // Triangle 3: p3 p0 x
+                        faces[newBase+3].setSize(3);
+                        faces[newBase+3][0] = oldFace[3];
+                        faces[newBase+3][1] = oldFace[0];
+                        faces[newBase+3][2] = x;
+                    }
+
+                    // -------------------------------------------------
+                    // Replace each selected old face by all four sibling
+                    // triangles in every incident cell.
+                    //
+                    // Cell count is unchanged.
+                    // -------------------------------------------------
+
+                    forAll(cells, cellI)
+                    {
+                        const cell oldCell
+                        (
+                            cells[cellI]
+                        );
+
+                        label nSelectedInCell = 0;
+
+                        forAll(oldCell, cfI)
+                        {
+                            const label oldFaceI =
+                                oldCell[cfI];
+
+                            if
+                            (
+                                oldFaceI >= 0
+                             && oldFaceI < v57NInternal
+                             && v57Selected[oldFaceI]
+                            )
+                            {
+                                ++nSelectedInCell;
+                            }
+                        }
+
+                        cell& c =
+                            cells[cellI];
+
+                        c.setSize
+                        (
+                            oldCell.size()
+                          + 3*nSelectedInCell
+                        );
+
+                        label writeI = 0;
+
+                        forAll(oldCell, cfI)
+                        {
+                            const label oldFaceI =
+                                oldCell[cfI];
+
+                            if
+                            (
+                                oldFaceI < 0
+                             || oldFaceI >= v57OldFaceCount
+                            )
+                            {
+                                refinementValid_ = false;
+
+                                WarningIn
+                                (
+                                    "void refineBoundaryLayers::generateNewCells()"
+                                )
+                                    << "CFMITCH V5.7a bad old face ref:"
+                                    << " cell=" << cellI
+                                    << " face=" << oldFaceI
+                                    << endl;
+
+                                return;
+                            }
+
+                            if
+                            (
+                                oldFaceI < v57NInternal
+                             && v57Selected[oldFaceI]
+                            )
+                            {
+                                const label base =
+                                    v57FanBase[oldFaceI];
+
+                                c[writeI++] = base+0;
+                                c[writeI++] = base+1;
+                                c[writeI++] = base+2;
+                                c[writeI++] = base+3;
+                            }
+                            else
+                            {
+                                c[writeI++] =
+                                    v57OldToNew[oldFaceI];
+                            }
+                        }
+
+                        if( writeI != c.size() )
+                        {
+                            refinementValid_ = false;
+
+                            WarningIn
+                            (
+                                "void refineBoundaryLayers::generateNewCells()"
+                            )
+                                << "CFMITCH V5.7a cell rewrite mismatch:"
+                                << " cell=" << cellI
+                                << " expected=" << c.size()
+                                << " wrote=" << writeI
+                                << endl;
+
+                            return;
+                        }
+                    }
+
+                    // -------------------------------------------------
+                    // Existing boundary faces were shifted en bloc by
+                    // +3*nFan.  Patch sizes remain unchanged.
+                    // -------------------------------------------------
+
+                    forAll(boundaries, patchI)
+                    {
+                        boundaries[patchI].patchStart() +=
+                            3*v57NFan;
+                    }
+
+                    // Existing face subsets must follow shifted labels.
+                    // For a split face, the original subset lineage maps
+                    // to the first sibling triangle in V5.7a.
+                    mesh_.updateFaceSubsets(v57OldToNew);
+
+                    // Existing V4.5 gate below checks this value as well.
+                    currFace = faces.size();
+
+                    // Invalidate owner/neighbour/geometric addressing for
+                    // the new point/face/cell topology.
+                    meshModifier.clearAll();
+
+                    Info
+                        << "CFMITCH V5.7a QUAD-FAN APPLY:"
+                        << " applied=" << v57NFan
+                        << " oldPoints=" << v57OldPointCount
+                        << " newPoints=" << v57Points.size()
+                        << " oldFaces=" << v57OldFaceCount
+                        << " newFaces=" << faces.size()
+                        << " oldInternal=" << v57NInternal
+                        << " newInternal=" << v57NewInternal
+                        << " cells=" << cells.size()
+                        << " expectedFaceDelta=" << 3*v57NFan
+                        << " expectedPointDelta=" << v57NFan
+                        << endl;
+                }
+                else
+                {
+                    // We invalidated addressing before selection.
+                    // No topology changed, but leave caches clean.
+                    meshModifier.clearAll();
+                }
+            }
+        }
+    }
+
     // REFINE_POST_RELABEL_CLOSURE_AUDIT
     // Diagnostic only. At this point cells reference the reconstructed
     // mesh face list, so test the actual committed cell shells.
@@ -7520,6 +11042,31 @@ void refineBoundaryLayers::generateNewCells()
     # endif
 
     //- delete all adressing which is no longer up-to-date
+
+    Info
+        << "CFMITCH V10I TYPE2 BIRTH SUMMARY:"
+        << " invocation=" << v10iInvocation
+        << " file=" << v10iCsvName
+        << " parents=" << v10iType2Parents
+        << " children=" << v10iType2Children
+        << " finalCells=" << cells.size()
+        << endl;
+
+    Info
+        << "CFMITCH V10J TYPE1 CROSS_PATCH SUMMARY:"
+        << " invocation=" << v10iInvocation
+        << " file=" << v10jCsvName
+        << " originalInterfaces="
+        << v10jCrossPatchOriginalFaces
+        << " originalParents="
+        << v10jCrossPatchOriginalParents.size()
+        << " recordedParents="
+        << v10jRecordedParents
+        << " recordedChildren="
+        << v10jRecordedChildren
+        << " finalCells="
+        << cells.size()
+        << endl;
 
     // ==================================================================
     // CFMITCH V4.5 FINAL FACE-INCIDENCE GATE
@@ -10526,6 +14073,7 @@ void refineBoundaryLayers::generateNewCells()
                                 // rejectReason and all acceptance logic
                                 // remain unchanged.
 
+                                (void)rejectReason;
                                 continue;
                             }
 
@@ -14186,6 +17734,7 @@ void refineBoundaryLayers::generateNewCells()
                                         }
 
 
+                                        (void)rejectFace;
                                         if( !ofSafe )
                                         {
                                             if

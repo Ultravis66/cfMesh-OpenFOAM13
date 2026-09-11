@@ -3472,9 +3472,6 @@ void meshSurfaceMapper::mapEdgeNodes
             bool createsNewNeg = false;
             bool repairsNeg = false;
 
-            const label nIncidentCells =
-                probePointCells.sizeOfRow(globalPtI);
-
             forAllRow(probePointCells, globalPtI, pcI)
             {
                 const label cellI =

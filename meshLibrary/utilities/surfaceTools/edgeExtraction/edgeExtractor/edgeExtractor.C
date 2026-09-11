@@ -1555,9 +1555,7 @@ bool edgeExtractor::checkConcaveEdgeCells()
                         DynList<DynList<label>, 2> facesInPatch;
                         facesInPatch.setSize(2);
 
-                        DynList<label, 2> nFacesInPatch;
-                        nFacesInPatch.setSize(2);
-                        nFacesInPatch = 0;
+                        label nFacesInPatch[2] = {0, 0};
 
                         DynList<bool, 2> hasPatchPoints;
                         hasPatchPoints.setSize(2);

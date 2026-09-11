@@ -66,22 +66,24 @@ refineBoundaryLayers::refineBoundaryLayers(polyMeshGen& mesh)
     constraintPlannerMaxLayerStep_(2),
     cfmitchV52aFrontCensus_(false),
     cfmitchV52bApplyFrontCaps_(false),
+    cfmitchV57QuadFanEscape_(false),
+    cfmitchV10KCrossPatchLayerSync_(false),
     nLayersAtBndFace_(),
     cellToBaseBndFace_(),
     qualityMaxLayersAtFace_(),
-    splitEdges_(),
-    splitEdgesAtPoint_(),
-    newVerticesForSplitEdge_(),
-    facesFromFace_(),
-    newFaces_(),
-    acuteCornerCapLayers_(false),
     gapActionPoints_(),
     gapLoserPatchNames_(),
     gapRing1MaxLayers_(1),
     gapRing2MaxLayers_(2),
     blTerminationEdgePoints_(),
     blTerminationRing1MaxLayers_(3),
-    blTerminationRing2MaxLayers_(3)
+    blTerminationRing2MaxLayers_(3),
+    acuteCornerCapLayers_(false),
+    splitEdges_(),
+    splitEdgesAtPoint_(),
+    newVerticesForSplitEdge_(),
+    facesFromFace_(),
+    newFaces_()
 {}
 
 // * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
@@ -528,6 +530,38 @@ void refineBoundaryLayers::readSettings
             if( refLayers.cfmitchV52bApplyFrontCaps_ )
                 refLayers.cfmitchV52aFrontCensus_ = true;
         }
+
+        if( bndLayers.found("cfmitchV57QuadFanEscape") )
+        {
+            refLayers.cfmitchV57QuadFanEscape_ =
+                bool
+                (
+                    Switch
+                    (
+                        bndLayers.lookup
+                        (
+                            "cfmitchV57QuadFanEscape"
+                        )
+                    )
+                );
+        }
+
+        if( bndLayers.found("cfmitchV10KCrossPatchLayerSync") )
+        {
+            refLayers.cfmitchV10KCrossPatchLayerSync_ =
+                bool
+                (
+                    Switch
+                    (
+                        bndLayers.lookup
+                        (
+                            "cfmitchV10KCrossPatchLayerSync"
+                        )
+                    )
+                );
+        }
+
+
 
         //- read global properties
         if( bndLayers.found("nLayers") )

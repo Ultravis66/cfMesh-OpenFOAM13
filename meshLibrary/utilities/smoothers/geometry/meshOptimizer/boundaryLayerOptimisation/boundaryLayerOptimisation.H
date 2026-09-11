@@ -279,6 +279,11 @@ public:
         //- boundary faces where the layers exit at the boundary
         const boolList& isExitFace() const;
 
+        //- CFMitch V6.0b: smooth hair directions only.
+        //  No thickness optimisation and no surface optimisation.
+        //  Hair roots remain fixed and each hair keeps its current length.
+        void optimiseHairNormalsOnly();
+
         //- performs boundary layer optimisation
         void optimiseLayer();
 

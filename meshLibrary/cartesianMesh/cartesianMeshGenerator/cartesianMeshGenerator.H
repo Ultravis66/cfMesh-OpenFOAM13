@@ -96,6 +96,21 @@ class cartesianMeshGenerator
         // Keys are stable mesh-point labels, not boundary-point indices.
         Map<scalar> blNeutralLayerScaleAtMeshPoint_;
 
+        // ========================================================
+        // CFMITCH stable macro-BL lineage.
+        //
+        // Unlike blNeutralEdgePoints_ these are GLOBAL mesh-point
+        // labels and therefore survive boundary-point readdressing.
+        //
+        // base -> top is the exact macro extrusion pair.
+        // ========================================================
+
+        labelHashSet blNeutralBaseMeshPoints_;
+
+        Map<label> blNeutralBaseWallPatchAtMeshPoint_;
+
+        Map<label> blMacroTopForBaseMeshPoint_;
+
         //- BL/no-BL transition edge points (boundary-point indices)
         //- passed from boundaryLayers to post-BL mapper instances
         //- to exclude from generic nearest-surface projection

@@ -566,6 +566,44 @@ bool boundaryLayerOptimisation::optimiseLayersAtExittingFaces()
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// ============================================================
+// CFMITCH V6.0b NORMAL-ONLY
+//
+// Reuse Franjo's coupled hair-neighbour graph and normal smoothing,
+// but deliberately bypass:
+//
+//   optimiseThicknessVariation()
+//   meshSurfaceOptimizer::optimizeSurface()
+//
+// Therefore this mode may rotate hair vectors but does not
+// deliberately modify their lengths or move the boundary surface.
+// ============================================================
+
+void boundaryLayerOptimisation::optimiseHairNormalsOnly()
+{
+    Info
+        << "CFMITCH V6.0b NORMAL-ONLY:"
+        << " smoothing boundary hair directions"
+        << endl;
+
+    optimiseHairNormalsAtTheBoundary();
+
+    Info
+        << "CFMITCH V6.0b NORMAL-ONLY:"
+        << " smoothing internal hair directions"
+        << endl;
+
+    optimiseHairNormalsInside();
+
+    Info
+        << "CFMITCH V6.0b NORMAL-ONLY:"
+        << " finished"
+        << endl;
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
 void boundaryLayerOptimisation::optimiseLayer()
 {
     //- create surface smoother

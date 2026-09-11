@@ -66,7 +66,6 @@ void boundaryLayers::createLayerCells(const labelList& patchLabels)
     const labelList& faceOwners = mse.faceOwners();
     const labelList& bp = mse.bp();
     const VRWGraph& pointFaces = mse.pointFaces();
-    const pointFieldPMG& points = mesh_.points();
 
     const meshSurfacePartitioner& mPart = surfacePartitioner();
     const VRWGraph& pointPatches = mPart.pointPatches();
@@ -160,7 +159,7 @@ void boundaryLayers::createLayerCells(const labelList& patchLabels)
     boolList faceReducible(bFaces.size(), false);
     boolList triangleBypassFace(bFaces.size(), false);
     label nEdgeQuad=0,nEdgeDrop=0,nEdgeTriangle=0,nEdgeUnsafe=0;
-    label nFaceReduce=0,nFaceFallbackTri=0,nFaceFallbackUnsafe=0;
+    label nFaceReduce=0,nFaceFallbackUnsafe=0;
     label nAsymStitchCandidate=0; // diagnostic only -- not yet acted upon
 
     const bool enableReducedCellTopology =
@@ -294,13 +293,11 @@ void boundaryLayers::createLayerCells(const labelList& patchLabels)
                 DynList<label> topNei;
                 buildTopFaceTP(fNei, neiPatchIA, topNei);
                 DynList<label> sfNei;
-                label nt0Outer = -1, nt1Outer = -1;
                 forAll(fNei, pN)
                 {
                     const label nb0=fNei[pN], nb1=fNei.nextLabel(pN);
                     if(!((nb0==b0&&nb1==b1)||(nb0==b1&&nb1==b0))) continue;
                     const label nt0=topNei[pN], nt1=topNei[(pN+1)%fNei.size()];
-                    nt0Outer = nt0; nt1Outer = nt1;
                     buildSideFaceTP(nb0,nb1,nt0,nt1,sfNei);
                     break;
                 }

@@ -257,7 +257,6 @@ void decomposeCells::decomposeMesh(const boolList& decomposeCell)
 
 
     const cellListPMG& cells = mesh_.cells();
-    const faceListPMG& faces = mesh_.faces();
 
     const labelList& owner = mesh_.owner();
     const labelList& neighbour = mesh_.neighbour();

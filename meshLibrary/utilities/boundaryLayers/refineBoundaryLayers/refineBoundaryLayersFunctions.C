@@ -651,6 +651,232 @@ bool refineBoundaryLayers::analyseLayers()
              << " faces capped" << endl;
     }
 
+    // ============================================================
+    // CFMITCH V8A NEUTRAL SEAM LAYER BACKOFF
+    //
+    // Preserve the macro hair and first-layer thickness.
+    //
+    // Only reduce the requested OUTER layer count on active BL
+    // boundary faces touching a stable BL/neutral seam point.
+    //
+    // No coordinates are changed.
+    // No h1 values are changed.
+    // No faces or cells are deleted.
+    // No neutral/no-BL face is reactivated.
+    //
+    // The resulting caps enter the existing canonical
+    // forcedMaxLayersAtFace_ -> constraintPlanner path.
+    // ============================================================
+
+    if( !neutralSeamBackoffMeshPoints_.empty() )
+    {
+        if( neutralSeamBackoffMaxLayers_ < 1 )
+        {
+            FatalErrorIn
+            (
+                "refineBoundaryLayers::analyseLayers()"
+            )
+                << "CFMITCH V8A neutral seam max layers must be >= 1"
+                << exit(FatalError);
+        }
+
+
+        const meshSurfaceEngine& seamMse =
+            surfaceEngine();
+
+        const labelList& seamBoundaryPoints =
+            seamMse.boundaryPoints();
+
+        const VRWGraph& seamPointFaces =
+            seamMse.pointFaces();
+
+
+        // global mesh-point label -> CURRENT boundary-point index
+        labelList seamMeshToBp
+        (
+            mesh_.points().size(),
+            -1
+        );
+
+        forAll(seamBoundaryPoints, bpI)
+        {
+            const label meshPtI =
+                seamBoundaryPoints[bpI];
+
+            if
+            (
+                meshPtI >= 0
+             && meshPtI < label(seamMeshToBp.size())
+            )
+            {
+                seamMeshToBp[meshPtI] =
+                    bpI;
+            }
+        }
+
+
+        labelHashSet seamSeedFaces;
+
+        label nMappedPoints = 0;
+        label nMissingPoints = 0;
+        label nInactiveFaces = 0;
+        label nOutOfRangeFaces = 0;
+
+
+        forAllConstIter
+        (
+            labelHashSet,
+            neutralSeamBackoffMeshPoints_,
+            seamIt
+        )
+        {
+            const label meshPtI =
+                seamIt.key();
+
+
+            if
+            (
+                meshPtI < 0
+             || meshPtI >= label(seamMeshToBp.size())
+            )
+            {
+                ++nMissingPoints;
+                continue;
+            }
+
+
+            const label bpI =
+                seamMeshToBp[meshPtI];
+
+
+            if
+            (
+                bpI < 0
+             || bpI >= label(seamPointFaces.size())
+            )
+            {
+                ++nMissingPoints;
+                continue;
+            }
+
+
+            ++nMappedPoints;
+
+
+            forAllRow(seamPointFaces, bpI, pfI)
+            {
+                const label bfI =
+                    seamPointFaces(bpI, pfI);
+
+
+                if
+                (
+                    bfI < 0
+                 || bfI >= label(nLayersAtBndFace_.size())
+                )
+                {
+                    ++nOutOfRangeFaces;
+                    continue;
+                }
+
+
+                // Only ACTIVE BL faces participate.
+                //
+                // Neutral/termination/no-BL faces are already at one
+                // layer and must remain untouched.
+                if( nLayersAtBndFace_[bfI] <= 1 )
+                {
+                    ++nInactiveFaces;
+                    continue;
+                }
+
+
+                seamSeedFaces.insert(bfI);
+            }
+        }
+
+
+        label nInserted = 0;
+        label nLoweredExisting = 0;
+        label nKeptStricter = 0;
+
+
+        forAllConstIter
+        (
+            labelHashSet,
+            seamSeedFaces,
+            faceIt
+        )
+        {
+            const label bfI =
+                faceIt.key();
+
+
+            if( forcedMaxLayersAtFace_.found(bfI) )
+            {
+                const label oldCap =
+                    forcedMaxLayersAtFace_[bfI];
+
+
+                if
+                (
+                    neutralSeamBackoffMaxLayers_
+                  < oldCap
+                )
+                {
+                    forcedMaxLayersAtFace_[bfI] =
+                        neutralSeamBackoffMaxLayers_;
+
+                    ++nLoweredExisting;
+                }
+                else
+                {
+                    // Another subsystem already requested an equal
+                    // or stricter cap. Preserve the stricter policy.
+                    ++nKeptStricter;
+                }
+            }
+            else
+            {
+                forcedMaxLayersAtFace_.insert
+                (
+                    bfI,
+                    neutralSeamBackoffMaxLayers_
+                );
+
+                ++nInserted;
+            }
+        }
+
+
+        Info
+            << "CFMITCH V8A NEUTRAL_SEAM_BACKOFF:"
+            << " seamPoints="
+            << neutralSeamBackoffMeshPoints_.size()
+            << " mappedPoints="
+            << nMappedPoints
+            << " missingPoints="
+            << nMissingPoints
+            << " seedFaces="
+            << seamSeedFaces.size()
+            << " inactiveFaces="
+            << nInactiveFaces
+            << " outOfRangeFaces="
+            << nOutOfRangeFaces
+            << " cap="
+            << neutralSeamBackoffMaxLayers_
+            << " inserted="
+            << nInserted
+            << " loweredExisting="
+            << nLoweredExisting
+            << " keptStricter="
+            << nKeptStricter
+            << " forcedFaceTotal="
+            << forcedMaxLayersAtFace_.size()
+            << endl;
+    }
+
+
     // Provenance/junction BL retraction: cap selected boundary faces to
     // a maximum layer count. Generalizes the old binary
     // forceSingleLayerFaces_ logic into a tapered ring cap.
@@ -1865,6 +2091,686 @@ void refineBoundaryLayers::generateNewVertices()
 
         Info << endl;
 
+    }
+
+
+    // ==================================================================
+    // CFMITCH V10K CROSS-PATCH TYPE1 LAYER SYNC
+    //
+    // Production-architecture experiment.
+    //
+    // V10J proved that the surviving Rotor37 internal-skew family is born
+    // where independently refined refType-1 BL parents from different wall
+    // patches meet through an ORIGINAL internal lateral face with unequal
+    // nLayersAtBndFace_.
+    //
+    // The downstream topology is deterministic:
+    //
+    //   - nLayersAtEdge takes the maximum demand from touching BL faces;
+    //   - internal lateral quads likewise use max(nSplits0,nSplits1);
+    //   - generateNewCellsPrism() clamps excess derived side faces onto
+    //     local child zero.
+    //
+    // Therefore an unequal terminal layer count at this particular
+    // interface produces the complex terminal polyhedron by construction.
+    //
+    // Reproduce the exact V10J refType definition here, BEFORE split-edge
+    // depth is derived:
+    //
+    //     refType[cell] =
+    //         number of owned boundary faces having nLayers > 1
+    //
+    // An original internal face is a cross-patch type1/type1 seam iff:
+    //
+    //     refType[owner] == 1
+    //     refType[neighbour] == 1
+    //     patch(ownerBaseFace) != patch(neighbourBaseFace)
+    //
+    // For eligible seams enforce equality monotonically downward.  Every
+    // seam participating in a mismatch also seeds the existing-style +2
+    // same-patch recovery constraint.  Equality and recovery are iterated
+    // to a fixed point because a propagated reduction can reach another
+    // cross-patch seam.
+    //
+    // Existing virtual-topology faces remain authoritative and are counted
+    // but excluded from modification.
+    //
+    // Disabled by default.
+    // ==================================================================
+
+    if
+    (
+        cfmitchPlanner.plannerEnabled()
+     && cfmitchV10KCrossPatchLayerSync_
+     && !specialMode_
+    )
+    {
+        const labelList& v10kBoundaryOwners =
+            mse.faceOwners();
+
+        const labelList& v10kOwner =
+            mesh_.owner();
+
+        const labelList& v10kNeighbour =
+            mesh_.neighbour();
+
+        labelList v10kRefType
+        (
+            mesh_.cells().size(),
+            0
+        );
+
+        labelList v10kCellToBfI
+        (
+            mesh_.cells().size(),
+            -1
+        );
+
+        // --------------------------------------------------------------
+        // Reproduce generateNewCells() refType/cellToBfI exactly.
+        // --------------------------------------------------------------
+        forAll(v10kBoundaryOwners, bfI)
+        {
+            if
+            (
+                bfI < 0
+             || bfI >= label(nLayersAtBndFace_.size())
+            )
+                continue;
+
+            const label cellI =
+                v10kBoundaryOwners[bfI];
+
+            if
+            (
+                cellI < 0
+             || cellI >= label(v10kRefType.size())
+            )
+                continue;
+
+            if( nLayersAtBndFace_[bfI] > 1 )
+            {
+                ++v10kRefType[cellI];
+
+                if( v10kCellToBfI[cellI] < 0 )
+                    v10kCellToBfI[cellI] = bfI;
+            }
+        }
+
+        // Store the exact original internal interface pairs.
+        labelLongList v10kPairBf0;
+        labelLongList v10kPairBf1;
+        labelLongList v10kPairEligible;
+
+        label v10kCandidateInterfaces = 0;
+        label v10kProtectedInterfaces = 0;
+        label v10kUnequalBefore = 0;
+        label v10kEligibleUnequalBefore = 0;
+
+        label v10kDelta2 = 0;
+        label v10kDelta4 = 0;
+        label v10kDelta6 = 0;
+        label v10kDelta8 = 0;
+        label v10kDeltaOther = 0;
+
+        label v10kMaxDeltaBefore = 0;
+        label v10kMaxLayerBefore = 1;
+
+        forAll(nLayersAtBndFace_, bfI)
+        {
+            v10kMaxLayerBefore =
+                Foam::max
+                (
+                    v10kMaxLayerBefore,
+                    nLayersAtBndFace_[bfI]
+                );
+        }
+
+        for
+        (
+            label faceI=0;
+            faceI<label(v10kNeighbour.size());
+            ++faceI
+        )
+        {
+            if( faceI >= label(v10kOwner.size()) )
+                continue;
+
+            const label own =
+                v10kOwner[faceI];
+
+            const label nei =
+                v10kNeighbour[faceI];
+
+            if
+            (
+                own < 0
+             || nei < 0
+             || own >= label(v10kRefType.size())
+             || nei >= label(v10kRefType.size())
+            )
+                continue;
+
+            if
+            (
+                v10kRefType[own] != 1
+             || v10kRefType[nei] != 1
+            )
+                continue;
+
+            const label bf0 =
+                v10kCellToBfI[own];
+
+            const label bf1 =
+                v10kCellToBfI[nei];
+
+            if
+            (
+                bf0 < 0
+             || bf1 < 0
+             || bf0 >= label(nLayersAtBndFace_.size())
+             || bf1 >= label(nLayersAtBndFace_.size())
+             || bf0 >= label(facePatch.size())
+             || bf1 >= label(facePatch.size())
+            )
+                continue;
+
+            if( facePatch[bf0] == facePatch[bf1] )
+                continue;
+
+            ++v10kCandidateInterfaces;
+
+            const label n0 =
+                nLayersAtBndFace_[bf0];
+
+            const label n1 =
+                nLayersAtBndFace_[bf1];
+
+            const label delta =
+                (n0 >= n1) ? n0-n1 : n1-n0;
+
+            if( delta > 0 )
+            {
+                ++v10kUnequalBefore;
+
+                v10kMaxDeltaBefore =
+                    Foam::max
+                    (
+                        v10kMaxDeltaBefore,
+                        delta
+                    );
+
+                if( delta == 2 )
+                    ++v10kDelta2;
+                else if( delta == 4 )
+                    ++v10kDelta4;
+                else if( delta == 6 )
+                    ++v10kDelta6;
+                else if( delta == 8 )
+                    ++v10kDelta8;
+                else
+                    ++v10kDeltaOther;
+            }
+
+            bool protectedInterface = false;
+
+            if
+            (
+                bf0 < label(vtFaceRing_.size())
+             && vtFaceRing_[bf0] >= 0
+            )
+            {
+                protectedInterface = true;
+            }
+
+            if
+            (
+                bf1 < label(vtFaceRing_.size())
+             && vtFaceRing_[bf1] >= 0
+            )
+            {
+                protectedInterface = true;
+            }
+
+            if( protectedInterface )
+            {
+                ++v10kProtectedInterfaces;
+            }
+            else if( delta > 0 )
+            {
+                ++v10kEligibleUnequalBefore;
+            }
+
+            v10kPairBf0.append(bf0);
+            v10kPairBf1.append(bf1);
+            v10kPairEligible.append
+            (
+                protectedInterface ? label(0) : label(1)
+            );
+        }
+
+        const labelList v10kLayersBeforeSync
+        (
+            nLayersAtBndFace_
+        );
+
+        boolList v10kFrontier
+        (
+            nLayersAtBndFace_.size(),
+            false
+        );
+
+        boolList v10kSeamLoweredFace
+        (
+            nLayersAtBndFace_.size(),
+            false
+        );
+
+        boolList v10kRampAdjustedFace
+        (
+            nLayersAtBndFace_.size(),
+            false
+        );
+
+        label v10kEqualityPairUpdates = 0;
+        label v10kEqualityFaceUpdates = 0;
+        label v10kUniqueSeamFacesLowered = 0;
+
+        label v10kRampUpdates = 0;
+        label v10kUniqueRampFacesAdjusted = 0;
+
+        label v10kFixedPointPasses = 0;
+
+        // A deliberately generous finite guard.  The solve is monotonic:
+        // every legal update lowers an integer count bounded below by 1.
+        const label v10kMaxPasses =
+            Foam::max
+            (
+                label(32),
+                label(v10kPairBf0.size())
+              + v10kMaxLayerBefore
+              + label(4)
+            );
+
+        bool v10kConverged = false;
+
+        for
+        (
+            label solvePass=0;
+            solvePass<v10kMaxPasses;
+            ++solvePass
+        )
+        {
+            ++v10kFixedPointPasses;
+
+            bool changedThisPass = false;
+
+            // ----------------------------------------------------------
+            // Equality constraints on actual type1/type1 cross-patch
+            // original internal interfaces.
+            // ----------------------------------------------------------
+            forAll(v10kPairBf0, pairI)
+            {
+                if( !v10kPairEligible[pairI] )
+                    continue;
+
+                const label bf0 =
+                    v10kPairBf0[pairI];
+
+                const label bf1 =
+                    v10kPairBf1[pairI];
+
+                const label n0 =
+                    nLayersAtBndFace_[bf0];
+
+                const label n1 =
+                    nLayersAtBndFace_[bf1];
+
+                if( n0 == n1 )
+                    continue;
+
+                const label target =
+                    Foam::min(n0, n1);
+
+                ++v10kEqualityPairUpdates;
+
+                if( nLayersAtBndFace_[bf0] > target )
+                {
+                    nLayersAtBndFace_[bf0] =
+                        target;
+
+                    ++v10kEqualityFaceUpdates;
+
+                    if( !v10kSeamLoweredFace[bf0] )
+                    {
+                        v10kSeamLoweredFace[bf0] =
+                            true;
+
+                        ++v10kUniqueSeamFacesLowered;
+                    }
+                }
+
+                if( nLayersAtBndFace_[bf1] > target )
+                {
+                    nLayersAtBndFace_[bf1] =
+                        target;
+
+                    ++v10kEqualityFaceUpdates;
+
+                    if( !v10kSeamLoweredFace[bf1] )
+                    {
+                        v10kSeamLoweredFace[bf1] =
+                            true;
+
+                        ++v10kUniqueSeamFacesLowered;
+                    }
+                }
+
+                // Seed BOTH sides of the seam.  The already-short side
+                // must also have a smooth same-patch recovery away from
+                // the newly authoritative equal-count interface.
+                v10kFrontier[bf0] = true;
+                v10kFrontier[bf1] = true;
+
+                changedThisPass = true;
+            }
+
+            // ----------------------------------------------------------
+            // One same-patch +2 propagation ring.
+            //
+            // This deliberately follows the existing compatibility-ramp
+            // adjacency: boundary faces sharing a boundary point, same
+            // patch only, with VT-protected targets skipped.
+            // ----------------------------------------------------------
+            const labelList layersBeforePass
+            (
+                nLayersAtBndFace_
+            );
+
+            boolList nextFrontier
+            (
+                nLayersAtBndFace_.size(),
+                false
+            );
+
+            forAll(v10kFrontier, bfI)
+            {
+                if( !v10kFrontier[bfI] )
+                    continue;
+
+                if
+                (
+                    bfI < 0
+                 || bfI >= label(bFaces.size())
+                 || bfI >= label(facePatch.size())
+                )
+                    continue;
+
+                const label sourcePatch =
+                    facePatch[bfI];
+
+                const label sourceLayers =
+                    layersBeforePass[bfI];
+
+                const label neighbourCap =
+                    sourceLayers + 2;
+
+                const face& f =
+                    bFaces[bfI];
+
+                forAll(f, fpI)
+                {
+                    const label meshPtI =
+                        f[fpI];
+
+                    if
+                    (
+                        meshPtI < 0
+                     || meshPtI >= label(bp.size())
+                    )
+                        continue;
+
+                    const label bpI =
+                        bp[meshPtI];
+
+                    if
+                    (
+                        bpI < 0
+                     || bpI >= label(pointFaces.size())
+                    )
+                        continue;
+
+                    forAllRow(pointFaces, bpI, pfI)
+                    {
+                        const label nbfI =
+                            pointFaces(bpI, pfI);
+
+                        if
+                        (
+                            nbfI < 0
+                         || nbfI >=
+                            label(nLayersAtBndFace_.size())
+                         || nbfI >= label(facePatch.size())
+                         || nbfI == bfI
+                        )
+                            continue;
+
+                        if
+                        (
+                            facePatch[nbfI]
+                         != sourcePatch
+                        )
+                            continue;
+
+                        // Preserve existing VT authority.
+                        if
+                        (
+                            nbfI < label(vtFaceRing_.size())
+                         && vtFaceRing_[nbfI] >= 0
+                        )
+                            continue;
+
+                        if
+                        (
+                            layersBeforePass[nbfI]
+                         <= neighbourCap
+                        )
+                            continue;
+
+                        if
+                        (
+                            nLayersAtBndFace_[nbfI]
+                         > neighbourCap
+                        )
+                        {
+                            nLayersAtBndFace_[nbfI] =
+                                neighbourCap;
+
+                            nextFrontier[nbfI] =
+                                true;
+
+                            ++v10kRampUpdates;
+
+                            if
+                            (
+                                !v10kRampAdjustedFace[nbfI]
+                            )
+                            {
+                                v10kRampAdjustedFace[nbfI] =
+                                    true;
+
+                                ++v10kUniqueRampFacesAdjusted;
+                            }
+
+                            changedThisPass = true;
+                        }
+                    }
+                }
+            }
+
+            v10kFrontier.transfer
+            (
+                nextFrontier
+            );
+
+            if( !changedThisPass )
+            {
+                v10kConverged = true;
+                break;
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Final constraint audit.
+        // --------------------------------------------------------------
+        label v10kUnequalAfter = 0;
+        label v10kEligibleUnequalAfter = 0;
+        label v10kProtectedUnequalAfter = 0;
+        label v10kMaxDeltaAfter = 0;
+
+        forAll(v10kPairBf0, pairI)
+        {
+            const label bf0 =
+                v10kPairBf0[pairI];
+
+            const label bf1 =
+                v10kPairBf1[pairI];
+
+            const label n0 =
+                nLayersAtBndFace_[bf0];
+
+            const label n1 =
+                nLayersAtBndFace_[bf1];
+
+            const label delta =
+                (n0 >= n1) ? n0-n1 : n1-n0;
+
+            if( delta <= 0 )
+                continue;
+
+            ++v10kUnequalAfter;
+
+            v10kMaxDeltaAfter =
+                Foam::max
+                (
+                    v10kMaxDeltaAfter,
+                    delta
+                );
+
+            if( v10kPairEligible[pairI] )
+                ++v10kEligibleUnequalAfter;
+            else
+                ++v10kProtectedUnequalAfter;
+        }
+
+        label v10kTotalLayerReduction = 0;
+        label v10kChangedFaces = 0;
+        label v10kMinFinalActiveLayers = labelMax;
+
+        forAll(nLayersAtBndFace_, bfI)
+        {
+            if
+            (
+                nLayersAtBndFace_[bfI]
+             < v10kLayersBeforeSync[bfI]
+            )
+            {
+                ++v10kChangedFaces;
+
+                v10kTotalLayerReduction +=
+                    v10kLayersBeforeSync[bfI]
+                  - nLayersAtBndFace_[bfI];
+            }
+
+            if( nLayersAtBndFace_[bfI] > 1 )
+            {
+                v10kMinFinalActiveLayers =
+                    Foam::min
+                    (
+                        v10kMinFinalActiveLayers,
+                        nLayersAtBndFace_[bfI]
+                    );
+            }
+        }
+
+        if( v10kMinFinalActiveLayers == labelMax )
+            v10kMinFinalActiveLayers = 0;
+
+        Info
+            << "CFMITCH V10K CROSS_PATCH_SYNC:"
+            << " candidateInterfaces="
+            << v10kCandidateInterfaces
+            << " protectedInterfaces="
+            << v10kProtectedInterfaces
+            << " unequalBefore="
+            << v10kUnequalBefore
+            << " eligibleUnequalBefore="
+            << v10kEligibleUnequalBefore
+            << " maxDeltaBefore="
+            << v10kMaxDeltaBefore
+            << " delta2="
+            << v10kDelta2
+            << " delta4="
+            << v10kDelta4
+            << " delta6="
+            << v10kDelta6
+            << " delta8="
+            << v10kDelta8
+            << " deltaOther="
+            << v10kDeltaOther
+            << " equalityPairUpdates="
+            << v10kEqualityPairUpdates
+            << " equalityFaceUpdates="
+            << v10kEqualityFaceUpdates
+            << " seamFacesLowered="
+            << v10kUniqueSeamFacesLowered
+            << " rampAdjustedFaces="
+            << v10kUniqueRampFacesAdjusted
+            << " rampUpdates="
+            << v10kRampUpdates
+            << " fixedPointPasses="
+            << v10kFixedPointPasses
+            << " maxPasses="
+            << v10kMaxPasses
+            << " changedFaces="
+            << v10kChangedFaces
+            << " totalLayerReduction="
+            << v10kTotalLayerReduction
+            << " minFinalActiveLayers="
+            << v10kMinFinalActiveLayers
+            << " unequalAfter="
+            << v10kUnequalAfter
+            << " eligibleUnequalAfter="
+            << v10kEligibleUnequalAfter
+            << " protectedUnequalAfter="
+            << v10kProtectedUnequalAfter
+            << " maxDeltaAfter="
+            << v10kMaxDeltaAfter
+            << " converged="
+            << v10kConverged
+            << endl;
+
+        if
+        (
+            !v10kConverged
+         || v10kEligibleUnequalAfter != 0
+        )
+        {
+            refinementValid_ = false;
+
+            FatalErrorIn
+            (
+                "refineBoundaryLayers::generateNewVertices()"
+            )
+                << "CFMITCH V10K cross-patch layer synchronization "
+                << "failed to reach its fixed-point constraints."
+                << " converged=" << v10kConverged
+                << " eligibleUnequalAfter="
+                << v10kEligibleUnequalAfter
+                << " passes=" << v10kFixedPointPasses
+                << " maxPasses=" << v10kMaxPasses
+                << exit(FatalError);
+        }
     }
 
     //- count the number of vertices for each split edge

@@ -74,6 +74,9 @@ class labelledPoint
             coords_(p)
         {}
             
+    //- Copy construct
+    labelledPoint(const labelledPoint&) = default;
+
     // Destructor
         ~labelledPoint()
         {}

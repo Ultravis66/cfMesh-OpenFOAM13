@@ -73,6 +73,9 @@ public:
         //- contruct from stream
         patchRefinement(Istream&);
 
+    //- Copy construct
+    patchRefinement(const patchRefinement&) = default;
+
     // Destructor
 
         ~patchRefinement();

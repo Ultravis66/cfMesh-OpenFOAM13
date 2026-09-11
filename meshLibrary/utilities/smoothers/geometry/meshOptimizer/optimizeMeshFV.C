@@ -448,6 +448,67 @@ void meshOptimizer::untangleMeshFV
 
     } while( nBadFaces );
 
+    // ================================================================
+    // CFMITCH V5.1g UNTANGLE FINAL BEST RESTORE
+    //
+    // V5.1f preserved relaxedBestPoints whenever the relaxed defect
+    // count decreased, but only restored them after an explicit
+    // regression.  Equal-count states (e.g. 8 -> 8) were allowed to
+    // continue modifying the mesh, and normal function exit returned
+    // the LAST state rather than the BEST saved state.
+    //
+    // For relaxed untangling, always finish from the best point state
+    // actually observed.  Then rebuild the bad-face set so downstream
+    // diagnostics/subsets describe that restored geometry.
+    // ================================================================
+    if( relaxedCheck && relaxedBestValid )
+    {
+        pointFieldPMG& pts = mesh_.points();
+
+        if( pts.size() != relaxedBestPoints.size() )
+        {
+            FatalErrorIn("meshOptimizer::untangleMeshFV")
+                << "V5.1g best-state point count mismatch: current="
+                << pts.size()
+                << " saved="
+                << relaxedBestPoints.size()
+                << abort(FatalError);
+        }
+
+        forAll(pts, pointI)
+            pts[pointI] = relaxedBestPoints[pointI];
+
+        mesh_.clearAddressingData();
+
+        changedFace = true;
+        badFaces.clear();
+
+        nBadFaces =
+            polyMeshGenChecks::findBadFacesRelaxed
+            (
+                mesh_,
+                badFaces,
+                false,
+                &changedFace
+            );
+
+        Info
+            << "CFMITCH V5.1g UNTANGLE FINAL BEST RESTORE:"
+            << " restoredBadFaces=" << nBadFaces
+            << " expectedBest=" << relaxedBestBadFaces
+            << " restoredPoints=" << pts.size()
+            << endl;
+
+        if( nBadFaces != relaxedBestBadFaces )
+        {
+            FatalErrorIn("meshOptimizer::untangleMeshFV")
+                << "V5.1g final best-state restoration mismatch: "
+                << "expected " << relaxedBestBadFaces
+                << " bad faces, found " << nBadFaces
+                << abort(FatalError);
+        }
+    }
+
     if( nBadFaces != 0 )
     {
         label subsetId = mesh_.faceSubsetIndex("badFaces");
@@ -875,6 +936,130 @@ void meshOptimizer::optimizeLowQualityFaces(const label maxNumIterations)
 
     } while( ++nIter < maxNumIterations );
 }
+
+// CFMitch V6.1 -- explicitly selected-face local optimiser.
+//
+// This is deliberately separate from optimizeLowQualityFaces().
+//
+// The legacy path first calls polyMeshGenChecks::findLowQualityFaces(),
+// which can produce a very large population unrelated to the exact
+// OpenFOAM failure population.  Its existing >500-face safety guard
+// remains unchanged.
+//
+// This entry point consumes only the face set supplied by the caller.
+// Candidate acceptance/rollback remains the caller's responsibility.
+void meshOptimizer::optimizeSelectedFaces
+(
+    const labelHashSet& selectedFaces,
+    const label maxNumIterations,
+    const direction additionalLayers
+)
+{
+    if( selectedFaces.size() == 0 || maxNumIterations <= 0 )
+    {
+        Info
+            << "optimizeSelectedFaces: nothing to do"
+            << " faces=" << selectedFaces.size()
+            << " iterations=" << maxNumIterations
+            << endl;
+
+        return;
+    }
+
+    const faceListPMG& faces = mesh_.faces();
+
+    // Validate/copy the caller population.  partTetMesh takes a mutable
+    // labelHashSet&, but the public API intentionally accepts const input.
+    labelHashSet targetFaces;
+
+    forAllConstIter(labelHashSet, selectedFaces, it)
+    {
+        const label faceI = it.key();
+
+        if( faceI >= 0 && faceI < label(faces.size()) )
+            targetFaces.insert(faceI);
+    }
+
+    if( targetFaces.size() == 0 )
+    {
+        Info
+            << "optimizeSelectedFaces: no valid face labels after filtering"
+            << endl;
+
+        return;
+    }
+
+    // Preserve all constraints already installed on this meshOptimizer.
+    // This is the same LOCKED-point treatment used by
+    // optimizeLowQualityFaces().
+    labelLongList lockedPoints;
+
+    forAll(vertexLocation_, pointI)
+    {
+        if( vertexLocation_[pointI] & LOCKED )
+            lockedPoints.append(pointI);
+    }
+
+    Info
+        << "CFMITCH V6.1 SELECTED FACE OPT:"
+        << " faces=" << targetFaces.size()
+        << " lockedPoints=" << lockedPoints.size()
+        << " additionalLayers=" << label(additionalLayers)
+        << " iterations=" << maxNumIterations
+        << endl;
+
+    // Existing selected-face constructor:
+    //
+    //     partTetMesh
+    //     (
+    //         mesh,
+    //         lockedPoints,
+    //         badFaces,
+    //         additionalLayers
+    //     )
+    //
+    // It builds only the cells around vertices of the supplied faces,
+    // plus the explicitly requested extra cell layers.
+    partTetMesh tetMesh
+    (
+        mesh_,
+        lockedPoints,
+        targetFaces,
+        additionalLayers
+    );
+
+    if
+    (
+        surfaceOctreePtr_
+     && bndPointPatchesPtr_
+     && globalToBoundaryPointPtr_
+    )
+    {
+        tetMesh.setSurfaceConstraint
+        (
+            surfaceOctreePtr_,
+            bndPointPatchesPtr_,
+            globalToBoundaryPointPtr_,
+            featureCornerPointsPtr_,
+            featureCurveTangentsPtr_
+        );
+    }
+
+    tetMeshOptimisation tmo(tetMesh);
+
+    tmo.optimiseUsingVolumeOptimizer(maxNumIterations);
+
+    // No iterative generic re-selection here.  This routine performs one
+    // bounded operation on exactly the supplied population.  The caller
+    // re-evaluates exact OpenFOAM quality before deciding to commit it.
+    tetMesh.updateOrigMesh();
+
+    Info
+        << "CFMITCH V6.1 SELECTED FACE OPT complete:"
+        << " faces=" << targetFaces.size()
+        << endl;
+}
+
 
 void meshOptimizer::optimizeMeshNearBoundaries
 (

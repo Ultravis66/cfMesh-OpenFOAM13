@@ -33,6 +33,7 @@ Description
 #include "demandDrivenData.H"
 #include "meshOctreeCreator.H"
 #include "cartesianMeshExtractor.H"
+#include "meshOctreeCubeCoordinates.H"
 #include "meshSurfaceEngine.H"
 #include "meshSurfaceEngineModifier.H"
 #include "polyMeshGenAddressing.H"
@@ -42,6 +43,7 @@ Description
 #include "meshSurfaceEdgeExtractorNonTopo.H"
 #include "meshOptimizer.H"
 #include "meshSurfaceOptimizer.H"
+#include "boundaryLayerOptimisation.H"
 #include "topologicalCleaner.H"
 #include "boundaryLayers.H"
 #include "refineBoundaryLayers.H"
@@ -81,6 +83,426 @@ Description
 
 namespace Foam
 {
+
+// ============================================================
+// CFMITCH V10C SPLIT-HEX LINEAGE CONSTRAINT
+//
+// BUG BEING FIXED
+// ----------------
+// meshOctreeAddressing::createOctreeFaces() inserts refinement
+// edge-centre nodes into split-hex faces.  Once cartesianMeshExtractor
+// copies the template into polyMeshGen, that parent-edge relationship
+// is lost.  Generic point optimisation can therefore move a dependent
+// refinement node independently of its parent edge.
+//
+// V10C captures:
+//
+//     dependent point D
+//     parent edge A--B
+//     birth interpolation lambda
+//
+// such that:
+//
+//     D = A + lambda * (B-A)
+//
+// For 2:1 Cartesian refinement lambda should normally be 0.5.
+//
+// The final repair is:
+//   * interior-only
+//   * point-motion-only
+//   * exact Foundation-quality gated
+//   * fully transactional
+//
+// No topology is changed here.
+// ============================================================
+
+struct CFMitchSplitEdgeConstraintV10C
+{
+    label dependent;
+    label masterA;
+    label masterB;
+
+    scalar lambda;
+    scalar birthEdgeLength;
+
+    CFMitchSplitEdgeConstraintV10C()
+    :
+        dependent(-1),
+        masterA(-1),
+        masterB(-1),
+        lambda(0.5),
+        birthEdgeLength(0.0)
+    {}
+};
+
+
+static std::vector<CFMitchSplitEdgeConstraintV10C>
+    cfmitchV10SplitEdgeConstraints;
+
+
+// Reconstruct the same refinement-edge-centre lookup performed by
+// meshOctreeAddressing::findEdgeCentre(), while the original octree
+// point numbering is still identical to the extracted mesh point
+// numbering.
+static label cfmitchV10FindEdgeCentre
+(
+    const meshOctreeAddressing& addressing,
+    const label leafI,
+    const direction eI
+)
+{
+    const meshOctree& octree =
+        addressing.octree();
+
+    if( octree.isQuadtree() && eI >= 8 )
+        return -1;
+
+    const meshOctreeCubeBasic& oc =
+        octree.returnLeaf(leafI);
+
+    const VRWGraph& nodeLabels =
+        addressing.nodeLabels();
+
+    const label nodeI =
+        nodeLabels
+        (
+            leafI,
+            meshOctreeCubeCoordinates::edgeNodes_[eI][0]
+        );
+
+    const FRWGraph<label, 8>& pointLeaves =
+        addressing.nodeLeaves();
+
+    const direction level =
+        oc.level();
+
+    label fI(-1);
+
+    switch( eI )
+    {
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+            fI = 1;
+            break;
+
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+            fI = 3;
+            break;
+
+        case 8:
+        case 9:
+        case 10:
+        case 11:
+            fI = 5;
+            break;
+
+        default:
+            return -1;
+    }
+
+    for(label i=0; i<4; ++i)
+    {
+        const label fNode =
+            meshOctreeCubeCoordinates::faceNodes_[fI][i];
+
+        const label leafJ =
+            pointLeaves(nodeI, fNode);
+
+        if( leafJ < 0 )
+            continue;
+
+        if
+        (
+            octree.returnLeaf(leafJ).level()
+          > level
+        )
+        {
+            const label shift =
+                (i+2)%4;
+
+            return
+                nodeLabels
+                (
+                    leafJ,
+                    meshOctreeCubeCoordinates::
+                        faceNodes_[fI][shift]
+                );
+        }
+    }
+
+    return -1;
+}
+
+
+// Capture all unique refinement edge-centre constraints immediately
+// after cartesianMeshExtractor has created the polyMesh.
+//
+// Conflicting parent definitions are rejected rather than guessed.
+static void cfmitchV10CaptureSplitEdgeConstraints
+(
+    meshOctree& octree,
+    const dictionary& meshDict,
+    const polyMeshGen& mesh
+)
+{
+    cfmitchV10SplitEdgeConstraints.clear();
+
+    meshOctreeAddressing addressing
+    (
+        octree,
+        meshDict,
+        false
+    );
+
+    const List<direction>& boxType =
+        addressing.boxType();
+
+    const VRWGraph& nodeLabels =
+        addressing.nodeLabels();
+
+    const pointFieldPMG& points =
+        mesh.points();
+
+    std::map<label, CFMitchSplitEdgeConstraintV10C>
+        byDependent;
+
+    std::set<label> conflicts;
+
+    label rawCandidates(0);
+    label invalidLabels(0);
+    label invalidGeometry(0);
+    label duplicateConsistent(0);
+    label duplicateConflict(0);
+
+    forAll(boxType, leafI)
+    {
+        if
+        (
+            !(boxType[leafI]
+            & meshOctreeAddressing::MESHCELL)
+        )
+        {
+            continue;
+        }
+
+        for(direction eI=0; eI<12; ++eI)
+        {
+            const label dep =
+                cfmitchV10FindEdgeCentre
+                (
+                    addressing,
+                    leafI,
+                    eI
+                );
+
+            if( dep < 0 )
+                continue;
+
+            ++rawCandidates;
+
+            const label a =
+                nodeLabels
+                (
+                    leafI,
+                    meshOctreeCubeCoordinates::
+                        edgeNodes_[eI][0]
+                );
+
+            const label b =
+                nodeLabels
+                (
+                    leafI,
+                    meshOctreeCubeCoordinates::
+                        edgeNodes_[eI][1]
+                );
+
+            if
+            (
+                dep < 0
+             || a < 0
+             || b < 0
+             || dep >= label(points.size())
+             || a >= label(points.size())
+             || b >= label(points.size())
+             || dep == a
+             || dep == b
+             || a == b
+            )
+            {
+                ++invalidLabels;
+                continue;
+            }
+
+            const vector ab =
+                points[b] - points[a];
+
+            const scalar ab2 =
+                magSqr(ab);
+
+            if( ab2 <= VSMALL )
+            {
+                ++invalidGeometry;
+                continue;
+            }
+
+            const scalar lambda =
+                (
+                    (points[dep] - points[a])
+                  & ab
+                ) / ab2;
+
+            const point expected =
+                points[a] + lambda*ab;
+
+            const scalar residual =
+                mag(points[dep] - expected);
+
+            const scalar edgeLength =
+                Foam::sqrt(ab2);
+
+            // Octree refinement edge centres must lie on the parent
+            // edge and in its interior.  Fail closed if not.
+            if
+            (
+                lambda <= scalar(0.0)
+             || lambda >= scalar(1.0)
+             || residual >
+                Foam::max
+                (
+                    scalar(1e-12),
+                    scalar(1e-8)*edgeLength
+                )
+            )
+            {
+                ++invalidGeometry;
+                continue;
+            }
+
+            CFMitchSplitEdgeConstraintV10C c;
+
+            c.dependent = dep;
+            c.masterA = a;
+            c.masterB = b;
+            c.lambda = lambda;
+            c.birthEdgeLength = edgeLength;
+
+            std::map
+            <
+                label,
+                CFMitchSplitEdgeConstraintV10C
+            >::iterator found =
+                byDependent.find(dep);
+
+            if( found == byDependent.end() )
+            {
+                byDependent.insert
+                (
+                    std::make_pair(dep, c)
+                );
+            }
+            else
+            {
+                const CFMitchSplitEdgeConstraintV10C& old =
+                    found->second;
+
+                const bool sameParents =
+                (
+                    (
+                        old.masterA == a
+                     && old.masterB == b
+                    )
+                 ||
+                    (
+                        old.masterA == b
+                     && old.masterB == a
+                    )
+                );
+
+                if( sameParents )
+                {
+                    ++duplicateConsistent;
+                }
+                else
+                {
+                    conflicts.insert(dep);
+                    ++duplicateConflict;
+                }
+            }
+        }
+    }
+
+    for
+    (
+        std::map
+        <
+            label,
+            CFMitchSplitEdgeConstraintV10C
+        >::const_iterator it = byDependent.begin();
+        it != byDependent.end();
+        ++it
+    )
+    {
+        if( conflicts.find(it->first) != conflicts.end() )
+            continue;
+
+        cfmitchV10SplitEdgeConstraints.push_back
+        (
+            it->second
+        );
+    }
+
+    // Coarse parent edges first.  This makes chained refinement
+    // constraints deterministic if a finer constraint uses a point
+    // which is itself dependent at a coarser level.
+    std::sort
+    (
+        cfmitchV10SplitEdgeConstraints.begin(),
+        cfmitchV10SplitEdgeConstraints.end(),
+        []
+        (
+            const CFMitchSplitEdgeConstraintV10C& a,
+            const CFMitchSplitEdgeConstraintV10C& b
+        )
+        {
+            if
+            (
+                mag
+                (
+                    a.birthEdgeLength
+                  - b.birthEdgeLength
+                ) > SMALL
+            )
+            {
+                return
+                    a.birthEdgeLength
+                  > b.birthEdgeLength;
+            }
+
+            return a.dependent < b.dependent;
+        }
+    );
+
+    Info
+        << "CFMITCH V10C CAPTURE:"
+        << " rawCandidates=" << rawCandidates
+        << " unique="
+        << cfmitchV10SplitEdgeConstraints.size()
+        << " duplicateConsistent="
+        << duplicateConsistent
+        << " duplicateConflict="
+        << duplicateConflict
+        << " invalidLabels="
+        << invalidLabels
+        << " invalidGeometry="
+        << invalidGeometry
+        << endl;
+}
+
 
 // * * * * * * * * * * * * Private member functions  * * * * * * * * * * * * //
 
@@ -427,6 +849,14 @@ struct CFMitchOFHardQuality
     // entering the 70-degree warning/error population.
     std::map<label, scalar> fanNonOrthDegrees;
     std::map<label, scalar> fanSevereSkew;
+
+    // ========================================================
+    // CFMITCH V10E V3 TRANSACTIONAL PROVENANCE
+    //
+    // Exact Foundation skew>4 values for every selected face.
+    // fanSevereSkew is only a restricted diagnostic subset.
+    // ========================================================
+    std::map<label, scalar> fanSkewValues;
     scalarField fanAllNonOrthDegrees;
     // V5.1x: exact Foundation face-tet margins for failing faces.  Owner
     // edge quality must be < -sqr(SMALL), neighbour edge quality must be
@@ -520,6 +950,7 @@ static void evaluateOpenFOAMHardQuality
     result.fanSevereFaces.clear();
     result.fanNonOrthDegrees.clear();
     result.fanSevereSkew.clear();
+    result.fanSkewValues.clear();
     result.fanAllNonOrthDegrees.clear();
     result.faceTetOwnerWorst.clear();
     result.faceTetNeighbourWorst.clear();
@@ -973,6 +1404,9 @@ static void evaluateOpenFOAMHardQuality
         {
             ++result.highSkewFaces;
             result.fanSkewFaces.insert(faceI);
+
+            if( collectFanData )
+                result.fanSkewValues[faceI] = skew;
         }
     }
 
@@ -1929,6 +2363,136 @@ static label scanNearCoincidentPoints
     return nPairs;
 }
 
+// ============================================================
+// CFMITCH V10D INTERNAL SKEW STAGE TRACE
+//
+// Diagnostic only.
+//
+// Find the FIRST meshing stage at which the currently unexplained
+// Foundation-13 internal skew>4 population appears.
+//
+// No point motion.
+// No topology changes.
+// No acceptance/rejection.
+// ============================================================
+
+static void cfmitchV10DStageSkewAudit
+(
+    polyMeshGen& mesh,
+    const word& stageName
+)
+{
+    // Point-motion stages can leave cached geometry stale.
+    // Always force exact geometry reconstruction first.
+    mesh.clearAddressingData();
+
+    CFMitchOFHardQuality q;
+
+    evaluateOpenFOAMHardQuality
+    (
+        mesh,
+        q,
+        false,
+        NULL,
+        true
+    );
+
+    const labelList& nei =
+        mesh.neighbour();
+
+    label internalGt4 = 0;
+    label boundaryGt4 = 0;
+
+    scalar maxInternalSkew = 0.0;
+    scalar maxBoundarySkew = 0.0;
+
+    label maxInternalFace = -1;
+    label maxBoundaryFace = -1;
+
+    for
+    (
+        std::map<label, scalar>::const_iterator it =
+            q.fanSkewValues.begin();
+        it != q.fanSkewValues.end();
+        ++it
+    )
+    {
+        const label faceI =
+            it->first;
+
+        const scalar skew =
+            it->second;
+
+        const bool internal =
+        (
+            faceI >= 0
+         && faceI < label(nei.size())
+         && nei[faceI] >= 0
+        );
+
+        if( internal )
+        {
+            ++internalGt4;
+
+            if( skew > maxInternalSkew )
+            {
+                maxInternalSkew = skew;
+                maxInternalFace = faceI;
+            }
+        }
+        else
+        {
+            ++boundaryGt4;
+
+            if( skew > maxBoundarySkew )
+            {
+                maxBoundarySkew = skew;
+                maxBoundaryFace = faceI;
+            }
+        }
+    }
+
+    Info
+        << "CFMITCH V10D STAGE:"
+        << " stage=" << stageName
+        << " exactGt4=" << q.highSkewFaces
+        << " classifiedGt4="
+        << (internalGt4 + boundaryGt4)
+        << " internalGt4=" << internalGt4
+        << " boundaryGt4=" << boundaryGt4
+        << " maxInternalSkew=" << maxInternalSkew
+        << " maxInternalFace=" << maxInternalFace
+        << " maxBoundarySkew=" << maxBoundarySkew
+        << " maxBoundaryFace=" << maxBoundaryFace
+        << " negVol=" << q.signedNegVolCells
+        << " badPyr=" << q.pyramidErrors
+        << " nonOrthErrors="
+        << q.errorNonOrthFaces.size()
+        << " maxNonOrth=" << q.maxNonOrth
+        << " points=" << mesh.points().size()
+        << " faces=" << mesh.faces().size()
+        << " cells=" << mesh.cells().size()
+        << endl;
+
+    if
+    (
+        label(q.fanSkewValues.size())
+     != q.highSkewFaces
+    )
+    {
+        Info
+            << "CFMITCH V10D WARNING:"
+            << " stage=" << stageName
+            << " fanSkewValues="
+            << q.fanSkewValues.size()
+            << " exactGt4="
+            << q.highSkewFaces
+            << " exactSkewMapMismatch=yes"
+            << endl;
+    }
+}
+
+
 void cartesianMeshGenerator::createCartesianMesh()
 {
     //- create polyMesh from octree boxes
@@ -1941,6 +2505,61 @@ void cartesianMeshGenerator::createCartesianMesh()
     }
 
     cme.createMesh();
+
+    cfmitchV10DStageSkewAudit
+    (
+        mesh_,
+        "CARTESIAN_BIRTH"
+    );
+
+    // ========================================================
+    // CFMITCH V10C SPLIT-HEX LINEAGE CONSTRAINT
+    //
+    // At this exact point extracted mesh point labels still
+    // correspond to octree node labels.  Capture the refinement
+    // dependency before later topology/point-motion stages lose
+    // that semantic information.
+    // ========================================================
+
+    bool v10SplitHexDecomposed(false);
+
+    if
+    (
+        meshDict_.found
+        (
+            "decomposePolyhedraIntoTetsAndPyrs"
+        )
+    )
+    {
+        v10SplitHexDecomposed =
+            readBool
+            (
+                meshDict_.lookup
+                (
+                    "decomposePolyhedraIntoTetsAndPyrs"
+                )
+            );
+    }
+
+    if( !v10SplitHexDecomposed )
+    {
+        cfmitchV10CaptureSplitEdgeConstraints
+        (
+            *octreePtr_,
+            meshDict_,
+            mesh_
+        );
+    }
+    else
+    {
+        cfmitchV10SplitEdgeConstraints.clear();
+
+        Info
+            << "CFMITCH V10C CAPTURE:"
+            << " skipped=yes"
+            << " reason=splitHexDecompositionEnabled"
+            << endl;
+    }
 }
 
 void cartesianMeshGenerator::surfacePreparation()
@@ -2451,6 +3070,277 @@ void cartesianMeshGenerator::detectTripleJunctions
     if( !meshDict_.isDict("boundaryLayers") )
         return;
     const dictionary& bndL = meshDict_.subDict("boundaryLayers");
+
+    // ================================================================
+    // CFMITCH AUTO_BOUNDARY_JUNCTIONS V1
+    //
+    // Generic topology-driven junction discovery.
+    //
+    // Patch names and OpenFOAM patch types do NOT decide whether a
+    // patch is BL-active.  The authoritative decision is the already
+    // resolved boundaryLayers nLayersForPatch_: N > 0 means BL.
+    //
+    // Every OpenFOAM/custom boundary type therefore participates in
+    // exactly the same incidence graph.
+    // ================================================================
+    bool autoDetectBoundaryJunctions = false;
+
+    if( bndL.found("autoDetectBoundaryJunctions") )
+    {
+        autoDetectBoundaryJunctions =
+            Switch(bndL.lookup("autoDetectBoundaryJunctions"));
+    }
+
+    if( autoDetectBoundaryJunctions )
+    {
+        meshSurfaceEngine mse(mesh_);
+        const labelList& bPoints = mse.boundaryPoints();
+        const meshSurfacePartitioner mPart(mse);
+        const VRWGraph& pPatches = mPart.pointPatches();
+        const PtrList<boundaryPatch>& boundaries = mesh_.boundaries();
+
+        labelHashSet autoTriplePoints;
+
+        label nMultiPatch = 0;
+        label nAllBL = 0;
+        label nBLBLNeutral = 0;
+        label nBLNeutralNeutral = 0;
+        label nAllNeutral = 0;
+        label nMixedOther = 0;
+
+        // ------------------------------------------------------------
+        // Optional legacy parity audit.
+        // These lists affect NOTHING when auto mode is enabled.
+        // They are retained temporarily only so Rotor37 can prove that
+        // automatic topology reproduces the known-good legacy seeds.
+        // ------------------------------------------------------------
+        const bool legacyConfigured =
+            bndL.found("tripleJunctionSuppressPatches")
+         && bndL.found("tripleJunctionWallPatches")
+         && bndL.found("tripleJunctionNeutralPatches");
+
+        labelHashSet legacySuppressIds;
+        labelHashSet legacyWallIds;
+        labelHashSet legacyNeutralIds;
+        labelHashSet legacyTriplePoints;
+
+        if( legacyConfigured )
+        {
+            const wordList namesSuppress
+            (
+                bndL.lookup("tripleJunctionSuppressPatches")
+            );
+            const wordList namesWall
+            (
+                bndL.lookup("tripleJunctionWallPatches")
+            );
+            const wordList namesNeutral
+            (
+                bndL.lookup("tripleJunctionNeutralPatches")
+            );
+
+            forAll(namesSuppress, nameI)
+            {
+                const label patchI = mesh_.getPatchID(namesSuppress[nameI]);
+                if( patchI >= 0 ) legacySuppressIds.insert(patchI);
+            }
+
+            forAll(namesWall, nameI)
+            {
+                const label patchI = mesh_.getPatchID(namesWall[nameI]);
+                if( patchI >= 0 ) legacyWallIds.insert(patchI);
+            }
+
+            forAll(namesNeutral, nameI)
+            {
+                const label patchI = mesh_.getPatchID(namesNeutral[nameI]);
+                if( patchI >= 0 ) legacyNeutralIds.insert(patchI);
+            }
+        }
+
+        forAll(bPoints, bpI)
+        {
+            const label nPatches = pPatches.sizeOfRow(bpI);
+
+            if( nPatches < 3 )
+                continue;
+
+            ++nMultiPatch;
+
+            label nBL = 0;
+            label nNeutral = 0;
+
+            bool legacySuppress = false;
+            bool legacyWall = false;
+            bool legacyNeutral = false;
+
+            forAllRow(pPatches, bpI, pI)
+            {
+                const label patchI = pPatches(bpI, pI);
+
+                if
+                (
+                    patchI < 0
+                 || patchI >= label(boundaries.size())
+                )
+                    continue;
+
+                if( bl.patchHasBoundaryLayers(patchI) )
+                    ++nBL;
+                else
+                    ++nNeutral;
+
+                if( legacyConfigured )
+                {
+                    if( legacySuppressIds.found(patchI) )
+                        legacySuppress = true;
+                    if( legacyWallIds.found(patchI) )
+                        legacyWall = true;
+                    if( legacyNeutralIds.found(patchI) )
+                        legacyNeutral = true;
+                }
+            }
+
+            word classification("MIXED_OTHER");
+
+            if( nBL == nPatches )
+            {
+                classification = "ALL_BL";
+                ++nAllBL;
+            }
+            else if( nBL == 0 )
+            {
+                classification = "ALL_NEUTRAL";
+                ++nAllNeutral;
+            }
+            else if( nBL >= 2 && nNeutral >= 1 )
+            {
+                classification = "BL_BL_NEUTRAL";
+                ++nBLBLNeutral;
+    
+                // Existing triple-junction machinery is specifically
+                // the BL+BL+neutral protection mechanism.
+                autoTriplePoints.insert(bPoints[bpI]);
+            }
+            else if( nBL == 1 && nNeutral >= 2 )
+            {
+                classification = "BL_NEUTRAL_NEUTRAL";
+                ++nBLNeutralNeutral;
+            }
+            else
+            {
+                ++nMixedOther;
+            }
+
+            if
+            (
+                legacyConfigured
+             && legacySuppress
+             && legacyWall
+             && legacyNeutral
+            )
+            {
+                legacyTriplePoints.insert(bPoints[bpI]);
+            }
+
+            Info
+                << "CFMITCH AUTO_BOUNDARY_JUNCTION:"
+                << " meshPoint=" << bPoints[bpI]
+                << " patchCount=" << nPatches
+                << " blCount=" << nBL
+                << " neutralCount=" << nNeutral
+                << " classification=" << classification
+                << " patches=(";
+
+            forAllRow(pPatches, bpI, pI)
+            {
+                const label patchI = pPatches(bpI, pI);
+
+                if( pI ) Info << " ";
+
+                if
+                (
+                    patchI >= 0
+                 && patchI < label(boundaries.size())
+                )
+                {
+                    Info
+                        << boundaries[patchI].patchName()
+                        << ":"
+                        << boundaries[patchI].patchType()
+                        << ":N"
+                        << bl.numberOfLayersForPatch(patchI);
+                }
+                else
+                {
+                    Info << "INVALID_PATCH_" << patchI;
+                }
+            }
+
+            Info << ")" << endl;
+        }
+
+        Info
+            << "CFMITCH AUTO_BOUNDARY_JUNCTION_SUMMARY:"
+            << " multiPatchPoints=" << nMultiPatch
+            << " allBL=" << nAllBL
+            << " blblNeutral=" << nBLBLNeutral
+            << " blNeutralNeutral=" << nBLNeutralNeutral
+            << " allNeutral=" << nAllNeutral
+            << " mixedOther=" << nMixedOther
+            << " selectedTriplePoints=" << autoTriplePoints.size()
+            << endl;
+
+        if( legacyConfigured )
+        {
+            label nBoth = 0;
+            label nAutoOnly = 0;
+            label nLegacyOnly = 0;
+
+            forAllConstIter(labelHashSet, autoTriplePoints, it)
+            {
+                if( legacyTriplePoints.found(it.key()) )
+                    ++nBoth;
+                else
+                    ++nAutoOnly;
+            }
+
+            forAllConstIter(labelHashSet, legacyTriplePoints, it)
+            {
+                if( !autoTriplePoints.found(it.key()) )
+                    ++nLegacyOnly;
+            }
+
+            Info
+                << "CFMITCH AUTO_BOUNDARY_JUNCTION_LEGACY_PARITY:"
+                << " auto=" << autoTriplePoints.size()
+                << " legacy=" << legacyTriplePoints.size()
+                << " both=" << nBoth
+                << " autoOnly=" << nAutoOnly
+                << " legacyOnly=" << nLegacyOnly
+                << " exact="
+                <<
+                (
+                    nAutoOnly == 0 && nLegacyOnly == 0
+                  ? "yes" : "no"
+                )
+                << endl;
+        }
+    
+        // Feed only the semantically equivalent BL+BL+neutral class
+        // into the established triple-junction planner machinery.
+        bl.addTripleJunctionPoints(autoTriplePoints);
+    
+        Info
+            << "CFMITCH AUTO_BOUNDARY_JUNCTION_APPLIED:"
+            << " points=" << autoTriplePoints.size()
+            << " source=topology+nLayers"
+            << " patchNamesRequired=no"
+            << " patchTypesRestricted=no"
+            << endl;
+    
+        return;
+    }
     if( !bndL.found("tripleJunctionSuppressPatches") )
         return;
     if( !bndL.found("tripleJunctionWallPatches") )
@@ -2983,6 +3873,182 @@ void cartesianMeshGenerator::generateBoundaryLayers()
 
     bl.addLayerForAllPatches();
 
+    // ============================================================
+    // CFMITCH STABLE MACRO HAIR LINEAGE V7B
+    //
+    // blNeutralEdgePoints() is keyed by the PRE-extrusion bpI
+    // space.  It must NOT be consumed later as a bpI after BL
+    // topology creation.
+    //
+    // We already preserved:
+    //
+    //     bpI -> old stable mesh-point label
+    //
+    // in blScaleMeshPointForBp.
+    //
+    // boundaryLayers also owns:
+    //
+    //     old mesh-point -> newly created point
+    //
+    // in newLabelForVertex_.
+    //
+    // Because createNewVertices swaps their coordinates:
+    //
+    //     old label = macro/top point
+    //     new label = physical wall/base point
+    //
+    // Capture that exact global-label lineage now.
+    // ============================================================
+
+    blNeutralBaseMeshPoints_.clear();
+    blNeutralBaseWallPatchAtMeshPoint_.clear();
+    blMacroTopForBaseMeshPoint_.clear();
+
+    const labelLongList& blNewLabelForVertex =
+        bl.newLabelForVertexMap();
+
+
+    label nMacroPairs = 0;
+    label nMacroPairMissing = 0;
+
+    forAll(blScaleMeshPointForBp, bpI)
+    {
+        const label topMeshPt =
+            blScaleMeshPointForBp[bpI];
+
+        if
+        (
+            topMeshPt < 0
+         || topMeshPt >= label(blNewLabelForVertex.size())
+        )
+        {
+            ++nMacroPairMissing;
+            continue;
+        }
+
+        const label baseMeshPt =
+            blNewLabelForVertex[topMeshPt];
+
+        if
+        (
+            baseMeshPt < 0
+         || baseMeshPt >= label(mesh_.points().size())
+        )
+        {
+            ++nMacroPairMissing;
+            continue;
+        }
+
+        blMacroTopForBaseMeshPoint_.insert
+        (
+            baseMeshPt,
+            topMeshPt
+        );
+
+        ++nMacroPairs;
+    }
+
+
+    const labelHashSet& stableNeutralBp =
+        bl.blNeutralEdgePoints();
+
+    const Map<label>& stableNeutralWallPatch =
+        bl.blNeutralPointPatch();
+
+    label nStableNeutral = 0;
+    label nStableNeutralMissing = 0;
+
+
+    forAllConstIter
+    (
+        labelHashSet,
+        stableNeutralBp,
+        it
+    )
+    {
+        const label bpI =
+            it.key();
+
+        if
+        (
+            bpI < 0
+         || bpI >= label(blScaleMeshPointForBp.size())
+        )
+        {
+            ++nStableNeutralMissing;
+            continue;
+        }
+
+
+        const label topMeshPt =
+            blScaleMeshPointForBp[bpI];
+
+        if
+        (
+            topMeshPt < 0
+         || topMeshPt >= label(blNewLabelForVertex.size())
+        )
+        {
+            ++nStableNeutralMissing;
+            continue;
+        }
+
+
+        const label baseMeshPt =
+            blNewLabelForVertex[topMeshPt];
+
+        if
+        (
+            baseMeshPt < 0
+         || baseMeshPt >= label(mesh_.points().size())
+        )
+        {
+            ++nStableNeutralMissing;
+            continue;
+        }
+
+
+        if( !stableNeutralWallPatch.found(bpI) )
+        {
+            ++nStableNeutralMissing;
+            continue;
+        }
+
+
+        blNeutralBaseMeshPoints_.insert
+        (
+            baseMeshPt
+        );
+
+        blNeutralBaseWallPatchAtMeshPoint_.insert
+        (
+            baseMeshPt,
+            stableNeutralWallPatch[bpI]
+        );
+
+        ++nStableNeutral;
+    }
+
+
+    Info
+        << "CFMITCH V7B STABLE_LINEAGE:"
+        << " neutralBp="
+        << stableNeutralBp.size()
+        << " stableNeutralBases="
+        << blNeutralBaseMeshPoints_.size()
+        << " neutralMapped="
+        << nStableNeutral
+        << " neutralMissing="
+        << nStableNeutralMissing
+        << " macroPairs="
+        << nMacroPairs
+        << " macroPairMissing="
+        << nMacroPairMissing
+        << " inverseMap="
+        << blMacroTopForBaseMeshPoint_.size()
+        << endl;
+
+
     // Capture FINAL layerScale after all BL taper systems have acted.
     blLayerScale_ = bl.layerScale();
 
@@ -3126,6 +4192,103 @@ refLayers.setNeutralLayerScaleAtMeshPoint
 );
 
         refineBoundaryLayers::readSettings(meshDict_, refLayers);
+
+        // ============================================================
+        // CFMITCH V8A NEUTRAL SEAM LAYER BACKOFF
+        //
+        // Stable physical/base mesh-point labels were captured during
+        // macro BL construction by V7B lineage bookkeeping.
+        //
+        // V8A uses the lineage but does NOT require V7 persistent locks.
+        // ============================================================
+
+        bool cfmitchV8NeutralSeamBackoff = false;
+        label cfmitchV8NeutralSeamMaxLayers = 5;
+
+
+        if( meshDict_.isDict("boundaryLayers") )
+        {
+            const dictionary& bndV8 =
+                meshDict_.subDict("boundaryLayers");
+
+
+            if
+            (
+                bndV8.found
+                (
+                    "cfmitchV8NeutralSeamBackoff"
+                )
+            )
+            {
+                cfmitchV8NeutralSeamBackoff =
+                    bool
+                    (
+                        Switch
+                        (
+                            bndV8.lookup
+                            (
+                                "cfmitchV8NeutralSeamBackoff"
+                            )
+                        )
+                    );
+            }
+
+
+            if
+            (
+                bndV8.found
+                (
+                    "cfmitchV8NeutralSeamMaxLayers"
+                )
+            )
+            {
+                cfmitchV8NeutralSeamMaxLayers =
+                    readLabel
+                    (
+                        bndV8.lookup
+                        (
+                            "cfmitchV8NeutralSeamMaxLayers"
+                        )
+                    );
+            }
+        }
+
+
+        if
+        (
+            cfmitchV8NeutralSeamBackoff
+         && cfmitchV8NeutralSeamMaxLayers < 1
+        )
+        {
+            FatalErrorIn
+            (
+                "cartesianMeshGenerator::refBoundaryLayers()"
+            )
+                << "cfmitchV8NeutralSeamMaxLayers must be >= 1"
+                << exit(FatalError);
+        }
+
+
+        if( cfmitchV8NeutralSeamBackoff )
+        {
+            refLayers.setNeutralSeamBackoff
+            (
+                blNeutralBaseMeshPoints_,
+                cfmitchV8NeutralSeamMaxLayers
+            );
+        }
+
+
+        Info
+            << "CFMITCH V8A HANDOFF:"
+            << " enabled="
+            << cfmitchV8NeutralSeamBackoff
+            << " stableSeamPoints="
+            << blNeutralBaseMeshPoints_.size()
+            << " maxLayers="
+            << cfmitchV8NeutralSeamMaxLayers
+            << endl;
+
 
         // Pass BL/BL junction points for wedge topology
         refLayers.setBlblJunctionPoints(blblJunctionPoints_);
@@ -3282,7 +4445,7 @@ refLayers.setNeutralLayerScaleAtMeshPoint
         // Uses exact bfI seeds from a previous post-refBL diagnostic run.
         // File format: one boundary-local bfI per line, no header.
         // Generate from diagnostic run:
-        //   tail -n +2 postRefBL_provenanceSeedBfI.csv \
+        //   tail -n +2 postRefBL_provenanceSeedBfI.csv
         //       > postRefBL_provenanceSeedBfI.labels
         {
             bool doProvRetraction = false;
@@ -3404,6 +4567,14 @@ refLayers.setNeutralLayerScaleAtMeshPoint
             }
         }
 
+        // ========================================================
+        // CFMITCH V10E V3 TRANSACTIONAL PROVENANCE
+        //
+        // BL provenance is cell-indexed topology state.
+        // ========================================================
+        labelList v51mActiveBLProvenance;
+        word v51mActiveBLProvenanceStage("unset");
+
         // Pre-refBL mesh snapshot for two-pass repair loop.
         struct PreRefBLMeshSnapshot
         {
@@ -3426,6 +4597,9 @@ refLayers.setNeutralLayerScaleAtMeshPoint
             labelHashSet blblAcuteCornerPoints;
             boolList     rampSeedPoints;
             labelList    vtFaceRing;
+
+            labelList    activeBLProvenance;
+            word         activeBLProvenanceStage;
 
             bool         valid;
             PreRefBLMeshSnapshot() : valid(false) {}
@@ -3473,6 +4647,12 @@ refLayers.setNeutralLayerScaleAtMeshPoint
             snap.blblAcuteCornerPoints = blblAcuteCornerPoints_;
             snap.rampSeedPoints = blRampSeedPoints_;
             snap.vtFaceRing = vtFaceRing_;
+
+            snap.activeBLProvenance =
+                v51mActiveBLProvenance;
+
+            snap.activeBLProvenanceStage =
+                v51mActiveBLProvenanceStage;
 
             snap.valid = true;
 
@@ -3626,6 +4806,22 @@ refLayers.setNeutralLayerScaleAtMeshPoint
             blRampSeedPoints_ = snap.rampSeedPoints;
             vtFaceRing_ = snap.vtFaceRing;
 
+            v51mActiveBLProvenance =
+                snap.activeBLProvenance;
+
+            v51mActiveBLProvenanceStage =
+                snap.activeBLProvenanceStage;
+
+            Info
+                << "CFMITCH V10E PROVENANCE RESTORE:"
+                << " stage="
+                << v51mActiveBLProvenanceStage
+                << " size="
+                << v51mActiveBLProvenance.size()
+                << " meshCells="
+                << snap.cells.size()
+                << endl;
+
             //- Topology has been replaced wholesale. The ordinary
             //- clearAddressingData() deletes polyMeshGenAddressing but leaves
             //- ownerPtr_/neighbourPtr_ alive. Those arrays describe the
@@ -3712,8 +4908,7 @@ refLayers.setNeutralLayerScaleAtMeshPoint
         // retained. Point compaction does not change cell labels, so this
         // map remains valid until the later mesh renumbering provided its
         // logical size still matches the active cell count.
-        labelList v51mActiveBLProvenance;
-        word v51mActiveBLProvenanceStage("unset");
+        // V10E V3: declarations moved above snapshot helpers.
 
         // ---- BLCOVERAGE base-face snapshot (pre-refBL, report-only) ----
         labelList  blcovBaseFacePatch;
@@ -4607,6 +5802,37 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
 (
     blNeutralLayerScaleAtMeshPoint_
 );
+
+                              // =================================================
+                              // CFMITCH V8A PERSISTENT REFINEMENT HANDOFF
+                              //
+                              // Every Q0 restore/retry constructs a NEW
+                              // refineBoundaryLayers object.  The V8A seam
+                              // layer-count constraint is a topology invariant
+                              // and must therefore be restored along with the
+                              // neutral height-scale field.
+                              // =================================================
+
+                              if( cfmitchV8NeutralSeamBackoff )
+                              {
+                                  refLayers2.setNeutralSeamBackoff
+                                  (
+                                      blNeutralBaseMeshPoints_,
+                                      cfmitchV8NeutralSeamMaxLayers
+                                  );
+                              }
+
+                              Info
+                                  << "CFMITCH V8A PERSIST_HANDOFF:"
+                                  << " target=refLayers2"
+                                  << " enabled="
+                                  << cfmitchV8NeutralSeamBackoff
+                                  << " seamPoints="
+                                  << blNeutralBaseMeshPoints_.size()
+                                  << " maxLayers="
+                                  << cfmitchV8NeutralSeamMaxLayers
+                                  << endl;
+
                             refineBoundaryLayers::readSettings
                                 (meshDict_, refLayers2);
                             refLayers2.setBlblJunctionPoints
@@ -6807,7 +8033,20 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                     pass2BadPyr.size() > 0
                                  &&
                                     (
-                                        nNewRetreatSeeds > 0
+                                        // CFMITCH V8C RESIDUAL RETREAT GATE
+                                        //
+                                        // A Q2 bad-pyramid provenance seed does not have to be
+                                        // new to require topology retreat.  The previous gate
+                                        // compared set sizes, so persistent residual failures
+                                        // mapped to an already-known seed incorrectly caused
+                                        // V3.1 to report STAGNATED without ever trying the
+                                        // cumulative N=1 adaptive retreat candidate.
+                                        //
+                                        // Trigger whenever Q2 still has attributable residual
+                                        // provenance.  The existing transactional acceptance
+                                        // test remains authoritative and restores Q2 if this
+                                        // candidate is not strictly better.
+                                        q2ResidualSeedBfI.size() > 0
                                      || v42RetreatFromRejectedCompression
                                     )
                                 )
@@ -6815,7 +8054,20 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                     // Preserve the already accepted Q2 state
                                     // before returning to Q0 for the cumulative
                                     // candidate.
-                                    PreRefBLMeshSnapshot pass2BestSnap;
+                                    
+                                    // V10E V3: newly retained BL topology.
+                                    v51mActiveBLProvenance =
+                                        refLayers2.cellToBaseBndFace();
+                                    v51mActiveBLProvenanceStage = "Q2";
+                                    Info
+                                        << "CFMITCH V10E PROVENANCE STATE:"
+                                        << " stage=Q2"
+                                        << " size="
+                                        << v51mActiveBLProvenance.size()
+                                        << " meshCells="
+                                        << mesh_.cells().size()
+                                        << endl;
+PreRefBLMeshSnapshot pass2BestSnap;
                                     takePreRefBLSnapshot(pass2BestSnap);
 
                                     bool adaptiveAccepted = false;
@@ -6836,6 +8088,37 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                             (
                                                 blNeutralLayerScaleAtMeshPoint_
                                             );
+
+                              // =================================================
+                              // CFMITCH V8A PERSISTENT REFINEMENT HANDOFF
+                              //
+                              // Every Q0 restore/retry constructs a NEW
+                              // refineBoundaryLayers object.  The V8A seam
+                              // layer-count constraint is a topology invariant
+                              // and must therefore be restored along with the
+                              // neutral height-scale field.
+                              // =================================================
+
+                              if( cfmitchV8NeutralSeamBackoff )
+                              {
+                                  refLayersAdaptive.setNeutralSeamBackoff
+                                  (
+                                      blNeutralBaseMeshPoints_,
+                                      cfmitchV8NeutralSeamMaxLayers
+                                  );
+                              }
+
+                              Info
+                                  << "CFMITCH V8A PERSIST_HANDOFF:"
+                                  << " target=refLayersAdaptive"
+                                  << " enabled="
+                                  << cfmitchV8NeutralSeamBackoff
+                                  << " seamPoints="
+                                  << blNeutralBaseMeshPoints_.size()
+                                  << " maxLayers="
+                                  << cfmitchV8NeutralSeamMaxLayers
+                                  << endl;
+
 
                                         refineBoundaryLayers::readSettings
                                             (
@@ -7393,6 +8676,21 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                     v34AcceptedCellToBaseBndFace =
                                         refLayers2.cellToBaseBndFace();
 
+                                    v51mActiveBLProvenance =
+                                        v34AcceptedCellToBaseBndFace;
+
+                                    v51mActiveBLProvenanceStage =
+                                        "Q2";
+
+                                    Info
+                                        << "CFMITCH V10E PROVENANCE STATE:"
+                                        << " stage=Q2"
+                                        << " size="
+                                        << v51mActiveBLProvenance.size()
+                                        << " meshCells="
+                                        << mesh_.cells().size()
+                                        << endl;
+
                                     v34AcceptedRetreatSeedBfI.clear();
 
                                     forAllConstIter
@@ -7419,7 +8717,22 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                 // pristine Q0 using the cumulative N=1 set.
                                 // =========================================
 
-                                CFMitchOFHardQuality v34BaseHard;
+                                // ========================================================
+                                // CFMITCH V10H TWO-PASS CROSS-PATCH ITERATION
+                                //
+                                // V10G pass 1 proved that cross-patch N=1 retreat
+                                // moves the residual defect onto newly exposed bfI
+                                // provenance.  Permit exactly ONE additional pass.
+                                //
+                                // This is intentionally capped at two total passes so
+                                // we can distinguish convergence from a retreat front
+                                // simply marching outward through the boundary layer.
+                                // ========================================================
+                                for(label v10gIter=1; v10gIter<=2; ++v10gIter)
+                                {
+                                    bool v10gIterAccepted = false;
+
+                                    CFMitchOFHardQuality v34BaseHard;
                                 evaluateOpenFOAMHardQuality
                                 (
                                     mesh_,
@@ -7461,6 +8774,175 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
 
                                 const labelList& v34Nei =
                                     mesh_.neighbour();
+
+                                // ========================================================
+                                // CFMITCH V10G V4 CROSS-PATCH SKEW RETREAT
+                                //
+                                // Feed only exact internal skew>4 BL/BL interfaces from
+                                // different original boundary patches into the existing
+                                // transactional V3.4 retreat/rebuild mechanism.
+                                //
+                                // Deliberately excluded:
+                                //   * boundary skew
+                                //   * BL/core interfaces
+                                //   * same-base BL interfaces
+                                //   * same-patch BL interfaces
+                                //
+                                // No direct point motion occurs here.
+                                // Existing V3.4 Q0 rebuild/rollback remains authoritative.
+                                // ========================================================
+                                bool v10gEnabled = false;
+
+                                if( meshDict_.isDict("boundaryLayers") )
+                                {
+                                    const dictionary& v10gBndL =
+                                        meshDict_.subDict("boundaryLayers");
+
+                                    if
+                                    (
+                                        v10gBndL.found
+                                        (
+                                            "cfmitchV10GCrossPatchSkewRetreat"
+                                        )
+                                    )
+                                    {
+                                        v10gEnabled =
+                                            bool
+                                            (
+                                                Switch
+                                                (
+                                                    v10gBndL.lookup
+                                                    (
+                                                        "cfmitchV10GCrossPatchSkewRetreat"
+                                                    )
+                                                )
+                                            );
+                                    }
+                                }
+
+                                const bool v10gBaseHardClean =
+                                (
+                                    v34BaseHard.pyramidErrors == 0
+                                 && v34BaseHard.badPyramidFaces.size() == 0
+                                 && v34BaseHard.errorNonOrthFaces.size() == 0
+                                 && v34BaseHard.signedNegVolCells == 0
+                                 && v34BaseHard.zeroFaceCells == 0
+                                 && v34BaseHard.centreFallbackCells == 0
+                                );
+
+                                const auto v10gIsCrossPatchSkew =
+                                [&]
+                                (
+                                    const label faceI,
+                                    const labelList& provenance,
+                                    const labelList& own,
+                                    const labelList& nei
+                                ) -> bool
+                                {
+                                    // Internal faces only.
+                                    if
+                                    (
+                                        faceI < 0
+                                     || faceI >= label(own.size())
+                                     || faceI >= label(nei.size())
+                                    )
+                                        return false;
+
+                                    const label ownCell = own[faceI];
+                                    const label neiCell = nei[faceI];
+
+                                    if
+                                    (
+                                        ownCell < 0
+                                     || neiCell < 0
+                                     || ownCell >= label(provenance.size())
+                                     || neiCell >= label(provenance.size())
+                                    )
+                                        return false;
+
+                                    const label ownBf = provenance[ownCell];
+                                    const label neiBf = provenance[neiCell];
+
+                                    // Both sides must carry BL provenance, with different
+                                    // original base boundary faces.
+                                    if
+                                    (
+                                        ownBf < 0
+                                     || neiBf < 0
+                                     || ownBf == neiBf
+                                     || ownBf >= label(blcovBaseFacePatch.size())
+                                     || neiBf >= label(blcovBaseFacePatch.size())
+                                    )
+                                        return false;
+
+                                    const label ownPatch =
+                                        blcovBaseFacePatch[ownBf];
+
+                                    const label neiPatch =
+                                        blcovBaseFacePatch[neiBf];
+
+                                    return
+                                    (
+                                        ownPatch >= 0
+                                     && neiPatch >= 0
+                                     && ownPatch != neiPatch
+                                    );
+                                };
+
+                                labelHashSet v10gBaseCrossPatchSkew;
+
+                                if( v10gEnabled && v10gBaseHardClean )
+                                {
+                                    forAllConstIter
+                                    (
+                                        labelHashSet,
+                                        v34BaseHard.fanSkewFaces,
+                                        v10gSkewIt
+                                    )
+                                    {
+                                        const label faceI =
+                                            v10gSkewIt.key();
+
+                                        if
+                                        (
+                                            v10gIsCrossPatchSkew
+                                            (
+                                                faceI,
+                                                v34AcceptedCellToBaseBndFace,
+                                                v34Own,
+                                                v34Nei
+                                            )
+                                        )
+                                        {
+                                            v10gBaseCrossPatchSkew.insert(faceI);
+
+                                            // Existing V3.4 code below maps BOTH adjacent
+                                            // cells back to cumulative bfI retreat seeds.
+                                            v34HardFaces.insert(faceI);
+                                        }
+                                    }
+                                }
+
+                                const bool v10gRepairMode =
+                                (
+                                    v10gEnabled
+                                 && v10gBaseHardClean
+                                 && v10gBaseCrossPatchSkew.size() > 0
+                                );
+
+                                Info
+                                    << "CFMITCH V10G CROSS_PATCH_SKEW_SELECT:"
+                                    << " iter=" << v10gIter
+                                    << " enabled=" << v10gEnabled
+                                    << " baseHardClean=" << v10gBaseHardClean
+                                    << " exactGt4=" << v34BaseHard.highSkewFaces
+                                    << " fanSkewSet="
+                                    << v34BaseHard.fanSkewFaces.size()
+                                    << " crossPatchSelected="
+                                    << v10gBaseCrossPatchSkew.size()
+                                    << " hardFaceUnion="
+                                    << v34HardFaces.size()
+                                    << endl;
 
                                 const auto v34MapCell =
                                 [&]
@@ -7660,6 +9142,37 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                                     blNeutralLayerScaleAtMeshPoint_
                                                 );
 
+                              // =================================================
+                              // CFMITCH V8A PERSISTENT REFINEMENT HANDOFF
+                              //
+                              // Every Q0 restore/retry constructs a NEW
+                              // refineBoundaryLayers object.  The V8A seam
+                              // layer-count constraint is a topology invariant
+                              // and must therefore be restored along with the
+                              // neutral height-scale field.
+                              // =================================================
+
+                              if( cfmitchV8NeutralSeamBackoff )
+                              {
+                                  refLayersOFHard.setNeutralSeamBackoff
+                                  (
+                                      blNeutralBaseMeshPoints_,
+                                      cfmitchV8NeutralSeamMaxLayers
+                                  );
+                              }
+
+                              Info
+                                  << "CFMITCH V8A PERSIST_HANDOFF:"
+                                  << " target=refLayersOFHard"
+                                  << " enabled="
+                                  << cfmitchV8NeutralSeamBackoff
+                                  << " seamPoints="
+                                  << blNeutralBaseMeshPoints_.size()
+                                  << " maxLayers="
+                                  << cfmitchV8NeutralSeamMaxLayers
+                                  << endl;
+
+
                                             refineBoundaryLayers::readSettings
                                             (
                                                 meshDict_,
@@ -7828,6 +9341,42 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                                     v34CandidateHard
                                                 );
 
+                                                label v10gCandidateCrossPatchSkew = 0;
+
+                                                if( v10gRepairMode )
+                                                {
+                                                    const labelList& v10gCandidateProv =
+                                                        refLayersOFHard.cellToBaseBndFace();
+
+                                                    const labelList& v10gCandidateOwn =
+                                                        mesh_.owner();
+
+                                                    const labelList& v10gCandidateNei =
+                                                        mesh_.neighbour();
+
+                                                    forAllConstIter
+                                                    (
+                                                        labelHashSet,
+                                                        v34CandidateHard.fanSkewFaces,
+                                                        v10gCandidateSkewIt
+                                                    )
+                                                    {
+                                                        if
+                                                        (
+                                                            v10gIsCrossPatchSkew
+                                                            (
+                                                                v10gCandidateSkewIt.key(),
+                                                                v10gCandidateProv,
+                                                                v10gCandidateOwn,
+                                                                v10gCandidateNei
+                                                            )
+                                                        )
+                                                        {
+                                                            ++v10gCandidateCrossPatchSkew;
+                                                        }
+                                                    }
+                                                }
+
                                                 const bool
                                                     v34ConstructionNegOK =
                                                         v34CandidateConstructionNeg.
@@ -7897,12 +9446,87 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                                     v34CandidateRawMinVol
                                                  >= v34BaseRawMinVol;
 
+                                                const scalar v10gSkewTol =
+                                                    scalar(1.0e-10)
+                                                  * Foam::max
+                                                    (
+                                                        scalar(1.0),
+                                                        v34BaseHard.maxSkew
+                                                    );
+
+                                                const scalar v10gNonOrthTol =
+                                                    scalar(1.0e-10)
+                                                  * Foam::max
+                                                    (
+                                                        scalar(1.0),
+                                                        v34BaseHard.maxNonOrth
+                                                    );
+
+                                                const bool v10gSkewRepairBetter =
+                                                (
+                                                    v10gRepairMode
+
+                                                    // The exact target family must strictly improve.
+                                                 && v10gCandidateCrossPatchSkew
+                                                      < label(v10gBaseCrossPatchSkew.size())
+
+                                                    // Do not trade target cleanup for new skew elsewhere.
+                                                 && v34CandidateHard.highSkewFaces
+                                                      <= v34BaseHard.highSkewFaces
+
+                                                 && v34CandidateHard.maxSkew
+                                                      <= v34BaseHard.maxSkew + v10gSkewTol
+
+                                                    // Do not degrade non-orthogonality while fixing skew.
+                                                 && v34CandidateHard.maxNonOrth
+                                                      <= v34BaseHard.maxNonOrth + v10gNonOrthTol
+
+                                                    // Preserve valid cell-centre state.
+                                                 && v34CandidateHard.zeroFaceCells
+                                                      <= v34BaseHard.zeroFaceCells
+
+                                                 && v34CandidateHard.centreFallbackCells
+                                                      <= v34BaseHard.centreFallbackCells
+                                                );
+
+                                                const bool v34QualityBetter =
+                                                (
+                                                    v34ExactHardBetter
+                                                 || v10gSkewRepairBetter
+                                                );
+
+                                                Info
+                                                    << "CFMITCH V10G CROSS_PATCH_SKEW_CANDIDATE:"
+                                                    << " iter=" << v10gIter
+                                                    << " mode=" << v10gRepairMode
+                                                    << " targeted "
+                                                    << v10gBaseCrossPatchSkew.size()
+                                                    << "->"
+                                                    << v10gCandidateCrossPatchSkew
+                                                    << " totalSkew "
+                                                    << v34BaseHard.highSkewFaces
+                                                    << "->"
+                                                    << v34CandidateHard.highSkewFaces
+                                                    << " maxSkew "
+                                                    << v34BaseHard.maxSkew
+                                                    << "->"
+                                                    << v34CandidateHard.maxSkew
+                                                    << " maxNonOrth "
+                                                    << v34BaseHard.maxNonOrth
+                                                    << "->"
+                                                    << v34CandidateHard.maxNonOrth
+                                                    << " skewBetter="
+                                                    << v10gSkewRepairBetter
+                                                    << " hardBetter="
+                                                    << v34ExactHardBetter
+                                                    << endl;
+
                                                 const bool v34Better =
                                                     v34ConstructionNegOK
                                                  && v34ConstructionPyrOK
                                                  && v34ExactPyrOK
                                                  && v34ExactNonOrthOK
-                                                 && v34ExactHardBetter
+                                                 && v34QualityBetter
                                                  && v34SignedNegOK
                                                  && v34SignedMinVolOK
                                                  && v34RawNegMagOK
@@ -7954,6 +9578,14 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                                     << v34BaseRawMinVol
                                                     << "->"
                                                     << v34CandidateRawMinVol
+                                                    << " crossPatchSkew "
+                                                    << v10gBaseCrossPatchSkew.size()
+                                                    << "->"
+                                                    << v10gCandidateCrossPatchSkew
+                                                    << " totalSkew "
+                                                    << v34BaseHard.highSkewFaces
+                                                    << "->"
+                                                    << v34CandidateHard.highSkewFaces
                                                     << (v34Better
                                                         ? " -- ACCEPTED"
                                                         : " -- REJECTED")
@@ -7966,6 +9598,70 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                                         (
                                                             blPoints_
                                                         );
+
+                                                    // =================================================
+                                                    // CFMITCH V10H ACCEPTED-STATE PERSISTENCE
+                                                    //
+                                                    // A following V10G iteration must classify against
+                                                    // the topology that was just accepted and must rebuild
+                                                    // using every previously accepted N=1 constraint.
+                                                    // =================================================
+                                                    v34AcceptedCellToBaseBndFace =
+                                                        refLayersOFHard.
+                                                            cellToBaseBndFace();
+
+                                                    v34AcceptedRetreatSeedBfI.clear();
+
+                                                    forAllConstIter
+                                                    (
+                                                        labelHashSet,
+                                                        v34CumulativeSeedBfI,
+                                                        v10hPersistSeedIt
+                                                    )
+                                                    {
+                                                        v34AcceptedRetreatSeedBfI.
+                                                            insert
+                                                            (
+                                                                v10hPersistSeedIt.key()
+                                                            );
+                                                    }
+
+                                                    v34HaveAcceptedState = true;
+
+                                                    // V10E V3: newly retained BL topology.
+                                                    v51mActiveBLProvenance =
+                                                        v34AcceptedCellToBaseBndFace;
+
+                                                    v51mActiveBLProvenanceStage =
+                                                        "V34_OFHARD";
+
+                                                    v10gIterAccepted =
+                                                    (
+                                                        v10gRepairMode
+                                                     && v10gSkewRepairBetter
+                                                    );
+
+                                                    Info
+                                                        << "CFMITCH V10H ACCEPTED_STATE:"
+                                                        << " iter=" << v10gIter
+                                                        << " persistedSeeds="
+                                                        << v34AcceptedRetreatSeedBfI.
+                                                            size()
+                                                        << " provenanceSize="
+                                                        << v34AcceptedCellToBaseBndFace.
+                                                            size()
+                                                        << " continue="
+                                                        << v10gIterAccepted
+                                                        << endl;
+                                                    Info
+                                                        << "CFMITCH V10E PROVENANCE STATE:"
+                                                        << " stage=V34_OFHARD"
+                                                        << " size="
+                                                        << v51mActiveBLProvenance.size()
+                                                        << " meshCells="
+                                                        << mesh_.cells().size()
+                                                        << endl;
+
 
                                                     twoPassAccepted = true;
                                                     blPointsFromPass2 = true;
@@ -8043,6 +9739,46 @@ refLayers2.setNeutralLayerScaleAtMeshPoint
                                         << v34NoProvenance
                                         << endl;
                                 }
+
+                                // ------------------------------------------------
+                                // V10H iteration controller.
+                                //
+                                // Continue only after an ACCEPTED V10G skew repair.
+                                // Ordinary V3.4 hard-repair behaviour remains
+                                // single-pass.
+                                // ------------------------------------------------
+                                if( !v10gIterAccepted )
+                                {
+                                    Info
+                                        << "CFMITCH V10H ITERATION_STOP:"
+                                        << " iter=" << v10gIter
+                                        << " reason=noAcceptedCrossPatchImprovement"
+                                        << endl;
+
+                                    break;
+                                }
+
+                                if( v10gIter < 2 )
+                                {
+                                    Info
+                                        << "CFMITCH V10H ITERATION_CONTINUE:"
+                                        << " completedIter=" << v10gIter
+                                        << " nextIter=" << (v10gIter + 1)
+                                        << " acceptedSeeds="
+                                        << v34AcceptedRetreatSeedBfI.size()
+                                        << endl;
+                                }
+                                else
+                                {
+                                    Info
+                                        << "CFMITCH V10H ITERATION_STOP:"
+                                        << " iter=" << v10gIter
+                                        << " reason=twoPassDiagnosticCap"
+                                        << " acceptedSeeds="
+                                        << v34AcceptedRetreatSeedBfI.size()
+                                        << endl;
+                                }
+                            }
                             }
                             else if
                             (
@@ -8076,6 +9812,37 @@ refLayers3.setNeutralLayerScaleAtMeshPoint
 (
     blNeutralLayerScaleAtMeshPoint_
 );
+
+                              // =================================================
+                              // CFMITCH V8A PERSISTENT REFINEMENT HANDOFF
+                              //
+                              // Every Q0 restore/retry constructs a NEW
+                              // refineBoundaryLayers object.  The V8A seam
+                              // layer-count constraint is a topology invariant
+                              // and must therefore be restored along with the
+                              // neutral height-scale field.
+                              // =================================================
+
+                              if( cfmitchV8NeutralSeamBackoff )
+                              {
+                                  refLayers3.setNeutralSeamBackoff
+                                  (
+                                      blNeutralBaseMeshPoints_,
+                                      cfmitchV8NeutralSeamMaxLayers
+                                  );
+                              }
+
+                              Info
+                                  << "CFMITCH V8A PERSIST_HANDOFF:"
+                                  << " target=refLayers3"
+                                  << " enabled="
+                                  << cfmitchV8NeutralSeamBackoff
+                                  << " seamPoints="
+                                  << blNeutralBaseMeshPoints_.size()
+                                  << " maxLayers="
+                                  << cfmitchV8NeutralSeamMaxLayers
+                                  << endl;
+
 
                                     refineBoundaryLayers::readSettings
                                         (meshDict_, refLayers3);
@@ -8346,6 +10113,19 @@ refLayers3.setNeutralLayerScaleAtMeshPoint
                                             // restore Q3 exactly.
                                             refLayers3.pointsInBndLayer
                                                 (blPoints_);
+                                            // V10E V3: newly retained BL topology.
+                                            v51mActiveBLProvenance =
+                                                refLayers3.cellToBaseBndFace();
+                                            v51mActiveBLProvenanceStage = "Q3";
+                                            Info
+                                                << "CFMITCH V10E PROVENANCE STATE:"
+                                                << " stage=Q3"
+                                                << " size="
+                                                << v51mActiveBLProvenance.size()
+                                                << " meshCells="
+                                                << mesh_.cells().size()
+                                                << endl;
+
 
                                             // Historical variable name:
                                             // means an accepted repair-pass
@@ -8608,6 +10388,37 @@ refLayers3.setNeutralLayerScaleAtMeshPoint
                                                         (
                                                             blNeutralLayerScaleAtMeshPoint_
                                                         );
+
+                              // =================================================
+                              // CFMITCH V8A PERSISTENT REFINEMENT HANDOFF
+                              //
+                              // Every Q0 restore/retry constructs a NEW
+                              // refineBoundaryLayers object.  The V8A seam
+                              // layer-count constraint is a topology invariant
+                              // and must therefore be restored along with the
+                              // neutral height-scale field.
+                              // =================================================
+
+                              if( cfmitchV8NeutralSeamBackoff )
+                              {
+                                  refLayers5.setNeutralSeamBackoff
+                                  (
+                                      blNeutralBaseMeshPoints_,
+                                      cfmitchV8NeutralSeamMaxLayers
+                                  );
+                              }
+
+                              Info
+                                  << "CFMITCH V8A PERSIST_HANDOFF:"
+                                  << " target=refLayers5"
+                                  << " enabled="
+                                  << cfmitchV8NeutralSeamBackoff
+                                  << " seamPoints="
+                                  << blNeutralBaseMeshPoints_.size()
+                                  << " maxLayers="
+                                  << cfmitchV8NeutralSeamMaxLayers
+                                  << endl;
+
 
                                                     refineBoundaryLayers::
                                                         readSettings
@@ -9058,6 +10869,19 @@ refLayers3.setNeutralLayerScaleAtMeshPoint
                                                                 (
                                                                     blPoints_
                                                                 );
+                                                            // V10E V3: newly retained BL topology.
+                                                            v51mActiveBLProvenance =
+                                                                refLayers5.cellToBaseBndFace();
+                                                            v51mActiveBLProvenanceStage = "Q5";
+                                                            Info
+                                                                << "CFMITCH V10E PROVENANCE STATE:"
+                                                                << " stage=Q5"
+                                                                << " size="
+                                                                << v51mActiveBLProvenance.size()
+                                                                << " meshCells="
+                                                                << mesh_.cells().size()
+                                                                << endl;
+
 
                                                             twoPassAccepted =
                                                                 true;
@@ -9531,6 +11355,19 @@ refLayers3.setNeutralLayerScaleAtMeshPoint
                                                             refLayers4.
                                                                 pointsInBndLayer
                                                                 (blPoints_);
+                                                            // V10E V3: newly retained BL topology.
+                                                            v51mActiveBLProvenance =
+                                                                refLayers4.cellToBaseBndFace();
+                                                            v51mActiveBLProvenanceStage = "Q4";
+                                                            Info
+                                                                << "CFMITCH V10E PROVENANCE STATE:"
+                                                                << " stage=Q4"
+                                                                << " size="
+                                                                << v51mActiveBLProvenance.size()
+                                                                << " meshCells="
+                                                                << mesh_.cells().size()
+                                                                << endl;
+
 
                                                             twoPassAccepted =
                                                                 true;
@@ -9885,6 +11722,481 @@ refLayers3.setNeutralLayerScaleAtMeshPoint
             Info << "  Gate 1 (neg vol cells):    " << badCells.size() << endl;
             Info << "  Gate 2 (bad pyramids):     " << badPyramidFaces.size() << endl;
             Info << "  Gate 3 (non-ortho >85deg): " << nonOrthoFaces.size() << endl;
+
+            // =========================================================
+            // CFMITCH V10F FINAL INTERNAL SKEW PROVENANCE
+            //
+            // REPORT ONLY.
+            //
+            // Run after the BL repair transaction tree has selected its
+            // final retained topology, while the retained cell->base-face
+            // provenance and original base-face patch map are still alive.
+            //
+            // No point motion.
+            // No topology changes.
+            // No acceptance/rejection changes.
+            //
+            // Classify every exact Foundation skew>4 INTERNAL face as:
+            //
+            //   0 NONBL_NONBL
+            //   1 BL_CORE
+            //   2 BL_BL_SAME_BASE
+            //   3 BL_BL_SAME_PATCH
+            //   4 BL_BL_CROSS_PATCH
+            //
+            // Also record cell face topology so we can directly test the
+            // V10A/V10B hypothesis that the dominant family is a BL-created
+            // non-hex transition/cap cell against an untouched core hex.
+            // =========================================================
+            {
+                const bool v10fProvenanceUsable =
+                (
+                    v51mActiveBLProvenance.size()
+                 == mesh_.cells().size()
+                 && blcovBaseFacePatch.size() > 0
+                );
+
+                CFMitchOFHardQuality v10fQuality;
+
+                evaluateOpenFOAMHardQuality
+                (
+                    mesh_,
+                    v10fQuality,
+                    false,
+                    nullptr,
+                    true
+                );
+
+                const labelList& v10fOwner =
+                    mesh_.owner();
+
+                const labelList& v10fNeighbour =
+                    mesh_.neighbour();
+
+                const faceListPMG& v10fFaces =
+                    mesh_.faces();
+
+                const cellListPMG& v10fCells =
+                    mesh_.cells();
+
+                const PtrList<boundaryPatch>& v10fBoundaries =
+                    mesh_.boundaries();
+
+                auto v10fCellBase =
+                [&]
+                (
+                    const label cellI
+                ) -> label
+                {
+                    if
+                    (
+                        !v10fProvenanceUsable
+                     || cellI < 0
+                     || cellI >=
+                        label(v51mActiveBLProvenance.size())
+                    )
+                    {
+                        return -1;
+                    }
+
+                    return v51mActiveBLProvenance[cellI];
+                };
+
+                auto v10fBasePatch =
+                [&]
+                (
+                    const label baseBfI
+                ) -> label
+                {
+                    if
+                    (
+                        baseBfI < 0
+                     || baseBfI >=
+                        label(blcovBaseFacePatch.size())
+                    )
+                    {
+                        return -1;
+                    }
+
+                    return blcovBaseFacePatch[baseBfI];
+                };
+
+                auto v10fCellShape =
+                [&]
+                (
+                    const label cellI,
+                    label& nFaces,
+                    label& nTri,
+                    label& nQuad,
+                    label& nPoly,
+                    bool& pureHex
+                )
+                {
+                    nFaces = 0;
+                    nTri = 0;
+                    nQuad = 0;
+                    nPoly = 0;
+                    pureHex = false;
+
+                    if
+                    (
+                        cellI < 0
+                     || cellI >= label(v10fCells.size())
+                    )
+                    {
+                        return;
+                    }
+
+                    const cell& c =
+                        v10fCells[cellI];
+
+                    nFaces = c.size();
+
+                    forAll(c, cfi)
+                    {
+                        const label faceI =
+                            c[cfi];
+
+                        if
+                        (
+                            faceI < 0
+                         || faceI >= label(v10fFaces.size())
+                        )
+                        {
+                            ++nPoly;
+                            continue;
+                        }
+
+                        const label nfp =
+                            v10fFaces[faceI].size();
+
+                        if( nfp == 3 )
+                            ++nTri;
+                        else if( nfp == 4 )
+                            ++nQuad;
+                        else
+                            ++nPoly;
+                    }
+
+                    pureHex =
+                    (
+                        nFaces == 6
+                     && nTri == 0
+                     && nQuad == 6
+                     && nPoly == 0
+                    );
+                };
+
+                OFstream v10fCsv
+                (
+                    "CFMITCH_V10F_internalSkewProvenance.csv"
+                );
+
+                v10fCsv
+                    << "faceI,skew,class,"
+                    << "ownerCell,neighbourCell,"
+                    << "ownerBase,neighbourBase,"
+                    << "ownerPatch,neighbourPatch,"
+                    << "ownerPatchName,neighbourPatchName,"
+                    << "ownerNFaces,ownerTri,ownerQuad,ownerPoly,"
+                    << "ownerPureHex,"
+                    << "neighbourNFaces,neighbourTri,"
+                    << "neighbourQuad,neighbourPoly,"
+                    << "neighbourPureHex"
+                    << nl;
+
+                label v10fInternal = 0;
+
+                label v10fNonBLNonBL = 0;
+                label v10fBLCore = 0;
+                label v10fBLBLSameBase = 0;
+                label v10fBLBLSamePatch = 0;
+                label v10fBLBLCrossPatch = 0;
+
+                label v10fBLCoreCorePureHex = 0;
+                label v10fBLCoreBLPureHex = 0;
+                label v10fBLCoreHexToTransition = 0;
+
+                label v10fInvalidBasePatch = 0;
+
+                for
+                (
+                    std::map<label, scalar>::const_iterator it =
+                        v10fQuality.fanSkewValues.begin();
+                    it != v10fQuality.fanSkewValues.end();
+                    ++it
+                )
+                {
+                    const label faceI =
+                        it->first;
+
+                    const scalar skew =
+                        it->second;
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(v10fNeighbour.size())
+                     || v10fNeighbour[faceI] < 0
+                    )
+                    {
+                        continue;
+                    }
+
+                    ++v10fInternal;
+
+                    const label ownerCell =
+                        v10fOwner[faceI];
+
+                    const label neighbourCell =
+                        v10fNeighbour[faceI];
+
+                    const label ownerBase =
+                        v10fCellBase(ownerCell);
+
+                    const label neighbourBase =
+                        v10fCellBase(neighbourCell);
+
+                    const bool ownerBL =
+                        ownerBase >= 0;
+
+                    const bool neighbourBL =
+                        neighbourBase >= 0;
+
+                    const label ownerPatch =
+                        v10fBasePatch(ownerBase);
+
+                    const label neighbourPatch =
+                        v10fBasePatch(neighbourBase);
+
+                    if
+                    (
+                        (ownerBase >= 0 && ownerPatch < 0)
+                     || (neighbourBase >= 0 && neighbourPatch < 0)
+                    )
+                    {
+                        ++v10fInvalidBasePatch;
+                    }
+
+                    word classification("UNKNOWN");
+                    label classId = -1;
+
+                    if( !ownerBL && !neighbourBL )
+                    {
+                        classId = 0;
+                        classification = "NONBL_NONBL";
+                        ++v10fNonBLNonBL;
+                    }
+                    else if( ownerBL != neighbourBL )
+                    {
+                        classId = 1;
+                        classification = "BL_CORE";
+                        ++v10fBLCore;
+                    }
+                    else if( ownerBase == neighbourBase )
+                    {
+                        classId = 2;
+                        classification = "BL_BL_SAME_BASE";
+                        ++v10fBLBLSameBase;
+                    }
+                    else if
+                    (
+                        ownerPatch >= 0
+                     && neighbourPatch >= 0
+                     && ownerPatch == neighbourPatch
+                    )
+                    {
+                        classId = 3;
+                        classification = "BL_BL_SAME_PATCH";
+                        ++v10fBLBLSamePatch;
+                    }
+                    else
+                    {
+                        classId = 4;
+                        classification = "BL_BL_CROSS_PATCH";
+                        ++v10fBLBLCrossPatch;
+                    }
+
+                    label ownerNFaces = 0;
+                    label ownerTri = 0;
+                    label ownerQuad = 0;
+                    label ownerPoly = 0;
+                    bool ownerPureHex = false;
+
+                    label neighbourNFaces = 0;
+                    label neighbourTri = 0;
+                    label neighbourQuad = 0;
+                    label neighbourPoly = 0;
+                    bool neighbourPureHex = false;
+
+                    v10fCellShape
+                    (
+                        ownerCell,
+                        ownerNFaces,
+                        ownerTri,
+                        ownerQuad,
+                        ownerPoly,
+                        ownerPureHex
+                    );
+
+                    v10fCellShape
+                    (
+                        neighbourCell,
+                        neighbourNFaces,
+                        neighbourTri,
+                        neighbourQuad,
+                        neighbourPoly,
+                        neighbourPureHex
+                    );
+
+                    if( classId == 1 )
+                    {
+                        const bool corePureHex =
+                            ownerBL
+                          ? neighbourPureHex
+                          : ownerPureHex;
+
+                        const bool blPureHex =
+                            ownerBL
+                          ? ownerPureHex
+                          : neighbourPureHex;
+
+                        if( corePureHex )
+                            ++v10fBLCoreCorePureHex;
+
+                        if( blPureHex )
+                            ++v10fBLCoreBLPureHex;
+
+                        if( corePureHex && !blPureHex )
+                            ++v10fBLCoreHexToTransition;
+                    }
+
+                    word ownerPatchName("none");
+                    word neighbourPatchName("none");
+
+                    if
+                    (
+                        ownerPatch >= 0
+                     && ownerPatch <
+                        label(v10fBoundaries.size())
+                    )
+                    {
+                        ownerPatchName =
+                            v10fBoundaries[ownerPatch].
+                                patchName();
+                    }
+
+                    if
+                    (
+                        neighbourPatch >= 0
+                     && neighbourPatch <
+                        label(v10fBoundaries.size())
+                    )
+                    {
+                        neighbourPatchName =
+                            v10fBoundaries[neighbourPatch].
+                                patchName();
+                    }
+
+                    Info
+                        << "CFMITCH V10F FACE:"
+                        << " face=" << faceI
+                        << " skew=" << skew
+                        << " class=" << classification
+                        << " owner=" << ownerCell
+                        << " neighbour=" << neighbourCell
+                        << " ownerBase=" << ownerBase
+                        << " neighbourBase=" << neighbourBase
+                        << " ownerPatch=" << ownerPatchName
+                        << " neighbourPatch="
+                        << neighbourPatchName
+                        << " ownerShape="
+                        << ownerNFaces << "F/"
+                        << ownerTri << "T/"
+                        << ownerQuad << "Q/"
+                        << ownerPoly << "P"
+                        << " ownerHex="
+                        << ownerPureHex
+                        << " neighbourShape="
+                        << neighbourNFaces << "F/"
+                        << neighbourTri << "T/"
+                        << neighbourQuad << "Q/"
+                        << neighbourPoly << "P"
+                        << " neighbourHex="
+                        << neighbourPureHex
+                        << endl;
+
+                    v10fCsv
+                        << faceI << ','
+                        << skew << ','
+                        << classification << ','
+                        << ownerCell << ','
+                        << neighbourCell << ','
+                        << ownerBase << ','
+                        << neighbourBase << ','
+                        << ownerPatch << ','
+                        << neighbourPatch << ','
+                        << ownerPatchName << ','
+                        << neighbourPatchName << ','
+                        << ownerNFaces << ','
+                        << ownerTri << ','
+                        << ownerQuad << ','
+                        << ownerPoly << ','
+                        << label(ownerPureHex) << ','
+                        << neighbourNFaces << ','
+                        << neighbourTri << ','
+                        << neighbourQuad << ','
+                        << neighbourPoly << ','
+                        << label(neighbourPureHex)
+                        << nl;
+                }
+
+                Info
+                    << "CFMITCH V10F SUMMARY:"
+                    << " provenanceUsable="
+                    << v10fProvenanceUsable
+                    << " stage="
+                    << v51mActiveBLProvenanceStage
+                    << " provenanceSize="
+                    << v51mActiveBLProvenance.size()
+                    << " meshCells="
+                    << mesh_.cells().size()
+                    << " exactGt4="
+                    << v10fQuality.highSkewFaces
+                    << " internalGt4="
+                    << v10fInternal
+                    << " NONBL_NONBL="
+                    << v10fNonBLNonBL
+                    << " BL_CORE="
+                    << v10fBLCore
+                    << " BL_BL_SAME_BASE="
+                    << v10fBLBLSameBase
+                    << " BL_BL_SAME_PATCH="
+                    << v10fBLBLSamePatch
+                    << " BL_BL_CROSS_PATCH="
+                    << v10fBLBLCrossPatch
+                    << " BL_CORE_corePureHex="
+                    << v10fBLCoreCorePureHex
+                    << " BL_CORE_blPureHex="
+                    << v10fBLCoreBLPureHex
+                    << " BL_CORE_hexToTransition="
+                    << v10fBLCoreHexToTransition
+                    << " invalidBasePatch="
+                    << v10fInvalidBasePatch
+                    << " csvGood="
+                    << v10fCsv.good()
+                    << endl;
+
+                if( !v10fProvenanceUsable )
+                {
+                    Info
+                        << "CFMITCH V10F WARNING:"
+                        << " retained provenance does not match "
+                        << "current cell topology; classification "
+                        << "must not be trusted"
+                        << endl;
+                }
+            }
 
             // Post-refBL provenance audit.
             // Runs while refLayers.cellToBaseBndFace() is still alive and
@@ -16240,6 +18552,133 @@ void cartesianMeshGenerator::optimiseFinalMesh()
     reprojUnsafe_ = false;
     meshHistory_ = MeshHistory::CleanNatural;
 
+    // ============================================================
+    // CFMITCH MACRO HAIR STAGE TRACE V1B
+    //
+    // Read-only Rotor37 forensic telemetry.
+    //
+    // Parent hairs reconstructed from the final 15-layer prism:
+    //
+    //   1487931 -> 337809
+    //   1487940 -> 337818
+    //   1487942 -> 337820
+    //
+    // No mesh coordinates are modified here.
+    // ============================================================
+
+    const label cfmHairBase[3] =
+    {
+        1487931,
+        1487940,
+        1487942
+    };
+
+    const label cfmHairTop[3] =
+    {
+        337809,
+        337818,
+        337820
+    };
+
+    auto cfmTraceMacroHairs =
+    [&](const char* stage)
+    {
+        const pointFieldPMG& pts = mesh_.points();
+
+        for(label i=0; i<3; ++i)
+        {
+            if
+            (
+                cfmHairBase[i] < 0
+             || cfmHairTop[i] < 0
+             || cfmHairBase[i] >= label(pts.size())
+             || cfmHairTop[i] >= label(pts.size())
+            )
+            {
+                Info
+                    << "CFMITCH HAIRTRACE"
+                    << " stage=" << stage
+                    << " unavailable=yes"
+                    << " nPoints=" << pts.size()
+                    << endl;
+                return;
+            }
+        }
+
+        vector h[3];
+        scalar L[3];
+
+        for(label i=0; i<3; ++i)
+        {
+            h[i] =
+                pts[cfmHairTop[i]]
+              - pts[cfmHairBase[i]];
+
+            L[i] = mag(h[i]);
+        }
+
+        scalar cos01 = 2.0;
+        scalar cos02 = 2.0;
+        scalar cos12 = 2.0;
+
+        scalar unitDiff01 = -1.0;
+        scalar unitDiff02 = -1.0;
+        scalar unitDiff12 = -1.0;
+
+        if( L[0] > VSMALL && L[1] > VSMALL )
+        {
+            cos01 = (h[0] & h[1])/(L[0]*L[1]);
+            unitDiff01 =
+                mag(h[0]/L[0] - h[1]/L[1]);
+        }
+
+        if( L[0] > VSMALL && L[2] > VSMALL )
+        {
+            cos02 = (h[0] & h[2])/(L[0]*L[2]);
+            unitDiff02 =
+                mag(h[0]/L[0] - h[2]/L[2]);
+        }
+
+        if( L[1] > VSMALL && L[2] > VSMALL )
+        {
+            cos12 = (h[1] & h[2])/(L[1]*L[2]);
+            unitDiff12 =
+                mag(h[1]/L[1] - h[2]/L[2]);
+        }
+
+        Info
+            << "CFMITCH HAIRTRACE"
+            << " stage=" << stage
+            << " nPoints=" << pts.size()
+
+            << " base0=" << pts[cfmHairBase[0]]
+            << " top0=" << pts[cfmHairTop[0]]
+            << " hair0=" << h[0]
+            << " L0=" << L[0]
+
+            << " base1=" << pts[cfmHairBase[1]]
+            << " top1=" << pts[cfmHairTop[1]]
+            << " hair1=" << h[1]
+            << " L1=" << L[1]
+
+            << " base2=" << pts[cfmHairBase[2]]
+            << " top2=" << pts[cfmHairTop[2]]
+            << " hair2=" << h[2]
+            << " L2=" << L[2]
+
+            << " cos01=" << cos01
+            << " cos02=" << cos02
+            << " cos12=" << cos12
+
+            << " unitDiff01=" << unitDiff01
+            << " unitDiff02=" << unitDiff02
+            << " unitDiff12=" << unitDiff12
+
+            << endl;
+    };
+
+    cfmTraceMacroHairs("ENTRY");
+
     //- untangle the surface if needed
     bool enforceConstraints(false);
     if( meshDict_.found("enforceGeometryConstraints") )
@@ -16258,53 +18697,806 @@ void cartesianMeshGenerator::optimiseFinalMesh()
                     bool(Switch(bndL.lookup("lockAcuteCornerPoints")));
         }
 
+    // ============================================================
+    // CFMITCH PERSISTENT SEAM COLLAR LOCK V7
+    //
+    // V6 creates a coherent BL/neutral seam + wall collar BEFORE
+    // optimiseFinalMesh(), but stage tracing proves the generic
+    // surface/volume optimizer subsequently destroys that field.
+    //
+    // V7 is deliberately a hard-lock experiment:
+    //
+    //   ring 0 = captured BL/neutral seam
+    //   ring 1..N = ordinary single-patch BL-side collar points
+    //
+    // The exact same point set is protected from:
+    //
+    //   1. meshSurfaceOptimizer
+    //   2. meshOptimizer
+    //   3. post-optimizer STL re-projection
+    //
+    // Default OFF.  Enable from boundaryLayers dictionary with:
+    //
+    //   cfmitchV7PersistentSeamLock true;
+    //   cfmitchV7PersistentSeamLockRings 3;
+    //
+    // This is a persistence experiment, not yet the final production
+    // constrained-motion implementation.
+    // ============================================================
+
+    bool cfmitchV7PersistentSeamLock = false;
+    label cfmitchV7PersistentSeamLockRings = 3;
+
+    if( meshDict_.isDict("boundaryLayers") )
+    {
+        const dictionary& bndV7 =
+            meshDict_.subDict("boundaryLayers");
+
+        if( bndV7.found("cfmitchV7PersistentSeamLock") )
+        {
+            cfmitchV7PersistentSeamLock =
+                bool
+                (
+                    Switch
+                    (
+                        bndV7.lookup
+                        (
+                            "cfmitchV7PersistentSeamLock"
+                        )
+                    )
+                );
+        }
+
+        if
+        (
+            bndV7.found
+            (
+                "cfmitchV7PersistentSeamLockRings"
+            )
+        )
+        {
+            cfmitchV7PersistentSeamLockRings =
+                readLabel
+                (
+                    bndV7.lookup
+                    (
+                        "cfmitchV7PersistentSeamLockRings"
+                    )
+                );
+        }
+    }
+
+    cfmitchV7PersistentSeamLockRings =
+        Foam::max
+        (
+            label(0),
+            Foam::min
+            (
+                label(8),
+                cfmitchV7PersistentSeamLockRings
+            )
+        );
+
+
+    // Boundary-point indices used by surface optimizer.
+    labelHashSet cfmitchV7LockedBp;
+
+    // Stable global mesh-point labels used by volume optimizer and
+    // post-optimizer re-projection.
+    labelHashSet cfmitchV7LockedMeshPts;
+
+
     {
         meshSurfaceEngine mse(mesh_);
         meshSurfaceOptimizer surfOpt(mse, *octreePtr_);
+
+
+        // --------------------------------------------------------
+        // V7B: reconstruct the seam from STABLE GLOBAL mesh-point
+        // labels.
+        //
+        // Ring 0 seeds are the actual physical wall/base points
+        // created during BL extrusion.
+        //
+        // Rings 1..N are then generated in the CURRENT boundary
+        // topology, so no stale bpI survives into optimiseFinalMesh.
+        //
+        // Finally each wall/base point is paired to its exact
+        // macro/top point using the stored extrusion lineage.
+        // --------------------------------------------------------
+
+        if
+        (
+            cfmitchV7PersistentSeamLock
+         && !blNeutralBaseMeshPoints_.empty()
+        )
+        {
+            const labelList& bPtsV7 =
+                mse.boundaryPoints();
+
+            const VRWGraph& pointPointsV7 =
+                mse.pointPoints();
+
+            meshSurfacePartitioner mPartV7(mse);
+
+            const VRWGraph& pPatchesV7 =
+                mPartV7.pointPatches();
+
+
+            // Current global mesh-point -> current boundary-point
+            // index map.
+            labelList meshPtToBp
+            (
+                mesh_.points().size(),
+                -1
+            );
+
+            forAll(bPtsV7, bpI)
+            {
+                const label meshPtI =
+                    bPtsV7[bpI];
+
+                if
+                (
+                    meshPtI >= 0
+                 && meshPtI < label(meshPtToBp.size())
+                )
+                {
+                    meshPtToBp[meshPtI] =
+                        bpI;
+                }
+            }
+
+
+            labelList wallPatchForBp
+            (
+                bPtsV7.size(),
+                -1
+            );
+
+            labelList ringCount
+            (
+                cfmitchV7PersistentSeamLockRings + 1,
+                0
+            );
+
+            labelLongList frontier;
+
+            label nSeedMapped = 0;
+            label nSeedNotBoundary = 0;
+            label nSeedNoPatch = 0;
+
+
+            // ----------------------------------------------------
+            // Ring 0 from stable physical-wall/base labels.
+            // ----------------------------------------------------
+
+            forAllConstIter
+            (
+                labelHashSet,
+                blNeutralBaseMeshPoints_,
+                it
+            )
+            {
+                const label baseMeshPt =
+                    it.key();
+
+                if
+                (
+                    baseMeshPt < 0
+                 || baseMeshPt >= label(meshPtToBp.size())
+                )
+                {
+                    ++nSeedNotBoundary;
+                    continue;
+                }
+
+
+                const label bpI =
+                    meshPtToBp[baseMeshPt];
+
+                if
+                (
+                    bpI < 0
+                 || bpI >= label(bPtsV7.size())
+                )
+                {
+                    ++nSeedNotBoundary;
+                    continue;
+                }
+
+
+                if
+                (
+                    !blNeutralBaseWallPatchAtMeshPoint_.found
+                    (
+                        baseMeshPt
+                    )
+                )
+                {
+                    ++nSeedNoPatch;
+                    continue;
+                }
+
+
+                const label wallPatch =
+                    blNeutralBaseWallPatchAtMeshPoint_
+                    [
+                        baseMeshPt
+                    ];
+
+
+                // Verify this CURRENT boundary point still belongs
+                // to the expected BL-side wall patch.
+                bool hasExpectedWall = false;
+
+                forAllRow(pPatchesV7, bpI, ppI)
+                {
+                    if
+                    (
+                        pPatchesV7(bpI, ppI)
+                        == wallPatch
+                    )
+                    {
+                        hasExpectedWall = true;
+                        break;
+                    }
+                }
+
+                if( !hasExpectedWall )
+                {
+                    ++nSeedNoPatch;
+                    continue;
+                }
+
+
+                if( !cfmitchV7LockedBp.found(bpI) )
+                {
+                    cfmitchV7LockedBp.insert(bpI);
+
+                    wallPatchForBp[bpI] =
+                        wallPatch;
+
+                    frontier.append(bpI);
+
+                    ++ringCount[0];
+                    ++nSeedMapped;
+                }
+            }
+
+
+            // ----------------------------------------------------
+            // Rings 1..N on CURRENT wall topology.
+            // ----------------------------------------------------
+
+            for
+            (
+                label ringI=1;
+                ringI<=cfmitchV7PersistentSeamLockRings;
+                ++ringI
+            )
+            {
+                labelLongList nextFrontier;
+
+
+                forAll(frontier, fI)
+                {
+                    const label bpI =
+                        frontier[fI];
+
+                    if
+                    (
+                        bpI < 0
+                     || bpI >= label(wallPatchForBp.size())
+                    )
+                        continue;
+
+
+                    const label wallPatch =
+                        wallPatchForBp[bpI];
+
+                    if( wallPatch < 0 )
+                        continue;
+
+
+                    forAllRow
+                    (
+                        pointPointsV7,
+                        bpI,
+                        ppI
+                    )
+                    {
+                        const label bpJ =
+                            pointPointsV7(bpI, ppI);
+
+                        if
+                        (
+                            bpJ < 0
+                         || bpJ >= label(bPtsV7.size())
+                         || cfmitchV7LockedBp.found(bpJ)
+                        )
+                            continue;
+
+
+                        // Collar remains strictly on the same
+                        // single BL-side wall patch.
+                        if
+                        (
+                            pPatchesV7.sizeOfRow(bpJ) != 1
+                         || pPatchesV7(bpJ, 0) != wallPatch
+                        )
+                            continue;
+
+
+                        cfmitchV7LockedBp.insert(bpJ);
+
+                        wallPatchForBp[bpJ] =
+                            wallPatch;
+
+                        nextFrontier.append(bpJ);
+
+                        ++ringCount[ringI];
+                    }
+                }
+
+
+                frontier = nextFrontier;
+
+                if( frontier.size() == 0 )
+                    break;
+            }
+
+
+            // ----------------------------------------------------
+            // Convert wall/base boundary points to stable global
+            // labels AND add their exact macro/top partners.
+            // ----------------------------------------------------
+
+            label nPairFound = 0;
+            label nPairMissing = 0;
+
+
+            forAllConstIter
+            (
+                labelHashSet,
+                cfmitchV7LockedBp,
+                it
+            )
+            {
+                const label bpI =
+                    it.key();
+
+                if
+                (
+                    bpI < 0
+                 || bpI >= label(bPtsV7.size())
+                )
+                    continue;
+
+
+                const label baseMeshPt =
+                    bPtsV7[bpI];
+
+                cfmitchV7LockedMeshPts.insert
+                (
+                    baseMeshPt
+                );
+
+
+                if
+                (
+                    blMacroTopForBaseMeshPoint_.found
+                    (
+                        baseMeshPt
+                    )
+                )
+                {
+                    const label topMeshPt =
+                        blMacroTopForBaseMeshPoint_
+                        [
+                            baseMeshPt
+                        ];
+
+                    if
+                    (
+                        topMeshPt >= 0
+                     && topMeshPt
+                        < label(mesh_.points().size())
+                    )
+                    {
+                        cfmitchV7LockedMeshPts.insert
+                        (
+                            topMeshPt
+                        );
+
+                        ++nPairFound;
+                    }
+                    else
+                    {
+                        ++nPairMissing;
+                    }
+                }
+                else
+                {
+                    ++nPairMissing;
+                }
+            }
+
+
+            Info
+                << "CFMITCH V7B PERSISTENT_LOCK_BUILD:"
+                << " stableNeutralBases="
+                << blNeutralBaseMeshPoints_.size()
+                << " seedMapped="
+                << nSeedMapped
+                << " seedNotBoundary="
+                << nSeedNotBoundary
+                << " seedNoPatch="
+                << nSeedNoPatch
+                << " lockedBp="
+                << cfmitchV7LockedBp.size()
+                << " lockedMeshPts="
+                << cfmitchV7LockedMeshPts.size()
+                << " pairFound="
+                << nPairFound
+                << " pairMissing="
+                << nPairMissing
+                << " rings="
+                << cfmitchV7PersistentSeamLockRings
+                << " ringCount="
+                << ringCount
+                << endl;
+
+
+            // Diagnostic proof for the previously-forensic target
+            // column.  These labels are NOT used to select or alter
+            // geometry.
+            Info
+                << "CFMITCH V7B TARGET_LOCK_AUDIT:"
+                << " base1487931="
+                << cfmitchV7LockedMeshPts.found(1487931)
+                << " top337809="
+                << cfmitchV7LockedMeshPts.found(337809)
+                << " base1487940="
+                << cfmitchV7LockedMeshPts.found(1487940)
+                << " top337818="
+                << cfmitchV7LockedMeshPts.found(337818)
+                << " base1487942="
+                << cfmitchV7LockedMeshPts.found(1487942)
+                << " top337820="
+                << cfmitchV7LockedMeshPts.found(337820)
+                << endl;
+        }
 
 
         if( enforceConstraints )
             surfOpt.enforceConstraints();
 
 
-        //- lock acute BL+BL+neutral corners: prevent optimizer
-        //- from moving these points across patch boundaries
-        //- controlled by meshDict: lockAcuteCornerPoints true/false
-        if( lockAcuteCorners && blblAcuteCornerPoints_.size() )
+        // --------------------------------------------------------
+        // Surface lock set.
+        //
+        // meshSurfaceOptimizer marks these boundary-point indices
+        // LOCKED and skips them in its optimization loops.
+        // --------------------------------------------------------
+
+        // ========================================================
+        // CFMITCH PERSISTENT SURFACE LINEAGE LOCK V7C
+        //
+        // V7B established exact stable GLOBAL mesh-point lineage:
+        //
+        //     wall/base <-> macro/top
+        //
+        // But meshSurfaceOptimizer consumes BOUNDARY-POINT indices.
+        //
+        // V7B only passed the wall/base bpI set here.  The target
+        // audit proved the macro/top global labels were known, yet
+        // top337809/top337818 still moved in optimizeSurface().
+        //
+        // V7C rebuilds the optimizer lock set from ALL persistent
+        // global labels which occur in the CURRENT surfaceEngine
+        // boundaryPoints() addressing.
+        //
+        // Thus there is no stale-bpI assumption and no distinction
+        // between base and top at this stage.
+        // ========================================================
+
+        labelHashSet surfaceLockedBp;
+
+        label nV7CSurfaceBaseBp = 0;
+        label nV7CSurfaceGlobalBp = 0;
+        label nV7CSurfaceTopBoundary = 0;
+
+
+        if( cfmitchV7PersistentSeamLock )
         {
-            Info << "Locking " << blblAcuteCornerPoints_.size()
-                 << " acute BL+BL+neutral corner points in optimizer" << endl;
-            surfOpt.setAcuteCornerPoints(blblAcuteCornerPoints_);
+            // Preserve the current-base set constructed by V7B.
+            forAllConstIter
+            (
+                labelHashSet,
+                cfmitchV7LockedBp,
+                it
+            )
+            {
+                if
+                (
+                    !surfaceLockedBp.found(it.key())
+                )
+                {
+                    surfaceLockedBp.insert(it.key());
+                    ++nV7CSurfaceBaseBp;
+                }
+            }
+
+
+            // ----------------------------------------------------
+            // Convert every stable global persistent label back to
+            // CURRENT boundary-point index space.
+            // ----------------------------------------------------
+
+            const labelList& surfaceBPointsV7C =
+                mse.boundaryPoints();
+
+
+            forAll(surfaceBPointsV7C, bpI)
+            {
+                const label meshPtI =
+                    surfaceBPointsV7C[bpI];
+
+                if
+                (
+                    !cfmitchV7LockedMeshPts.found
+                    (
+                        meshPtI
+                    )
+                )
+                    continue;
+
+
+                if
+                (
+                    !surfaceLockedBp.found(bpI)
+                )
+                {
+                    surfaceLockedBp.insert(bpI);
+                    ++nV7CSurfaceGlobalBp;
+                }
+
+
+                // A persistent mesh point which is not one of the
+                // V7B base bpI values is normally a macro/top point.
+                if
+                (
+                    !cfmitchV7LockedBp.found(bpI)
+                )
+                {
+                    ++nV7CSurfaceTopBoundary;
+                }
+            }
+
+
+            Info
+                << "CFMITCH V7C SURFACE_LINEAGE_LOCK:"
+                << " persistentGlobal="
+                << cfmitchV7LockedMeshPts.size()
+                << " baseBp="
+                << cfmitchV7LockedBp.size()
+                << " addedFromGlobal="
+                << nV7CSurfaceGlobalBp
+                << " topBoundaryMatches="
+                << nV7CSurfaceTopBoundary
+                << " finalSurfaceLocked="
+                << surfaceLockedBp.size()
+                << endl;
+
+
+            // ----------------------------------------------------
+            // Exact target audit in CURRENT surface bp addressing.
+            // Diagnostic only.
+            // ----------------------------------------------------
+
+            label target337809Bp = -1;
+            label target337818Bp = -1;
+            label target337820Bp = -1;
+
+            forAll(surfaceBPointsV7C, bpI)
+            {
+                const label meshPtI =
+                    surfaceBPointsV7C[bpI];
+
+                if( meshPtI == 337809 )
+                    target337809Bp = bpI;
+
+                if( meshPtI == 337818 )
+                    target337818Bp = bpI;
+
+                if( meshPtI == 337820 )
+                    target337820Bp = bpI;
+            }
+
+
+            Info
+                << "CFMITCH V7C TARGET_SURFACE_LOCK:"
+                << " top337809Bp="
+                << target337809Bp
+                << " locked="
+                << (
+                    target337809Bp >= 0
+                 && surfaceLockedBp.found(target337809Bp)
+                )
+                << " top337818Bp="
+                << target337818Bp
+                << " locked="
+                << (
+                    target337818Bp >= 0
+                 && surfaceLockedBp.found(target337818Bp)
+                )
+                << " top337820Bp="
+                << target337820Bp
+                << " locked="
+                << (
+                    target337820Bp >= 0
+                 && surfaceLockedBp.found(target337820Bp)
+                )
+                << endl;
         }
+
+        if
+        (
+            lockAcuteCorners
+         && blblAcuteCornerPoints_.size()
+        )
+        {
+            forAllConstIter
+            (
+                labelHashSet,
+                blblAcuteCornerPoints_,
+                it
+            )
+            {
+                surfaceLockedBp.insert(it.key());
+            }
+        }
+
+        if( !surfaceLockedBp.empty() )
+        {
+            Info
+                << "CFMITCH V7B SURFACE_LOCK:"
+                << " total="
+                << surfaceLockedBp.size()
+                << " persistentSeamCollar="
+                << cfmitchV7LockedBp.size()
+                << " acute="
+                << (
+                    lockAcuteCorners
+                  ? blblAcuteCornerPoints_.size()
+                  : 0
+                )
+                << endl;
+
+            surfOpt.setAcuteCornerPoints
+            (
+                surfaceLockedBp
+            );
+        }
+
         surfOpt.optimizeSurface();
     }
+
+    cfmTraceMacroHairs("AFTER_SURFACE_OPT");
 
     //- final optimisation
     meshOptimizer optimizer(mesh_);
     if( enforceConstraints )
         optimizer.enforceConstraints();
 
-    // Compute acute corner global point list once -- reused before both
-    // optimizeMeshFV and untangleMeshFV since optimizeBoundaryLayer
-    // calls removeUserConstraints() internally, wiping the first lock.
+    // ------------------------------------------------------------
+    // V7 persistent global-point locks.
+    //
+    // Combine with the pre-existing acute-corner protection so the
+    // volume optimizer sees one deduplicated lock set.
+    // ------------------------------------------------------------
+
     labelLongList acuteGlobalPts;
-    if( lockAcuteCorners && !blblAcuteCornerPoints_.empty() )
+
+    labelHashSet combinedGlobalLockSet;
+
+    if( cfmitchV7PersistentSeamLock )
+    {
+        forAllConstIter
+        (
+            labelHashSet,
+            cfmitchV7LockedMeshPts,
+            it
+        )
+        {
+            combinedGlobalLockSet.insert
+            (
+                it.key()
+            );
+        }
+    }
+
+    if
+    (
+        lockAcuteCorners
+     && !blblAcuteCornerPoints_.empty()
+    )
     {
         const meshSurfaceEngine mseForLock(mesh_);
-        const labelList& bPoints = mseForLock.boundaryPoints();
-        forAllConstIter(labelHashSet, blblAcuteCornerPoints_, it)
+
+        const labelList& bPoints =
+            mseForLock.boundaryPoints();
+
+        forAllConstIter
+        (
+            labelHashSet,
+            blblAcuteCornerPoints_,
+            it
+        )
         {
-            const label bpI = it.key();
-            if( bpI >= 0 && bpI < label(bPoints.size()) )
-                acuteGlobalPts.append(bPoints[bpI]);
+            const label bpI =
+                it.key();
+
+            if
+            (
+                bpI >= 0
+             && bpI < label(bPoints.size())
+            )
+            {
+                const label meshPtI =
+                    bPoints[bpI];
+
+                acuteGlobalPts.append
+                (
+                    meshPtI
+                );
+
+                combinedGlobalLockSet.insert
+                (
+                    meshPtI
+                );
+            }
         }
-        if( acuteGlobalPts.size() > 0 )
+    }
+
+
+    if( !combinedGlobalLockSet.empty() )
+    {
+        labelLongList combinedGlobalLocks
+        (
+            combinedGlobalLockSet.size()
+        );
+
+        label lockI = 0;
+
+        forAllConstIter
+        (
+            labelHashSet,
+            combinedGlobalLockSet,
+            it
+        )
         {
-            optimizer.lockPoints(acuteGlobalPts);
-            Info << "optimiseFinalMesh: locked "
-                 << acuteGlobalPts.size()
-                 << " acute corner points in volume optimizer" << endl;
+            combinedGlobalLocks[lockI++] =
+                it.key();
         }
+
+
+        optimizer.lockPoints
+        (
+            combinedGlobalLocks
+        );
+
+
+        Info
+            << "CFMITCH V7B VOLUME_LOCK:"
+            << " total="
+            << combinedGlobalLocks.size()
+            << " persistentSeamCollar="
+            << cfmitchV7LockedMeshPts.size()
+            << " acute="
+            << acuteGlobalPts.size()
+            << endl;
     }
 
     // Surface-constrained optimizer: gate by meshDict switch.
@@ -16449,13 +19641,20 @@ void cartesianMeshGenerator::optimiseFinalMesh()
             &featureTangents
         );
         optimizer.optimizeMeshFV();
+        cfmTraceMacroHairs("AFTER_OPTIMIZE_MESHFV");
+
         optimizer.optimizeLowQualityFaces();
+        cfmTraceMacroHairs("AFTER_LOWQUALITY_1");
+
         optimizer.setSurfaceConstraint(NULL, NULL, NULL, NULL, NULL);
     }
     else
     {
         optimizer.optimizeMeshFV();
+        cfmTraceMacroHairs("AFTER_OPTIMIZE_MESHFV");
+
         optimizer.optimizeLowQualityFaces();
+        cfmTraceMacroHairs("AFTER_LOWQUALITY_1");
 
         // Second constrained pass: user requested surface-constrained
         // optimization but it was skipped due to pre-existing negVol.
@@ -16645,6 +19844,8 @@ void cartesianMeshGenerator::optimiseFinalMesh()
         }
     }
 
+    cfmTraceMacroHairs("BEFORE_REPROJECTION");
+
     // Post-optimizer surface re-projection: re-project drifted single-patch
     // boundary points while octree is still live. Tolerance-filtered and
     // validated -- same pattern as snapSurfaceBeforeBLRefinement.
@@ -16751,6 +19952,16 @@ void cartesianMeshGenerator::optimiseFinalMesh()
             // Skip points attached to fragile cells/faces
             if( protectedPts.found(meshPtI) )
                 continue;
+
+            // V7: do not destroy the persistent seam/collar field
+            // during post-optimizer STL re-projection.
+            if
+            (
+                cfmitchV7PersistentSeamLock
+             && cfmitchV7LockedMeshPts.found(meshPtI)
+            )
+                continue;
+
             const label patchI = pPatchesR(bpI, 0);
             point testPt;
             scalar testDsq;
@@ -17251,15 +20462,21 @@ void cartesianMeshGenerator::optimiseFinalMesh()
             }
         }
     }
+    cfmTraceMacroHairs("AFTER_REPROJECTION");
+
     //- octreePtr_ kept alive until post-BL rescue completes.
     //- Previously deleted here; deferred to destructor so that
     //- surface-constrained post-BL rescue can use it.
 
     optimizer.optimizeBoundaryLayer(modSurfacePtr_==NULL);
 
+    cfmTraceMacroHairs("AFTER_BOUNDARY_LAYER_OPT");
+
     // Second low-quality face pass after BL refinement -- targets skew
     // introduced by boundary layer cells that weren't present pre-BL.
     optimizer.optimizeLowQualityFaces();
+
+    cfmTraceMacroHairs("AFTER_LOWQUALITY_2");
 
     // Post-BL validity audit: find incorrectly oriented faces and attempt
     // conservative face-flip repair with full accept/reject validation.
@@ -17531,6 +20748,8 @@ void cartesianMeshGenerator::optimiseFinalMesh()
             Info << "Post-BL audit: all face pyramids OK" << endl;
         }
     }
+
+    cfmTraceMacroHairs("BEFORE_FINAL_UNTANGLE");
 
     // Final untangle intentionally runs after optimizeBoundaryLayer has
     // cleared user constraints via removeUserConstraints(). Acute corner
@@ -17967,6 +21186,8 @@ void cartesianMeshGenerator::optimiseFinalMesh()
         }
     }
 
+    cfmTraceMacroHairs("AFTER_FINAL_UNTANGLE");
+
     mesh_.clearAddressingData();
 
     if( modSurfacePtr_ )
@@ -18286,6 +21507,12 @@ void cartesianMeshGenerator::generateMesh()
         if( controller_.runCurrentStep("surfaceTopology") )
         {
             surfacePreparation();
+
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_SURFACE_TOPOLOGY"
+            );
             earlyLineageCSV("postSurfaceTopology");
         }
 
@@ -18302,6 +21529,12 @@ void cartesianMeshGenerator::generateMesh()
         if( controller_.runCurrentStep("surfaceProjection") )
         {
             mapMeshToSurface();
+
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_SURFACE_PROJECTION"
+            );
             earlyLineageCSV("postSurfaceProjection");
             // Re-run patch assignment after projection to correct any
             // misassignments that occurred on the unprojected hex mesh.
@@ -18367,9 +21600,21 @@ void cartesianMeshGenerator::generateMesh()
             }
 
             mapEdgesAndCorners();
+
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_EDGE_TOPOLOGY"
+            );
             earlyLineageCSV("postMapEdgesAndCorners");
 
             optimiseMeshSurface();
+
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_SURFACE_OPT"
+            );
             earlyLineageCSV("postOptimiseMeshSurface");
 
 
@@ -18534,6 +21779,12 @@ void cartesianMeshGenerator::generateMesh()
 
             generateBoundaryLayers();
 
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_BL_GENERATION"
+            );
+
             CFMitchOFHardQuality postBLCreateOF;
             evaluateOpenFOAMHardQuality(mesh_, postBLCreateOF);
             printOpenFOAMCandidateQuality("POST_BL_CREATE", postBLCreateOF);
@@ -18557,7 +21808,19 @@ void cartesianMeshGenerator::generateMesh()
             evaluateOpenFOAMHardQuality(mesh_, preFinalOptOF);
             printOpenFOAMCandidateQuality("PRE_FINAL_OPT", preFinalOptOF);
 
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "PRE_FINAL_OPT"
+            );
+
             optimiseFinalMesh();
+
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_FINAL_OPT"
+            );
 
             mesh_.clearAddressingData();
             CFMitchOFHardQuality postFinalOptOF;
@@ -18680,6 +21943,876 @@ void cartesianMeshGenerator::generateMesh()
             }
             writeLineageCSV("postOptimize");
         }
+
+        // ============================================================
+        // CFMITCH V6.0a COUPLED PRE-REFBL
+        //
+        // Reconnect the native cfMesh one-layer BL optimiser before
+        // the final pre-refinement snap and refineBoundaryLayers().
+        //
+        // V5.4b remains authoritative for final h1.
+        //
+        // V6.0a is transactional.  commit=false runs the complete
+        // candidate, measures it, then restores original points and
+        // mesh subsets.
+        // ============================================================
+
+        bool cfmitchPreRefBLCoupledOptimisation = false;
+        bool cfmitchPreRefBLCoupledCommit = false;
+        scalar cfmitchPreRefBLMinHairRatio = scalar(0.50);
+
+        // CFMitch V6.0b NORMAL-ONLY.
+        // One outer call is sufficient because each native normal routine
+        // performs this many neighbour-smoothing sweeps internally.
+        label cfmitchPreRefBLNormalSmoothingIterations = 2;
+
+        if( meshDict_.isDict("boundaryLayers") )
+        {
+            const dictionary& v60aBL =
+                meshDict_.subDict("boundaryLayers");
+
+            if
+            (
+                v60aBL.found
+                (
+                    "cfmitchPreRefBLCoupledOptimisation"
+                )
+            )
+            {
+                cfmitchPreRefBLCoupledOptimisation =
+                    Switch
+                    (
+                        v60aBL.lookup
+                        (
+                            "cfmitchPreRefBLCoupledOptimisation"
+                        )
+                    );
+            }
+
+            if
+            (
+                v60aBL.found
+                (
+                    "cfmitchPreRefBLCoupledCommit"
+                )
+            )
+            {
+                cfmitchPreRefBLCoupledCommit =
+                    Switch
+                    (
+                        v60aBL.lookup
+                        (
+                            "cfmitchPreRefBLCoupledCommit"
+                        )
+                    );
+            }
+
+            if
+            (
+                v60aBL.found
+                (
+                    "cfmitchPreRefBLMinHairRatio"
+                )
+            )
+            {
+                cfmitchPreRefBLMinHairRatio =
+                    readScalar
+                    (
+                        v60aBL.lookup
+                        (
+                            "cfmitchPreRefBLMinHairRatio"
+                        )
+                    );
+            }
+
+            if
+            (
+                v60aBL.found
+                (
+                    "cfmitchPreRefBLNormalSmoothingIterations"
+                )
+            )
+            {
+                cfmitchPreRefBLNormalSmoothingIterations =
+                    readLabel
+                    (
+                        v60aBL.lookup
+                        (
+                            "cfmitchPreRefBLNormalSmoothingIterations"
+                        )
+                    );
+            }
+        }
+
+        if
+        (
+            cfmitchPreRefBLMinHairRatio <= scalar(0)
+         || cfmitchPreRefBLMinHairRatio > scalar(1)
+        )
+        {
+            FatalErrorIn
+            (
+                "cartesianMeshGenerator::generateMesh()"
+            )
+                << "cfmitchPreRefBLMinHairRatio must be in (0,1], got "
+                << cfmitchPreRefBLMinHairRatio
+                << exit(FatalError);
+        }
+
+        if
+        (
+            cfmitchPreRefBLNormalSmoothingIterations < 1
+         || cfmitchPreRefBLNormalSmoothingIterations > 20
+        )
+        {
+            FatalErrorIn
+            (
+                "cartesianMeshGenerator::generateMesh()"
+            )
+                << "cfmitchPreRefBLNormalSmoothingIterations must be "
+                << "in [1,20], got "
+                << cfmitchPreRefBLNormalSmoothingIterations
+                << exit(FatalError);
+        }
+
+        Info
+            << "CFMITCH V6.0a COUPLED PRE-REFBL CONFIG:"
+            << " enabled="
+            << (
+                   cfmitchPreRefBLCoupledOptimisation
+                 ? "true"
+                 : "false"
+               )
+            << " commit="
+            << (
+                   cfmitchPreRefBLCoupledCommit
+                 ? "true"
+                 : "false"
+               )
+            << " minHairRatio="
+            << cfmitchPreRefBLMinHairRatio
+            << " normalOnly=true"
+            << " normalSmoothingIterations="
+            << cfmitchPreRefBLNormalSmoothingIterations
+            << " recalculateNormals=false"
+            << endl;
+
+        if
+        (
+            cfmitchPreRefBLCoupledOptimisation
+         && !finalUntangleRejected_
+         && !reprojUnsafe_
+        )
+        {
+            // --------------------------------------------------------
+            // Transaction snapshot: points + subset state.
+            // Native boundaryLayerOptimisation is expected to preserve
+            // topology but its hair analysis creates diagnostic subsets.
+            // --------------------------------------------------------
+
+            const label v60aNPointsBefore =
+                mesh_.points().size();
+
+            const label v60aNFacesBefore =
+                mesh_.faces().size();
+
+            const label v60aNCellsBefore =
+                mesh_.cells().size();
+
+            pointField v60aPointsBefore
+            (
+                v60aNPointsBefore,
+                point::zero
+            );
+
+            {
+                const pointFieldPMG& pts =
+                    mesh_.points();
+
+                forAll(pts, pointI)
+                    v60aPointsBefore[pointI] = pts[pointI];
+            }
+
+            std::map<label, meshSubset>
+                v60aPointSubsetsBefore;
+
+            std::map<label, meshSubset>
+                v60aFaceSubsetsBefore;
+
+            std::map<label, meshSubset>
+                v60aCellSubsetsBefore;
+
+            {
+                polyMeshGenModifier subsetModifier(mesh_);
+
+                v60aPointSubsetsBefore =
+                    subsetModifier.pointSubsetsAccess();
+
+                v60aFaceSubsetsBefore =
+                    subsetModifier.faceSubsetsAccess();
+
+                v60aCellSubsetsBefore =
+                    subsetModifier.cellSubsetsAccess();
+            }
+
+            // --------------------------------------------------------
+            // Propeller boundary quad-warp audit.
+            //
+            // Diagnostic is deliberately case-specific for V6.0a.
+            // Production policy will use patchRoles rather than a
+            // hard-coded patch name.
+            // --------------------------------------------------------
+
+            auto v60aPropellerWarpStats =
+            [&]
+            (
+                label& nQuad,
+                scalar& avgWarp,
+                scalar& maxWarp
+            )
+            {
+                nQuad = 0;
+                avgWarp = scalar(0);
+                maxWarp = scalar(0);
+
+                const PtrList<boundaryPatch>& patches =
+                    mesh_.boundaries();
+
+                label propellerPatchI = -1;
+
+                forAll(patches, patchI)
+                {
+                    if
+                    (
+                        patches[patchI].patchName()
+                     == word("propeller")
+                    )
+                    {
+                        propellerPatchI = patchI;
+                        break;
+                    }
+                }
+
+                if( propellerPatchI < 0 )
+                    return;
+
+                const boundaryPatch& pp =
+                    patches[propellerPatchI];
+
+                const faceListPMG& faces =
+                    mesh_.faces();
+
+                const pointFieldPMG& pts =
+                    mesh_.points();
+
+                scalar warpSum = scalar(0);
+
+                for
+                (
+                    label patchFaceI=0;
+                    patchFaceI<pp.patchSize();
+                    ++patchFaceI
+                )
+                {
+                    const label faceI =
+                        pp.patchStart() + patchFaceI;
+
+                    if
+                    (
+                        faceI < 0
+                     || faceI >= label(faces.size())
+                    )
+                        continue;
+
+                    const face& f =
+                        faces[faceI];
+
+                    if( f.size() != 4 )
+                        continue;
+
+                    const point& p0 = pts[f[0]];
+                    const point& p1 = pts[f[1]];
+                    const point& p2 = pts[f[2]];
+                    const point& p3 = pts[f[3]];
+
+                    const vector n012 =
+                        (p1-p0) ^ (p2-p0);
+
+                    const vector n023 =
+                        (p2-p0) ^ (p3-p0);
+
+                    const vector n013 =
+                        (p1-p0) ^ (p3-p0);
+
+                    const vector n123 =
+                        (p2-p1) ^ (p3-p1);
+
+                    const scalar m012 = mag(n012);
+                    const scalar m023 = mag(n023);
+                    const scalar m013 = mag(n013);
+                    const scalar m123 = mag(n123);
+
+                    if
+                    (
+                        m012 <= rootVSmall
+                     || m023 <= rootVSmall
+                     || m013 <= rootVSmall
+                     || m123 <= rootVSmall
+                    )
+                        continue;
+
+                    const scalar p3From012 =
+                        mag(((p3-p0) & n012)/m012);
+
+                    const scalar p1From023 =
+                        mag(((p1-p0) & n023)/m023);
+
+                    const scalar p2From013 =
+                        mag(((p2-p0) & n013)/m013);
+
+                    const scalar p0From123 =
+                        mag(((p0-p1) & n123)/m123);
+
+                    const scalar warp02 =
+                        Foam::max
+                        (
+                            p3From012,
+                            p1From023
+                        );
+
+                    const scalar warp13 =
+                        Foam::max
+                        (
+                            p2From013,
+                            p0From123
+                        );
+
+                    const scalar warp =
+                        Foam::max(warp02, warp13);
+
+                    warpSum += warp;
+
+                    maxWarp =
+                        Foam::max(maxWarp, warp);
+
+                    ++nQuad;
+                }
+
+                if( nQuad > 0 )
+                {
+                    avgWarp =
+                        warpSum/scalar(nQuad);
+                }
+            };
+
+            label v60aWarpNBefore = 0;
+            scalar v60aWarpAvgBefore = scalar(0);
+            scalar v60aWarpMaxBefore = scalar(0);
+
+            v60aPropellerWarpStats
+            (
+                v60aWarpNBefore,
+                v60aWarpAvgBefore,
+                v60aWarpMaxBefore
+            );
+
+            mesh_.clearAddressingData();
+
+            CFMitchOFHardQuality v60aBeforeOF;
+
+            evaluateOpenFOAMHardQuality
+            (
+                mesh_,
+                v60aBeforeOF
+            );
+
+            printOpenFOAMCandidateQuality
+            (
+                "V60A_PRE_COUPLED",
+                v60aBeforeOF
+            );
+
+            // --------------------------------------------------------
+            // Construct and configure Franjo's native one-layer
+            // coupled optimiser.
+            // --------------------------------------------------------
+
+            boundaryLayerOptimisation
+                v60aOptimisation(mesh_);
+
+            boundaryLayerOptimisation::readSettings
+            (
+                meshDict_,
+                v60aOptimisation
+            );
+
+            // V6.0b deliberately smooths the existing hair field instead
+            // of rebuilding normals from the surface.  This isolates
+            // neighbour coupling from normal reconstruction.
+            v60aOptimisation.recalculateNormals(false);
+
+            v60aOptimisation.setNumNormalsSmoothingIterations
+            (
+                cfmitchPreRefBLNormalSmoothingIterations
+            );
+
+            const edgeLongList& v60aHairEdges =
+                v60aOptimisation.hairEdges();
+
+            scalarField v60aHairLengthBefore
+            (
+                v60aHairEdges.size(),
+                scalar(0)
+            );
+
+            forAll(v60aHairEdges, hairI)
+            {
+                const edge& he =
+                    v60aHairEdges[hairI];
+
+                if
+                (
+                    he.start() >= 0
+                 && he.end() >= 0
+                 && he.start() < v60aNPointsBefore
+                 && he.end() < v60aNPointsBefore
+                )
+                {
+                    v60aHairLengthBefore[hairI] =
+                        mag
+                        (
+                            v60aPointsBefore[he.end()]
+                          - v60aPointsBefore[he.start()]
+                        );
+                }
+            }
+
+            Info
+                << "CFMITCH V6.0b NORMAL-ONLY:"
+                << " running constrained native hair smoothing"
+                << " hairs=" << v60aHairEdges.size()
+                << " smoothingIterations="
+                << cfmitchPreRefBLNormalSmoothingIterations
+                << " recalculateNormals=false"
+                << endl;
+
+            v60aOptimisation.optimiseHairNormalsOnly();
+
+            mesh_.clearAddressingData();
+
+            // Optimiser's debug/subset additions are not part of
+            // this transaction.
+            {
+                polyMeshGenModifier subsetModifier(mesh_);
+
+                subsetModifier.pointSubsetsAccess() =
+                    v60aPointSubsetsBefore;
+
+                subsetModifier.faceSubsetsAccess() =
+                    v60aFaceSubsetsBefore;
+
+                subsetModifier.cellSubsetsAccess() =
+                    v60aCellSubsetsBefore;
+            }
+
+            const bool v60aTopologyStable =
+            (
+                mesh_.points().size() == v60aNPointsBefore
+             && mesh_.faces().size() == v60aNFacesBefore
+             && mesh_.cells().size() == v60aNCellsBefore
+            );
+
+            if( !v60aTopologyStable )
+            {
+                FatalErrorIn
+                (
+                    "cartesianMeshGenerator::generateMesh()"
+                )
+                    << "CFMITCH V6.0a optimiser unexpectedly changed "
+                    << "topology: points "
+                    << v60aNPointsBefore << "->"
+                    << mesh_.points().size()
+                    << " faces "
+                    << v60aNFacesBefore << "->"
+                    << mesh_.faces().size()
+                    << " cells "
+                    << v60aNCellsBefore << "->"
+                    << mesh_.cells().size()
+                    << exit(FatalError);
+            }
+
+            // --------------------------------------------------------
+            // Hair movement telemetry.
+            // --------------------------------------------------------
+
+            scalar v60aMinHairRatio = GREAT;
+            scalar v60aMaxHairRatio = scalar(0);
+            scalar v60aRelChangeSum = scalar(0);
+            scalar v60aMaxRelChange = scalar(0);
+
+            scalar v60aMaxStartMove = scalar(0);
+            scalar v60aMaxEndMove = scalar(0);
+
+            label v60aValidHairs = 0;
+            label v60aChangedHairs = 0;
+            label v60aShortenedHairs = 0;
+            label v60aLengthenedHairs = 0;
+
+            const pointFieldPMG& v60aPointsAfter =
+                mesh_.points();
+
+            forAll(v60aHairEdges, hairI)
+            {
+                const edge& he =
+                    v60aHairEdges[hairI];
+
+                if
+                (
+                    he.start() < 0
+                 || he.end() < 0
+                 || he.start() >= label(v60aPointsAfter.size())
+                 || he.end() >= label(v60aPointsAfter.size())
+                )
+                    continue;
+
+                const scalar oldLength =
+                    v60aHairLengthBefore[hairI];
+
+                if( oldLength <= VSMALL )
+                    continue;
+
+                const scalar newLength =
+                    mag
+                    (
+                        v60aPointsAfter[he.end()]
+                      - v60aPointsAfter[he.start()]
+                    );
+
+                const scalar ratio =
+                    newLength/oldLength;
+
+                const scalar relChange =
+                    mag(ratio - scalar(1));
+
+                v60aMinHairRatio =
+                    Foam::min
+                    (
+                        v60aMinHairRatio,
+                        ratio
+                    );
+
+                v60aMaxHairRatio =
+                    Foam::max
+                    (
+                        v60aMaxHairRatio,
+                        ratio
+                    );
+
+                v60aRelChangeSum += relChange;
+
+                v60aMaxRelChange =
+                    Foam::max
+                    (
+                        v60aMaxRelChange,
+                        relChange
+                    );
+
+                v60aMaxStartMove =
+                    Foam::max
+                    (
+                        v60aMaxStartMove,
+                        mag
+                        (
+                            v60aPointsAfter[he.start()]
+                          - v60aPointsBefore[he.start()]
+                        )
+                    );
+
+                v60aMaxEndMove =
+                    Foam::max
+                    (
+                        v60aMaxEndMove,
+                        mag
+                        (
+                            v60aPointsAfter[he.end()]
+                          - v60aPointsBefore[he.end()]
+                        )
+                    );
+
+                if( ratio < scalar(1)-SMALL )
+                    ++v60aShortenedHairs;
+
+                if( ratio > scalar(1)+SMALL )
+                    ++v60aLengthenedHairs;
+
+                if( relChange > scalar(1.0e-10) )
+                    ++v60aChangedHairs;
+
+                ++v60aValidHairs;
+            }
+
+            if( v60aValidHairs == 0 )
+            {
+                v60aMinHairRatio = scalar(1);
+                v60aMaxHairRatio = scalar(1);
+            }
+
+            const scalar v60aMeanRelChange =
+            (
+                v60aValidHairs > 0
+              ? v60aRelChangeSum/scalar(v60aValidHairs)
+              : scalar(0)
+            );
+
+            label v60aWarpNAfter = 0;
+            scalar v60aWarpAvgAfter = scalar(0);
+            scalar v60aWarpMaxAfter = scalar(0);
+
+            v60aPropellerWarpStats
+            (
+                v60aWarpNAfter,
+                v60aWarpAvgAfter,
+                v60aWarpMaxAfter
+            );
+
+            mesh_.clearAddressingData();
+
+            CFMitchOFHardQuality v60aAfterOF;
+
+            evaluateOpenFOAMHardQuality
+            (
+                mesh_,
+                v60aAfterOF
+            );
+
+            printOpenFOAMCandidateQuality
+            (
+                "V60A_POST_COUPLED_CANDIDATE",
+                v60aAfterOF
+            );
+
+            const bool v60aHairSafe =
+                v60aMinHairRatio
+             >= cfmitchPreRefBLMinHairRatio;
+
+            // V6.0b is specifically a fixed-root/fixed-length experiment.
+            // Any meaningful violation means some shared-point interaction
+            // is moving topology in a way this mode did not intend.
+            const scalar v60bLengthTolerance = scalar(1.0e-8);
+            const scalar v60bRootMoveTolerance = scalar(1.0e-10);
+
+            const bool v60bLengthInvariant =
+            (
+                v60aMinHairRatio
+                    >= scalar(1) - v60bLengthTolerance
+             && v60aMaxHairRatio
+                    <= scalar(1) + v60bLengthTolerance
+            );
+
+            const bool v60bRootInvariant =
+                v60aMaxStartMove <= v60bRootMoveTolerance;
+
+            const bool v60aHardSafe =
+            (
+                v60aTopologyStable
+             && v60aAfterOF.signedNegVolCells
+                 <= v60aBeforeOF.signedNegVolCells
+             && v60aAfterOF.pyramidErrors
+                 <= v60aBeforeOF.pyramidErrors
+             && v60aAfterOF.maxNonOrth < scalar(90)
+             && v60aAfterOF.zeroFaceCells
+                 <= v60aBeforeOF.zeroFaceCells
+             && v60aAfterOF.centreFallbackCells
+                 <= v60aBeforeOF.centreFallbackCells
+            );
+
+            // Initial gate deliberately conservative.
+            const bool v60aSoftNonWorse =
+            (
+                v60aAfterOF.severeNonOrthFaces
+                 <= v60aBeforeOF.severeNonOrthFaces
+             && v60aAfterOF.maxNonOrth
+                 <= v60aBeforeOF.maxNonOrth + SMALL
+            );
+
+            const bool v60aWouldAccept =
+            (
+                v60aHairSafe
+             && v60bLengthInvariant
+             && v60bRootInvariant
+             && v60aHardSafe
+             && v60aSoftNonWorse
+            );
+
+            Info
+                << "CFMITCH V6.0b NORMAL-ONLY INVARIANTS:"
+                << " lengthInvariant="
+                << (v60bLengthInvariant ? "yes" : "no")
+                << " rootInvariant="
+                << (v60bRootInvariant ? "yes" : "no")
+                << " maxStartMove="
+                << v60aMaxStartMove
+                << " minHairRatio="
+                << v60aMinHairRatio
+                << " maxHairRatio="
+                << v60aMaxHairRatio
+                << endl;
+
+            Info
+                << "CFMITCH V6.0b NORMAL-ONLY RESULT:"
+                << " hairs=" << v60aHairEdges.size()
+                << " validHairs=" << v60aValidHairs
+                << " changed=" << v60aChangedHairs
+                << " shortened=" << v60aShortenedHairs
+                << " lengthened=" << v60aLengthenedHairs
+                << " minHairRatio=" << v60aMinHairRatio
+                << " maxHairRatio=" << v60aMaxHairRatio
+                << " meanAbsRelChange=" << v60aMeanRelChange
+                << " maxAbsRelChange=" << v60aMaxRelChange
+                << " maxStartMove=" << v60aMaxStartMove
+                << " maxEndMove=" << v60aMaxEndMove
+                << " propellerQuadWarpCount="
+                << v60aWarpNBefore
+                << "->"
+                << v60aWarpNAfter
+                << " propellerWarpAvg="
+                << v60aWarpAvgBefore
+                << "->"
+                << v60aWarpAvgAfter
+                << " propellerWarpMax="
+                << v60aWarpMaxBefore
+                << "->"
+                << v60aWarpMaxAfter
+                << " negVol="
+                << v60aBeforeOF.signedNegVolCells
+                << "->"
+                << v60aAfterOF.signedNegVolCells
+                << " pyramids="
+                << v60aBeforeOF.pyramidErrors
+                << "->"
+                << v60aAfterOF.pyramidErrors
+                << " severeNonOrth="
+                << v60aBeforeOF.severeNonOrthFaces
+                << "->"
+                << v60aAfterOF.severeNonOrthFaces
+                << " maxNonOrth="
+                << v60aBeforeOF.maxNonOrth
+                << "->"
+                << v60aAfterOF.maxNonOrth
+                << " determinant="
+                << v60aBeforeOF.smallDeterminantCells
+                << "->"
+                << v60aAfterOF.smallDeterminantCells
+                << " lowWeight="
+                << v60aBeforeOF.smallWeightFaces
+                << "->"
+                << v60aAfterOF.smallWeightFaces
+                << " lowVolRatio="
+                << v60aBeforeOF.smallVolRatioFaces
+                << "->"
+                << v60aAfterOF.smallVolRatioFaces
+                << " hairSafe="
+                << (v60aHairSafe ? "yes" : "no")
+                << " hardSafe="
+                << (v60aHardSafe ? "yes" : "no")
+                << " softNonWorse="
+                << (v60aSoftNonWorse ? "yes" : "no")
+                << " wouldAccept="
+                << (v60aWouldAccept ? "yes" : "no")
+                << endl;
+
+            if
+            (
+                cfmitchPreRefBLCoupledCommit
+             && v60aWouldAccept
+            )
+            {
+                Info
+                    << "CFMITCH V6.0a COUPLED PRE-REFBL: COMMIT"
+                    << endl;
+            }
+            else
+            {
+                Info
+                    << "CFMITCH V6.0a COUPLED PRE-REFBL: ROLLBACK "
+                    << (
+                           cfmitchPreRefBLCoupledCommit
+                         ? "candidate rejected"
+                         : "diagnostic commit disabled"
+                       )
+                    << endl;
+
+                polyMeshGenModifier rollbackModifier(mesh_);
+
+                pointFieldPMG& rollbackPoints =
+                    rollbackModifier.pointsAccess();
+
+                forAll(v60aPointsBefore, pointI)
+                    rollbackPoints[pointI] =
+                        v60aPointsBefore[pointI];
+
+                {
+                    polyMeshGenModifier subsetModifier(mesh_);
+
+                    subsetModifier.pointSubsetsAccess() =
+                        v60aPointSubsetsBefore;
+
+                    subsetModifier.faceSubsetsAccess() =
+                        v60aFaceSubsetsBefore;
+
+                    subsetModifier.cellSubsetsAccess() =
+                        v60aCellSubsetsBefore;
+                }
+
+                mesh_.clearAddressingData();
+
+                CFMitchOFHardQuality v60aRollbackOF;
+
+                evaluateOpenFOAMHardQuality
+                (
+                    mesh_,
+                    v60aRollbackOF
+                );
+
+                printOpenFOAMCandidateQuality
+                (
+                    "V60A_POST_ROLLBACK",
+                    v60aRollbackOF
+                );
+
+                Info
+                    << "CFMITCH V6.0a COUPLED PRE-REFBL ROLLBACK:"
+                    << " negVol="
+                    << v60aRollbackOF.signedNegVolCells
+                    << " pyramids="
+                    << v60aRollbackOF.pyramidErrors
+                    << " severeNonOrth="
+                    << v60aRollbackOF.severeNonOrthFaces
+                    << " maxNonOrth="
+                    << v60aRollbackOF.maxNonOrth
+                    << endl;
+            }
+        }
+        else if( cfmitchPreRefBLCoupledOptimisation )
+        {
+            Info
+                << "CFMITCH V6.0a COUPLED PRE-REFBL:"
+                << " skipped unsafe state"
+                << " finalUntangleRejected="
+                << (
+                       finalUntangleRejected_
+                     ? "true"
+                     : "false"
+                   )
+                << " reprojUnsafe="
+                << (
+                       reprojUnsafe_
+                     ? "true"
+                     : "false"
+                   )
+                << endl;
+        }
+
         if( finalUntangleRejected_ )
         {
             Info << "Pre-BL snap: skipped -- mesh state unsafe" << endl;
@@ -18692,6 +22825,12 @@ void cartesianMeshGenerator::generateMesh()
         else
         {
             snapSurfaceBeforeBLRefinement();
+
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_PREBL_SNAP"
+            );
 
             mesh_.clearAddressingData();
             CFMitchOFHardQuality postPreRefBLSnapOF;
@@ -18716,12 +22855,1096 @@ void cartesianMeshGenerator::generateMesh()
 
                 refBoundaryLayers();
 
+            cfmitchV10DStageSkewAudit
+            (
+                mesh_,
+                "POST_REFBL"
+            );
+
                 mesh_.clearAddressingData();
                 CFMitchOFHardQuality postRefBLOF;
                 evaluateOpenFOAMHardQuality(mesh_, postRefBLOF);
                 printOpenFOAMCandidateQuality("POST_REFBL", postRefBLOF);
 
+                // =========================================================
+                // CFMITCH V6.1 EXACT OF SKEW REPAIR
+                //
+                // Bounded, point-motion-only repair of the exact
+                // OpenFOAM-13 skewness population (>4).
+                //
+                // IMPORTANT:
+                //   * topology is unchanged
+                //   * physical boundary points are locked
+                //   * the retained BL point set is locked
+                //   * generic cfMesh findLowQualityFaces() is NOT used
+                //   * every batch is independently transactional
+                //   * candidate acceptance uses evaluateOpenFOAMHardQuality()
+                //   * rejected batches restore the exact pre-batch points
+                //
+                // This is experimental and opt-in while Rotor37 is used
+                // to validate the mechanism.
+                // =========================================================
+                bool runV61OFSkewRepair = false;
+
+                if( meshDict_.isDict("boundaryLayers") )
+                {
+                    const dictionary& bndLV61 =
+                        meshDict_.subDict("boundaryLayers");
+
+                    if
+                    (
+                        bndLV61.found
+                        (
+                            "cfmitchV61OpenFOAMSkewRepair"
+                        )
+                    )
+                    {
+                        runV61OFSkewRepair =
+                            bool
+                            (
+                                Switch
+                                (
+                                    bndLV61.lookup
+                                    (
+                                        "cfmitchV61OpenFOAMSkewRepair"
+                                    )
+                                )
+                            );
+                    }
+                }
+
+                Info
+                    << "CFMITCH V6.1 OF SKEW CONFIG:"
+                    << " enabled="
+                    << (runV61OFSkewRepair ? "true" : "false")
+                    << " initialSkewFaces="
+                    << postRefBLOF.highSkewFaces
+                    << " initialMaxSkew="
+                    << postRefBLOF.maxSkew
+                    << endl;
+
+                if
+                (
+                    runV61OFSkewRepair
+                 && postRefBLOF.highSkewFaces > 0
+                )
+                {
+                    const bool initialHardClean =
+                        postRefBLOF.signedNegVolCells == 0
+                     && postRefBLOF.pyramidErrors == 0
+                     && postRefBLOF.errorNonOrthFaces.size() == 0
+                     && postRefBLOF.zeroFaceCells == 0
+                     && postRefBLOF.centreFallbackCells == 0;
+
+                    if( !initialHardClean )
+                    {
+                        Info
+                            << "CFMITCH V6.1 OF SKEW REPAIR skipped:"
+                            << " input mesh is not hard-clean"
+                            << " negVol="
+                            << postRefBLOF.signedNegVolCells
+                            << " pyramids="
+                            << postRefBLOF.pyramidErrors
+                            << " nonOrthErrors="
+                            << postRefBLOF.errorNonOrthFaces.size()
+                            << " zeroFaceCells="
+                            << postRefBLOF.zeroFaceCells
+                            << " centreFallbackCells="
+                            << postRefBLOF.centreFallbackCells
+                            << endl;
+                    }
+                    else
+                    {
+                        // Freeze the initial exact-OF defect population.
+                        // Face labels remain valid because this operation
+                        // performs point motion only.
+                        const labelHashSet v61SourceFaces
+                        (
+                            postRefBLOF.fanSkewFaces
+                        );
+
+                        // -------------------------------------------------
+                        // Build hard point locks once.
+                        //
+                        // 1. Every physical boundary point:
+                        //    periodic/inlet/outlet/wall geometry cannot move.
+                        //
+                        // 2. Every retained BL point:
+                        //    preserve the existing BL/h1 architecture.
+                        // -------------------------------------------------
+                        const meshSurfaceEngine v61Surface(mesh_);
+
+                        const labelList& v61BoundaryPoints =
+                            v61Surface.boundaryPoints();
+
+                        labelHashSet v61LockedSet;
+
+                        forAll(v61BoundaryPoints, bpI)
+                        {
+                            const label pointI =
+                                v61BoundaryPoints[bpI];
+
+                            if
+                            (
+                                pointI >= 0
+                             && pointI < label(mesh_.points().size())
+                            )
+                            {
+                                v61LockedSet.insert(pointI);
+                            }
+                        }
+
+                        forAll(blPoints_, blpI)
+                        {
+                            const label pointI = blPoints_[blpI];
+
+                            if
+                            (
+                                pointI >= 0
+                             && pointI < label(mesh_.points().size())
+                            )
+                            {
+                                v61LockedSet.insert(pointI);
+                            }
+                        }
+
+                        labelLongList v61LockedPoints;
+
+                        forAllConstIter
+                        (
+                            labelHashSet,
+                            v61LockedSet,
+                            lit
+                        )
+                        {
+                            v61LockedPoints.append(lit.key());
+                        }
+
+                        meshOptimizer v61Optimizer(mesh_);
+                        v61Optimizer.lockPoints(v61LockedPoints);
+
+                        Info
+                            << "CFMITCH V6.1 OF SKEW REPAIR BEGIN:"
+                            << " exactOFFaces="
+                            << v61SourceFaces.size()
+                            << " boundaryLocked="
+                            << v61BoundaryPoints.size()
+                            << " blPoints="
+                            << blPoints_.size()
+                            << " uniqueLocked="
+                            << v61LockedSet.size()
+                            << endl;
+
+                        // Keep each partTetMesh population comfortably below
+                        // the old generic 500-face danger threshold.
+                        const label v61BatchLimit = 64;
+
+                        labelHashSet v61Consumed;
+
+                        label v61BatchI = 0;
+                        label v61Accepted = 0;
+                        label v61Rejected = 0;
+                        label v61SkippedClean = 0;
+
+                        while
+                        (
+                            v61Consumed.size()
+                          < v61SourceFaces.size()
+                        )
+                        {
+                            labelHashSet nominalBatch;
+
+                            // Deterministic ascending-face-label batches.
+                            while
+                            (
+                                nominalBatch.size() < v61BatchLimit
+                             && v61Consumed.size()
+                              < v61SourceFaces.size()
+                            )
+                            {
+                                label minFace =
+                                    mesh_.faces().size();
+
+                                bool foundFace = false;
+
+                                forAllConstIter
+                                (
+                                    labelHashSet,
+                                    v61SourceFaces,
+                                    sit
+                                )
+                                {
+                                    const label faceI = sit.key();
+
+                                    if
+                                    (
+                                        !v61Consumed.found(faceI)
+                                     && faceI < minFace
+                                    )
+                                    {
+                                        minFace = faceI;
+                                        foundFace = true;
+                                    }
+                                }
+
+                                if( !foundFace )
+                                    break;
+
+                                v61Consumed.insert(minFace);
+                                nominalBatch.insert(minFace);
+                            }
+
+                            if( nominalBatch.size() == 0 )
+                                break;
+
+                            ++v61BatchI;
+
+                            mesh_.clearAddressingData();
+
+                            CFMitchOFHardQuality v61Before;
+                            evaluateOpenFOAMHardQuality
+                            (
+                                mesh_,
+                                v61Before
+                            );
+
+                            // A previous accepted batch may already have
+                            // cleaned some faces from this nominal batch.
+                            labelHashSet activeBatch;
+
+                            forAllConstIter
+                            (
+                                labelHashSet,
+                                nominalBatch,
+                                nit
+                            )
+                            {
+                                if
+                                (
+                                    v61Before.fanSkewFaces.found
+                                    (
+                                        nit.key()
+                                    )
+                                )
+                                {
+                                    activeBatch.insert(nit.key());
+                                }
+                            }
+
+                            if( activeBatch.size() == 0 )
+                            {
+                                ++v61SkippedClean;
+
+                                Info
+                                    << "CFMITCH V6.1 OF SKEW BATCH "
+                                    << v61BatchI
+                                    << ": already clean -- skipped"
+                                    << endl;
+
+                                continue;
+                            }
+
+                            const pointField v61PointsBefore
+                            (
+                                mesh_.points()
+                            );
+
+                            Info
+                                << "CFMITCH V6.1 OF SKEW BATCH "
+                                << v61BatchI
+                                << " attempt:"
+                                << " faces="
+                                << activeBatch.size()
+                                << " globalSkewFaces="
+                                << v61Before.highSkewFaces
+                                << " maxSkew="
+                                << v61Before.maxSkew
+                                << endl;
+
+                            // One bounded volume-optimizer iteration on only
+                            // the exact OF-skew face neighbourhood.
+                            v61Optimizer.optimizeSelectedFaces
+                            (
+                                activeBatch,
+                                1,
+                                0
+                            );
+
+                            mesh_.clearAddressingData();
+
+                            CFMitchOFHardQuality v61After;
+                            evaluateOpenFOAMHardQuality
+                            (
+                                mesh_,
+                                v61After
+                            );
+
+                            const scalar skewTol =
+                                1.0e-10
+                              * Foam::max
+                                (
+                                    scalar(1.0),
+                                    v61Before.maxSkew
+                                );
+
+                            const bool hardSafe =
+                                v61After.signedNegVolCells == 0
+                             && v61After.pyramidErrors == 0
+                             && v61After.errorNonOrthFaces.size() == 0
+                             && v61After.zeroFaceCells == 0
+                             && v61After.centreFallbackCells == 0;
+
+                            // Do not improve skew by degrading the important
+                            // finite-volume warning populations.
+                            const bool fvNoRegression =
+                                v61After.smallWeightFaces
+                                    <= v61Before.smallWeightFaces
+                             && v61After.smallVolRatioFaces
+                                    <= v61Before.smallVolRatioFaces
+                             && v61After.severeNonOrthFaces
+                                    <= v61Before.severeNonOrthFaces;
+
+                            const bool skewNoRegression =
+                                v61After.highSkewFaces
+                                    <= v61Before.highSkewFaces
+                             && v61After.maxSkew
+                                    <= v61Before.maxSkew + skewTol;
+
+                            const bool skewImproved =
+                                v61After.highSkewFaces
+                                    < v61Before.highSkewFaces
+                             ||
+                                v61After.maxSkew
+                                    < v61Before.maxSkew - skewTol;
+
+                            const bool accept =
+                                hardSafe
+                             && fvNoRegression
+                             && skewNoRegression
+                             && skewImproved;
+
+                            if( accept )
+                            {
+                                ++v61Accepted;
+
+                                Info
+                                    << "CFMITCH V6.1 OF SKEW BATCH "
+                                    << v61BatchI
+                                    << " ACCEPT:"
+                                    << " skewFaces "
+                                    << v61Before.highSkewFaces
+                                    << "->"
+                                    << v61After.highSkewFaces
+                                    << " maxSkew "
+                                    << v61Before.maxSkew
+                                    << "->"
+                                    << v61After.maxSkew
+                                    << " severeNonOrth "
+                                    << v61Before.severeNonOrthFaces
+                                    << "->"
+                                    << v61After.severeNonOrthFaces
+                                    << " lowWeight "
+                                    << v61Before.smallWeightFaces
+                                    << "->"
+                                    << v61After.smallWeightFaces
+                                    << " lowVolRatio "
+                                    << v61Before.smallVolRatioFaces
+                                    << "->"
+                                    << v61After.smallVolRatioFaces
+                                    << endl;
+                            }
+                            else
+                            {
+                                ++v61Rejected;
+
+                                Info
+                                    << "CFMITCH V6.1 OF SKEW BATCH "
+                                    << v61BatchI
+                                    << " REJECT:"
+                                    << " skewFaces "
+                                    << v61Before.highSkewFaces
+                                    << "->"
+                                    << v61After.highSkewFaces
+                                    << " maxSkew "
+                                    << v61Before.maxSkew
+                                    << "->"
+                                    << v61After.maxSkew
+                                    << " hardSafe="
+                                    << (hardSafe ? "yes" : "no")
+                                    << " fvNoRegression="
+                                    << (fvNoRegression ? "yes" : "no")
+                                    << " skewNoRegression="
+                                    << (skewNoRegression ? "yes" : "no")
+                                    << " skewImproved="
+                                    << (skewImproved ? "yes" : "no")
+                                    << " -- rollback"
+                                    << endl;
+
+                                polyMeshGenModifier v61Modifier(mesh_);
+
+                                pointFieldPMG& v61Pts =
+                                    v61Modifier.pointsAccess();
+
+                                v61Pts = v61PointsBefore;
+
+                                mesh_.clearAddressingData();
+
+                                CFMitchOFHardQuality
+                                    v61RollbackQuality;
+
+                                evaluateOpenFOAMHardQuality
+                                (
+                                    mesh_,
+                                    v61RollbackQuality
+                                );
+
+                                Info
+                                    << "CFMITCH V6.1 OF SKEW BATCH "
+                                    << v61BatchI
+                                    << " rollback:"
+                                    << " skewFaces="
+                                    << v61RollbackQuality.highSkewFaces
+                                    << " maxSkew="
+                                    << v61RollbackQuality.maxSkew
+                                    << " negVol="
+                                    << v61RollbackQuality.signedNegVolCells
+                                    << " pyramids="
+                                    << v61RollbackQuality.pyramidErrors
+                                    << " nonOrthErrors="
+                                    << v61RollbackQuality.
+                                        errorNonOrthFaces.size()
+                                    << endl;
+                            }
+                        }
+
+                        mesh_.clearAddressingData();
+
+                        CFMitchOFHardQuality v61Final;
+                        evaluateOpenFOAMHardQuality
+                        (
+                            mesh_,
+                            v61Final
+                        );
+
+                        printOpenFOAMCandidateQuality
+                        (
+                            "POST_V61_OF_SKEW_REPAIR",
+                            v61Final
+                        );
+
+                        Info
+                            << "CFMITCH V6.1 OF SKEW REPAIR FINAL:"
+                            << " initialFaces="
+                            << postRefBLOF.highSkewFaces
+                            << " finalFaces="
+                            << v61Final.highSkewFaces
+                            << " initialMax="
+                            << postRefBLOF.maxSkew
+                            << " finalMax="
+                            << v61Final.maxSkew
+                            << " batches="
+                            << v61BatchI
+                            << " accepted="
+                            << v61Accepted
+                            << " rejected="
+                            << v61Rejected
+                            << " alreadyClean="
+                            << v61SkippedClean
+                            << " negVol="
+                            << v61Final.signedNegVolCells
+                            << " pyramids="
+                            << v61Final.pyramidErrors
+                            << " nonOrthErrors="
+                            << v61Final.errorNonOrthFaces.size()
+                            << endl;
+                    }
+                }
+
                 writeLineageCSV("postRefBL");
+            }
+        }
+
+        // ========================================================
+        // CFMITCH V10C SPLIT-HEX LINEAGE CONSTRAINT
+        //
+        // Re-impose the affine refinement-edge invariant after all
+        // broad point optimisation and BL topology work.
+        //
+        // This is deliberately a transaction:
+        //
+        //   snapshot dependent points
+        //   -> project to moving parent edges
+        //   -> exact Foundation quality
+        //   -> accept or complete rollback
+        //
+        // No surface point is touched.
+        // No face/cell topology is changed.
+        // ========================================================
+        {
+            bool v10Enabled(false);
+
+            if( meshDict_.isDict("boundaryLayers") )
+            {
+                const dictionary& v10Bnd =
+                    meshDict_.subDict("boundaryLayers");
+
+                if
+                (
+                    v10Bnd.found
+                    (
+                        "cfmitchV10PreserveSplitHexGeometry"
+                    )
+                )
+                {
+                    v10Enabled =
+                        Switch
+                        (
+                            v10Bnd.lookup
+                            (
+                                "cfmitchV10PreserveSplitHexGeometry"
+                            )
+                        );
+                }
+            }
+
+            Info
+                << "CFMITCH V10C CONFIG:"
+                << " enabled="
+                << (v10Enabled ? "yes" : "no")
+                << " capturedConstraints="
+                << cfmitchV10SplitEdgeConstraints.size()
+                << endl;
+
+            if
+            (
+                v10Enabled
+             && cfmitchV10SplitEdgeConstraints.size()
+            )
+            {
+                polyMeshGenModifier v10Modifier(mesh_);
+
+                pointFieldPMG& v10Points =
+                    v10Modifier.pointsAccess();
+
+                const faceListPMG& v10Faces =
+                    mesh_.faces();
+
+                const labelList& v10Neighbour =
+                    mesh_.neighbour();
+
+                boolList v10UsedPoint
+                (
+                    v10Points.size(),
+                    false
+                );
+
+                boolList v10BoundaryPoint
+                (
+                    v10Points.size(),
+                    false
+                );
+
+                forAll(v10Faces, faceI)
+                {
+                    const face& f =
+                        v10Faces[faceI];
+
+                    const bool isBoundary =
+                    (
+                        faceI >= label(v10Neighbour.size())
+                     || v10Neighbour[faceI] < 0
+                    );
+
+                    forAll(f, fp)
+                    {
+                        const label pI =
+                            f[fp];
+
+                        if
+                        (
+                            pI < 0
+                         || pI >= label(v10Points.size())
+                        )
+                        {
+                            continue;
+                        }
+
+                        v10UsedPoint[pI] = true;
+
+                        if( isBoundary )
+                            v10BoundaryPoint[pI] = true;
+                    }
+                }
+
+                std::vector<label> v10Active;
+
+                std::map<label, point>
+                    v10OldPoint;
+
+                label v10SkipRange(0);
+                label v10SkipUnused(0);
+                label v10SkipBoundary(0);
+                label v10SkipLineage(0);
+                label v10AlreadyExact(0);
+
+                scalar v10MaxInitialDrift(0.0);
+                scalar v10SumInitialDrift(0.0);
+
+                for
+                (
+                    label ci=0;
+                    ci<label
+                    (
+                        cfmitchV10SplitEdgeConstraints.size()
+                    );
+                    ++ci
+                )
+                {
+                    const CFMitchSplitEdgeConstraintV10C& c =
+                        cfmitchV10SplitEdgeConstraints[ci];
+
+                    if
+                    (
+                        c.dependent < 0
+                     || c.masterA < 0
+                     || c.masterB < 0
+                     || c.dependent >= label(v10Points.size())
+                     || c.masterA >= label(v10Points.size())
+                     || c.masterB >= label(v10Points.size())
+                    )
+                    {
+                        ++v10SkipRange;
+                        continue;
+                    }
+
+                    if
+                    (
+                        !v10UsedPoint[c.dependent]
+                     || !v10UsedPoint[c.masterA]
+                     || !v10UsedPoint[c.masterB]
+                    )
+                    {
+                        ++v10SkipUnused;
+                        continue;
+                    }
+
+                    // Interior-only for V10C.
+                    if
+                    (
+                        v10BoundaryPoint[c.dependent]
+                     || v10BoundaryPoint[c.masterA]
+                     || v10BoundaryPoint[c.masterB]
+                    )
+                    {
+                        ++v10SkipBoundary;
+                        continue;
+                    }
+
+                    const vector ab =
+                        v10Points[c.masterB]
+                      - v10Points[c.masterA];
+
+                    const scalar edgeLength =
+                        mag(ab);
+
+                    if
+                    (
+                        edgeLength <= VSMALL
+                     || c.birthEdgeLength <= VSMALL
+                    )
+                    {
+                        ++v10SkipLineage;
+                        continue;
+                    }
+
+                    const scalar edgeRatio =
+                        edgeLength/c.birthEdgeLength;
+
+                    // A stale point label after an unexpected early
+                    // compaction is much more dangerous than skipping
+                    // one constraint.  Use broad but finite lineage
+                    // sanity gates.
+                    if
+                    (
+                        edgeRatio < scalar(0.20)
+                     || edgeRatio > scalar(5.0)
+                    )
+                    {
+                        ++v10SkipLineage;
+                        continue;
+                    }
+
+                    const point target =
+                        v10Points[c.masterA]
+                      + c.lambda*ab;
+
+                    const scalar drift =
+                        mag
+                        (
+                            target
+                          - v10Points[c.dependent]
+                        );
+
+                    if
+                    (
+                        drift >
+                        scalar(2.0)*edgeLength
+                    )
+                    {
+                        ++v10SkipLineage;
+                        continue;
+                    }
+
+                    const scalar exactTol =
+                        Foam::max
+                        (
+                            scalar(1e-14),
+                            scalar(1e-10)*edgeLength
+                        );
+
+                    if( drift <= exactTol )
+                    {
+                        ++v10AlreadyExact;
+                        continue;
+                    }
+
+                    v10Active.push_back(ci);
+
+                    v10OldPoint.insert
+                    (
+                        std::make_pair
+                        (
+                            c.dependent,
+                            v10Points[c.dependent]
+                        )
+                    );
+
+                    v10MaxInitialDrift =
+                        Foam::max
+                        (
+                            v10MaxInitialDrift,
+                            drift
+                        );
+
+                    v10SumInitialDrift += drift;
+                }
+
+                Info
+                    << "CFMITCH V10C LINEAGE:"
+                    << " active=" << v10Active.size()
+                    << " alreadyExact="
+                    << v10AlreadyExact
+                    << " skipRange="
+                    << v10SkipRange
+                    << " skipUnused="
+                    << v10SkipUnused
+                    << " skipBoundary="
+                    << v10SkipBoundary
+                    << " skipLineage="
+                    << v10SkipLineage
+                    << " maxInitialDrift="
+                    << v10MaxInitialDrift
+                    << " meanInitialDrift="
+                    << (
+                        v10Active.size()
+                      ? v10SumInitialDrift
+                        /scalar(v10Active.size())
+                      : scalar(0)
+                       )
+                    << endl;
+
+                if( v10Active.size() )
+                {
+                    CFMitchOFHardQuality v10Before;
+
+                    evaluateOpenFOAMHardQuality
+                    (
+                        mesh_,
+                        v10Before
+                    );
+
+                    printOpenFOAMCandidateQuality
+                    (
+                        "V10C_PRE_CONSTRAINT",
+                        v10Before
+                    );
+
+                    const scalar v10Fractions[] =
+                    {
+                        scalar(1.0),
+                        scalar(0.75),
+                        scalar(0.50),
+                        scalar(0.25)
+                    };
+
+                    bool v10Accepted(false);
+                    scalar v10AcceptedFraction(0.0);
+                    CFMitchOFHardQuality v10AcceptedQuality;
+
+                    for(label attempt=0; attempt<4; ++attempt)
+                    {
+                        const scalar fraction =
+                            v10Fractions[attempt];
+
+                        // Full restore before every attempt.
+                        for
+                        (
+                            std::map<label, point>::const_iterator it =
+                                v10OldPoint.begin();
+                            it != v10OldPoint.end();
+                            ++it
+                        )
+                        {
+                            v10Points[it->first] =
+                                it->second;
+                        }
+
+                        mesh_.clearAddressingData();
+
+                        scalar maxMove(0.0);
+                        scalar sumMove(0.0);
+                        label moved(0);
+
+                        // Constraints were captured coarse-edge first.
+                        // If a master is itself dependent, it is therefore
+                        // updated before its finer child.
+                        for
+                        (
+                            label ai=0;
+                            ai<label(v10Active.size());
+                            ++ai
+                        )
+                        {
+                            const CFMitchSplitEdgeConstraintV10C& c =
+                                cfmitchV10SplitEdgeConstraints
+                                [
+                                    v10Active[ai]
+                                ];
+
+                            const std::map<label, point>::const_iterator
+                                oldIt =
+                                    v10OldPoint.find
+                                    (
+                                        c.dependent
+                                    );
+
+                            if
+                            (
+                                oldIt == v10OldPoint.end()
+                            )
+                            {
+                                continue;
+                            }
+
+                            const point target =
+                                v10Points[c.masterA]
+                              + c.lambda
+                               *(
+                                    v10Points[c.masterB]
+                                  - v10Points[c.masterA]
+                                );
+
+                            const point proposed =
+                                oldIt->second
+                              + fraction
+                               *(
+                                    target
+                                  - oldIt->second
+                                );
+
+                            const scalar move =
+                                mag
+                                (
+                                    proposed
+                                  - oldIt->second
+                                );
+
+                            v10Points[c.dependent] =
+                                proposed;
+
+                            maxMove =
+                                Foam::max
+                                (
+                                    maxMove,
+                                    move
+                                );
+
+                            sumMove += move;
+                            ++moved;
+                        }
+
+                        mesh_.clearAddressingData();
+
+                        CFMitchOFHardQuality v10After;
+
+                        evaluateOpenFOAMHardQuality
+                        (
+                            mesh_,
+                            v10After
+                        );
+
+                        const bool hardSafe =
+                        (
+                            v10After.signedNegVolCells
+                                <= v10Before.signedNegVolCells
+                         && v10After.pyramidErrors
+                                <= v10Before.pyramidErrors
+                         && v10After.errorNonOrthFaces.size()
+                                <= v10Before.errorNonOrthFaces.size()
+                         && v10After.zeroFaceCells
+                                <= v10Before.zeroFaceCells
+                         && v10After.centreFallbackCells
+                                <= v10Before.centreFallbackCells
+                        );
+
+                        const bool skewImproved =
+                        (
+                            v10After.highSkewFaces
+                              < v10Before.highSkewFaces
+                         ||
+                            (
+                                v10After.highSkewFaces
+                                  == v10Before.highSkewFaces
+                             && v10After.maxSkew
+                                  < v10Before.maxSkew
+                            )
+                        );
+
+                        Info
+                            << "CFMITCH V10C ATTEMPT:"
+                            << " fraction=" << fraction
+                            << " moved=" << moved
+                            << " maxMove=" << maxMove
+                            << " meanMove="
+                            << (
+                                moved
+                              ? sumMove/scalar(moved)
+                              : scalar(0)
+                               )
+                            << " negVol="
+                            << v10Before.signedNegVolCells
+                            << "->"
+                            << v10After.signedNegVolCells
+                            << " badPyr="
+                            << v10Before.pyramidErrors
+                            << "->"
+                            << v10After.pyramidErrors
+                            << " nonOrthErrors="
+                            << v10Before.errorNonOrthFaces.size()
+                            << "->"
+                            << v10After.errorNonOrthFaces.size()
+                            << " skewGt4="
+                            << v10Before.highSkewFaces
+                            << "->"
+                            << v10After.highSkewFaces
+                            << " maxSkew="
+                            << v10Before.maxSkew
+                            << "->"
+                            << v10After.maxSkew
+                            << " hardSafe="
+                            << (hardSafe ? "yes" : "no")
+                            << " improved="
+                            << (skewImproved ? "yes" : "no")
+                            << endl;
+
+                        if
+                        (
+                            hardSafe
+                         && skewImproved
+                        )
+                        {
+                            v10Accepted = true;
+                            v10AcceptedFraction =
+                                fraction;
+                            v10AcceptedQuality =
+                                v10After;
+                            break;
+                        }
+                    }
+
+                    if( v10Accepted )
+                    {
+                        Info
+                            << "CFMITCH V10C ACCEPTED:"
+                            << " fraction="
+                            << v10AcceptedFraction
+                            << " activeConstraints="
+                            << v10Active.size()
+                            << " skewGt4="
+                            << v10Before.highSkewFaces
+                            << "->"
+                            << v10AcceptedQuality.highSkewFaces
+                            << " maxSkew="
+                            << v10Before.maxSkew
+                            << "->"
+                            << v10AcceptedQuality.maxSkew
+                            << " negVol="
+                            << v10AcceptedQuality.signedNegVolCells
+                            << " badPyr="
+                            << v10AcceptedQuality.pyramidErrors
+                            << " nonOrthErrors="
+                            << v10AcceptedQuality.errorNonOrthFaces.size()
+                            << " coordinatesMoved=yes"
+                            << " topologyChanged=no"
+                            << endl;
+
+                        printOpenFOAMCandidateQuality
+                        (
+                            "V10C_POST_CONSTRAINT",
+                            v10AcceptedQuality
+                        );
+                    }
+                    else
+                    {
+                        // Every candidate failed the exact quality
+                        // transaction. Restore precisely.
+                        for
+                        (
+                            std::map<label, point>::const_iterator it =
+                                v10OldPoint.begin();
+                            it != v10OldPoint.end();
+                            ++it
+                        )
+                        {
+                            v10Points[it->first] =
+                                it->second;
+                        }
+
+                        mesh_.clearAddressingData();
+
+                        CFMitchOFHardQuality v10Rollback;
+
+                        evaluateOpenFOAMHardQuality
+                        (
+                            mesh_,
+                            v10Rollback
+                        );
+
+                        Info
+                            << "CFMITCH V10C ROLLBACK:"
+                            << " activeConstraints="
+                            << v10Active.size()
+                            << " skewGt4="
+                            << v10Rollback.highSkewFaces
+                            << " maxSkew="
+                            << v10Rollback.maxSkew
+                            << " negVol="
+                            << v10Rollback.signedNegVolCells
+                            << " badPyr="
+                            << v10Rollback.pyramidErrors
+                            << " nonOrthErrors="
+                            << v10Rollback.errorNonOrthFaces.size()
+                            << endl;
+                    }
+                }
+                else
+                {
+                    Info
+                        << "CFMITCH V10C:"
+                        << " no eligible interior drifted"
+                        << " split-edge constraints"
+                        << endl;
+                }
             }
         }
 
@@ -18890,6 +24113,2389 @@ void cartesianMeshGenerator::generateMesh()
 
             return valid;
         };
+
+        // ============================================================
+        // ============================================================
+        // CFMITCH V9C CONNECTED VIRTUAL PERIODIC MERGE
+        //
+        // Non-destructive proof pass.
+        //
+        // V9B proved that the exact Foundation/OpenFOAM selector identifies:
+        //
+        //     155 total skew > 4 faces
+        //      46 periodic boundary owner groups
+        //
+        // V9A rejected all 46 because it incorrectly treated all same-owner,
+        // same-patch faces as one cluster and used an excessively tight
+        // coplanarity gate.
+        //
+        // V9C:
+        //
+        //   1. selects exact Foundation skew > 4 faces;
+        //   2. groups periodic boundary faces by owner;
+        //   3. splits each owner group into SHARED-EDGE connected components;
+        //   4. validates manifold component topology;
+        //   5. reconstructs the single exterior perimeter;
+        //   6. constructs the hypothetical merged polygon;
+        //   7. reconstructs the owner cell centre for the hypothetical
+        //      post-merge topology using the Foundation primitiveMesh
+        //      centre/volume construction;
+        //   8. evaluates exact Foundation uncoupled-boundary skewness.
+        //
+        // IMPORTANT:
+        //
+        //   * NO faces are replaced.
+        //   * NO faces are removed.
+        //   * NO points are moved.
+        //   * NO points are removed.
+        //
+        // This pass is diagnostic/proof only.  V9D may physically apply only
+        // components which V9C proves safe/useful.
+        // ============================================================
+        {
+            bool v9cEnabled = false;
+
+            // CFMITCH V11B diagnostic only.
+            // Continue normal-threshold-rejected periodic components
+            // through virtual proof, but NEVER physically stage them.
+            bool v11bProbeNormalRejected = false;
+
+            // CFMITCH V11C production candidate:
+            // allow a normal/plane-rejected periodic fan to be physically
+            // staged only after the complete exact virtual proof succeeds.
+            bool v11cCommitProvenNormalRejected = false;
+
+            if( meshDict_.isDict("boundaryLayers") )
+            {
+                const dictionary& v9cBL =
+                    meshDict_.subDict("boundaryLayers");
+
+                if
+                (
+                    v9cBL.found
+                    (
+                        "cfmitchV9MergePeriodicFaceFans"
+                    )
+                )
+                {
+                    v9cEnabled =
+                        Switch
+                        (
+                            v9cBL.lookup
+                            (
+                                "cfmitchV9MergePeriodicFaceFans"
+                            )
+                        );
+                }
+            }
+
+            if( meshDict_.isDict("boundaryLayers") )
+            {
+                const dictionary& v11bBL =
+                    meshDict_.subDict("boundaryLayers");
+
+                if
+                (
+                    v11bBL.found
+                    (
+                        "cfmitchV11BProbeNormalRejected"
+                    )
+                )
+                {
+                    v11bProbeNormalRejected =
+                        Switch
+                        (
+                            v11bBL.lookup
+                            (
+                                "cfmitchV11BProbeNormalRejected"
+                            )
+                        );
+                }
+            }
+
+            if( meshDict_.isDict("boundaryLayers") )
+            {
+                const dictionary& v11cBL =
+                    meshDict_.subDict("boundaryLayers");
+
+                if
+                (
+                    v11cBL.found
+                    (
+                        "cfmitchV11CCommitProvenNormalRejected"
+                    )
+                )
+                {
+                    v11cCommitProvenNormalRejected =
+                        Switch
+                        (
+                            v11cBL.lookup
+                            (
+                                "cfmitchV11CCommitProvenNormalRejected"
+                            )
+                        );
+                }
+            }
+
+            if( v9cEnabled )
+            {
+                if( Pstream::parRun() )
+                {
+                    FatalErrorIn
+                    (
+                        "CFMITCH V9C virtual periodic merge"
+                    )
+                        << "V9C is currently serial-only"
+                        << abort(FatalError);
+                }
+
+                wordList v9cPeriodicPatchNames;
+
+                // Same semantic-role location used by PatchRoleMap.
+                if( meshDict_.isDict("boundaryLayers") )
+                {
+                    const dictionary& v9cBL =
+                        meshDict_.subDict("boundaryLayers");
+
+                    if( v9cBL.isDict("patchRoles") )
+                    {
+                        const dictionary& v9cRoles =
+                            v9cBL.subDict("patchRoles");
+
+                        if( v9cRoles.found("periodic") )
+                        {
+                            v9cRoles.lookup("periodic")
+                                >> v9cPeriodicPatchNames;
+                        }
+                    }
+                }
+
+                Info
+                    << "CFMITCH V9C CONFIG:"
+                    << " enabled=yes"
+                    << " semanticPeriodicPatches="
+                    << v9cPeriodicPatchNames
+                    << " mode=virtual-only"
+                    << endl;
+
+                if( v9cPeriodicPatchNames.size() == 0 )
+                {
+                    FatalErrorIn
+                    (
+                        "CFMITCH V9C virtual periodic merge"
+                    )
+                        << "Enabled but "
+                        << "boundaryLayers.patchRoles.periodic is empty"
+                        << abort(FatalError);
+                }
+
+                // --------------------------------------------------------
+                // Exact current OpenFOAM/Foundation defect population.
+                // fanSkewFaces is populated only when collectFanData=true.
+                // --------------------------------------------------------
+
+                CFMitchOFHardQuality v9cOFBefore;
+
+                evaluateOpenFOAMHardQuality
+                (
+                    mesh_,
+                    v9cOFBefore,
+                    false,
+                    nullptr,
+                    true
+                );
+
+                Info
+                    << "CFMITCH V9C EXACT SELECTOR:"
+                    << " skewGt4="
+                    << v9cOFBefore.highSkewFaces
+                    << " maxSkew="
+                    << v9cOFBefore.maxSkew
+                    << " selectedFaceSet="
+                    << v9cOFBefore.fanSkewFaces.size()
+                    << endl;
+
+                const faceListPMG& v9cFaces =
+                    mesh_.faces();
+
+                const label v9cFaceCountBefore =
+                    v9cFaces.size();
+
+                const cellListPMG& v9cCells =
+                    mesh_.cells();
+
+                const pointFieldPMG& v9cPoints =
+                    mesh_.points();
+
+                const labelList& v9cOwner =
+                    mesh_.owner();
+
+                const labelList& v9cNeighbour =
+                    mesh_.neighbour();
+
+                const PtrList<boundaryPatch>& v9cBoundaries =
+                    mesh_.boundaries();
+
+                const scalar v9cRootVSmall =
+                    Foam::sqrt(VSMALL);
+
+                // --------------------------------------------------------
+                // Exact Foundation/OpenFOAM face::areaAndCentre geometry.
+                // --------------------------------------------------------
+
+                const auto v9cFaceGeometry =
+                [&v9cPoints]
+                (
+                    const face& f,
+                    point& fc,
+                    vector& fa
+                ) -> bool
+                {
+                    const label nPoints =
+                        f.size();
+
+                    if( nPoints < 3 )
+                    {
+                        fc = vector::zero;
+                        fa = vector::zero;
+                        return false;
+                    }
+
+                    if( nPoints == 3 )
+                    {
+                        const point& p0 =
+                            v9cPoints[f[0]];
+
+                        const point& p1 =
+                            v9cPoints[f[1]];
+
+                        const point& p2 =
+                            v9cPoints[f[2]];
+
+                        fa =
+                            scalar(0.5)
+                           *((p1-p0)^(p2-p0));
+
+                        fc =
+                            (scalar(1.0)/scalar(3.0))
+                           *(p0+p1+p2);
+
+                        return mag(fa) > VSMALL;
+                    }
+
+                    point pAvg(vector::zero);
+
+                    forAll(f, fp)
+                    {
+                        pAvg +=
+                            v9cPoints[f[fp]];
+                    }
+
+                    pAvg /= scalar(nPoints);
+
+                    vector sumA(vector::zero);
+
+                    forAll(f, fp)
+                    {
+                        const point& p0 =
+                            v9cPoints[f[fp]];
+
+                        const point& p1 =
+                            v9cPoints
+                            [
+                                f.nextLabel(fp)
+                            ];
+
+                        sumA +=
+                            (p1-p0)^(pAvg-p0);
+                    }
+
+                    const scalar magSumA =
+                        mag(sumA);
+
+                    if( magSumA <= VSMALL )
+                    {
+                        fc = pAvg;
+                        fa = vector::zero;
+                        return false;
+                    }
+
+                    const vector sumAHat =
+                        sumA/magSumA;
+
+                    scalar sumAn = 0;
+                    vector sumAnc(vector::zero);
+
+                    forAll(f, fp)
+                    {
+                        const point& p0 =
+                            v9cPoints[f[fp]];
+
+                        const point& p1 =
+                            v9cPoints
+                            [
+                                f.nextLabel(fp)
+                            ];
+
+                        const vector a =
+                            (p1-p0)^(pAvg-p0);
+
+                        const vector c =
+                            p0+p1+pAvg;
+
+                        const scalar an =
+                            a & sumAHat;
+
+                        sumAn += an;
+                        sumAnc += an*c;
+                    }
+
+                    fa =
+                        scalar(0.5)*sumA;
+
+                    if( sumAn > VSMALL )
+                    {
+                        fc =
+                            (scalar(1.0)/scalar(3.0))
+                           *sumAnc/sumAn;
+                    }
+                    else
+                    {
+                        fc = pAvg;
+                    }
+
+                    return mag(fa) > VSMALL;
+                };
+
+                // --------------------------------------------------------
+                // Exact Foundation cell-centre construction for ONE cell.
+                //
+                // If removedFaces != nullptr, those current faces are
+                // omitted and a single hypothetical merged boundary face is
+                // inserted using mergedFc/mergedFa.
+                // --------------------------------------------------------
+
+                const auto v9cCellCentre =
+                [
+                    &v9cFaces,
+                    &v9cCells,
+                    &v9cOwner,
+                    &v9cNeighbour,
+                    &v9cFaceGeometry
+                ]
+                (
+                    const label cellI,
+                    const labelHashSet* removedFaces,
+                    const point* mergedFc,
+                    const vector* mergedFa,
+                    point& cc,
+                    scalar& signedVol
+                ) -> bool
+                {
+                    if
+                    (
+                        cellI < 0
+                     || cellI >= label(v9cCells.size())
+                    )
+                    {
+                        return false;
+                    }
+
+                    const cell& c =
+                        v9cCells[cellI];
+
+                    point cEst(vector::zero);
+                    label nVirtualFaces = 0;
+
+                    forAll(c, cfI)
+                    {
+                        const label faceI =
+                            c[cfI];
+
+                        if
+                        (
+                            removedFaces
+                         && removedFaces->found(faceI)
+                        )
+                        {
+                            continue;
+                        }
+
+                        if
+                        (
+                            faceI < 0
+                         || faceI >= label(v9cFaces.size())
+                        )
+                        {
+                            return false;
+                        }
+
+                        point fc(vector::zero);
+                        vector fa(vector::zero);
+
+                        if
+                        (
+                            !v9cFaceGeometry
+                            (
+                                v9cFaces[faceI],
+                                fc,
+                                fa
+                            )
+                        )
+                        {
+                            return false;
+                        }
+
+                        cEst += fc;
+                        ++nVirtualFaces;
+                    }
+
+                    if( mergedFc && mergedFa )
+                    {
+                        cEst += *mergedFc;
+                        ++nVirtualFaces;
+                    }
+
+                    if( nVirtualFaces < 4 )
+                        return false;
+
+                    cEst /= scalar(nVirtualFaces);
+
+                    vector weightedCentre(vector::zero);
+                    scalar vol3 = 0;
+
+                    forAll(c, cfI)
+                    {
+                        const label faceI =
+                            c[cfI];
+
+                        if
+                        (
+                            removedFaces
+                         && removedFaces->found(faceI)
+                        )
+                        {
+                            continue;
+                        }
+
+                        point fc(vector::zero);
+                        vector fa(vector::zero);
+
+                        if
+                        (
+                            !v9cFaceGeometry
+                            (
+                                v9cFaces[faceI],
+                                fc,
+                                fa
+                            )
+                        )
+                        {
+                            return false;
+                        }
+
+                        scalar pyr3Vol = 0;
+
+                        if
+                        (
+                            faceI < label(v9cOwner.size())
+                         && v9cOwner[faceI] == cellI
+                        )
+                        {
+                            pyr3Vol =
+                                fa & (fc-cEst);
+                        }
+                        else if
+                        (
+                            faceI
+                          < label(v9cNeighbour.size())
+                         && v9cNeighbour[faceI] == cellI
+                        )
+                        {
+                            pyr3Vol =
+                                fa & (cEst-fc);
+                        }
+                        else
+                        {
+                            return false;
+                        }
+
+                        const point pc =
+                            scalar(0.75)*fc
+                          + scalar(0.25)*cEst;
+
+                        weightedCentre +=
+                            pyr3Vol*pc;
+
+                        vol3 += pyr3Vol;
+                    }
+
+                    if( mergedFc && mergedFa )
+                    {
+                        // All V9C merged components are boundary faces whose
+                        // owner is cellI, so use owner orientation.
+                        const scalar pyr3Vol =
+                            (*mergedFa)
+                          & ((*mergedFc)-cEst);
+
+                        const point pc =
+                            scalar(0.75)*(*mergedFc)
+                          + scalar(0.25)*cEst;
+
+                        weightedCentre +=
+                            pyr3Vol*pc;
+
+                        vol3 += pyr3Vol;
+                    }
+
+                    signedVol =
+                        vol3/scalar(3.0);
+
+                    if( Foam::mag(vol3) > VSMALL )
+                    {
+                        cc =
+                            weightedCentre/vol3;
+                    }
+                    else
+                    {
+                        cc = cEst;
+                    }
+
+                    return true;
+                };
+
+                // --------------------------------------------------------
+                // Exact Foundation uncoupled boundary skew formula.
+                // --------------------------------------------------------
+
+                const auto v9cBoundarySkew =
+                [
+                    &v9cPoints,
+                    v9cRootVSmall
+                ]
+                (
+                    const face& f,
+                    const point& fc,
+                    const vector& fa,
+                    const point& ownCc
+                ) -> scalar
+                {
+                    const vector Cpf =
+                        fc-ownCc;
+
+                    vector normal =
+                        fa;
+
+                    normal /=
+                        mag(normal)
+                      + v9cRootVSmall;
+
+                    const vector d =
+                        normal*(normal & Cpf);
+
+                    const vector sv =
+                        Cpf
+                      - (
+                            (fa & Cpf)
+                           /(
+                                (fa & d)
+                              + v9cRootVSmall
+                            )
+                        )*d;
+
+                    const vector svHat =
+                        sv
+                       /(mag(sv)+v9cRootVSmall);
+
+                    scalar fd =
+                        scalar(0.4)*mag(d)
+                      + v9cRootVSmall;
+
+                    forAll(f, fp)
+                    {
+                        fd =
+                            Foam::max
+                            (
+                                fd,
+                                Foam::mag
+                                (
+                                    svHat
+                                  & (
+                                        v9cPoints[f[fp]]
+                                      - fc
+                                    )
+                                )
+                            );
+                    }
+
+                    return
+                        mag(sv)/fd;
+                };
+
+                // --------------------------------------------------------
+                // Exact undirected shared-edge test.
+                //
+                // CFMITCH V9C NEXTLABEL EDGE FIX
+                //
+                // face::nextLabel(i) returns the NEXT POINT LABEL, not the
+                // next local face index.  Do not index the face again.
+                // --------------------------------------------------------
+
+                const auto v9cShareEdge =
+                []
+                (
+                    const face& a,
+                    const face& b
+                ) -> bool
+                {
+                    forAll(a, ai)
+                    {
+                        label a0 = a[ai];
+                        label a1 = a.nextLabel(ai);
+
+                        if( a1 < a0 )
+                            std::swap(a0, a1);
+
+                        forAll(b, bi)
+                        {
+                            label b0 = b[bi];
+                            label b1 = b.nextLabel(bi);
+
+                            if( b1 < b0 )
+                                std::swap(b0, b1);
+
+                            if
+                            (
+                                a0 == b0
+                             && a1 == b1
+                            )
+                            {
+                                return true;
+                            }
+                        }
+                    }
+
+                    return false;
+                };
+
+                label v9cOwnerGroups = 0;
+                label v9cBadOwnerGroups = 0;
+                label v9cComponents = 0;
+                label v9cBadComponents = 0;
+                label v9cSingletonBadComponents = 0;
+
+                label v9cRejectedNormal = 0;
+                label v9cRejectedPlane = 0;
+                label v9cRejectedManifold = 0;
+                label v9cRejectedPerimeter = 0;
+                label v9cRejectedCellCentre = 0;
+                label v9cRejectedVirtualSkew = 0;
+
+                label v9cValidVirtualComponents = 0;
+                label v9cEligibleComponents = 0;
+
+                label v9cPeriodicBadFacesSeen = 0;
+                label v9cEligibleOldBadFaces = 0;
+
+                scalar v9cWorstEligibleMergedSkew = 0;
+                scalar v9cLargestCentreShift = 0;
+
+                // ========================================================
+                // CFMITCH V9D PROVEN PERIODIC MERGE
+                //
+                // V9C remains the eligibility/proof engine.
+                //
+                // V9D stages ONLY components for which V9C proves:
+                //   * coherent local plane/orientation
+                //   * valid single perimeter
+                //   * positive virtual owner volume
+                //   * exact Foundation merged boundary skew < 4
+                //   * strict skew improvement
+                //
+                // One existing component face is retained as the keeper
+                // and rewritten to the outer perimeter polygon.  Every
+                // sibling fragment is removed later in one batch.
+                //
+                // No point coordinates are modified.
+                // ========================================================
+
+                std::map<label, face> v9dReplacementFaces;
+
+                boolList v9dRemoveFace
+                (
+                    v9cFaces.size(),
+                    false
+                );
+
+                label v9dStoredComponents = 0;
+                label v9dFacesToRemove = 0;
+
+                // --------------------------------------------------------
+                // Process semantic periodic patches.
+                // --------------------------------------------------------
+
+                forAll(v9cBoundaries, patchI)
+                {
+                    const boundaryPatch& bp =
+                        v9cBoundaries[patchI];
+
+                    bool isPeriodicRole = false;
+
+                    forAll(v9cPeriodicPatchNames, roleI)
+                    {
+                        if
+                        (
+                            v9cPeriodicPatchNames[roleI]
+                         == bp.patchName()
+                        )
+                        {
+                            isPeriodicRole = true;
+                            break;
+                        }
+                    }
+
+                    if( !isPeriodicRole )
+                        continue;
+
+                    std::map<label, DynamicList<label> >
+                        ownerFaces;
+
+                    const label patchStart =
+                        bp.patchStart();
+
+                    const label patchEnd =
+                        patchStart
+                      + bp.patchSize();
+
+                    for
+                    (
+                        label faceI=patchStart;
+                        faceI<patchEnd;
+                        ++faceI
+                    )
+                    {
+                        if
+                        (
+                            faceI < 0
+                         || faceI >= label(v9cOwner.size())
+                        )
+                        {
+                            continue;
+                        }
+
+                        const label ownCell =
+                            v9cOwner[faceI];
+
+                        if
+                        (
+                            ownCell < 0
+                         || ownCell >= label(v9cCells.size())
+                        )
+                        {
+                            continue;
+                        }
+
+                        ownerFaces[ownCell].append(faceI);
+                    }
+
+                    for
+                    (
+                        std::map
+                        <
+                            label,
+                            DynamicList<label>
+                        >::const_iterator ownerIter =
+                            ownerFaces.begin();
+                        ownerIter != ownerFaces.end();
+                        ++ownerIter
+                    )
+                    {
+                        ++v9cOwnerGroups;
+
+                        const label ownCell =
+                            ownerIter->first;
+
+                        const DynamicList<label>& group =
+                            ownerIter->second;
+
+                        bool ownerHasBad = false;
+
+                        forAll(group, gi)
+                        {
+                            if
+                            (
+                                v9cOFBefore
+                               .fanSkewFaces
+                               .found(group[gi])
+                            )
+                            {
+                                ownerHasBad = true;
+                                break;
+                            }
+                        }
+
+                        if( !ownerHasBad )
+                            continue;
+
+                        ++v9cBadOwnerGroups;
+
+                        // ----------------------------------------------
+                        // Split same-owner/same-patch faces into exact
+                        // SHARED-EDGE connected components.
+                        // ----------------------------------------------
+
+                        boolList assigned
+                        (
+                            group.size(),
+                            false
+                        );
+
+                        forAll(group, seedLocal)
+                        {
+                            if( assigned[seedLocal] )
+                                continue;
+
+                            DynamicList<label> queue;
+                            DynamicList<label> component;
+
+                            assigned[seedLocal] = true;
+                            queue.append(seedLocal);
+
+                            label qHead = 0;
+
+                            while
+                            (
+                                qHead
+                              < label(queue.size())
+                            )
+                            {
+                                const label localI =
+                                    queue[qHead++];
+
+                                const label faceI =
+                                    group[localI];
+
+                                component.append(faceI);
+
+                                forAll(group, testLocal)
+                                {
+                                    if
+                                    (
+                                        assigned[testLocal]
+                                    )
+                                    {
+                                        continue;
+                                    }
+
+                                    if
+                                    (
+                                        v9cShareEdge
+                                        (
+                                            v9cFaces[faceI],
+                                            v9cFaces
+                                            [
+                                                group[testLocal]
+                                            ]
+                                        )
+                                    )
+                                    {
+                                        assigned[testLocal] =
+                                            true;
+
+                                        queue.append
+                                        (
+                                            testLocal
+                                        );
+                                    }
+                                }
+                            }
+
+                            ++v9cComponents;
+
+                            label oldBadFaces = 0;
+
+                            forAll(component, ci)
+                            {
+                                if
+                                (
+                                    v9cOFBefore
+                                   .fanSkewFaces
+                                   .found(component[ci])
+                                )
+                                {
+                                    ++oldBadFaces;
+                                }
+                            }
+
+                            if( oldBadFaces == 0 )
+                                continue;
+
+                            ++v9cBadComponents;
+
+                            v9cPeriodicBadFacesSeen +=
+                                oldBadFaces;
+
+                            if( component.size() < 2 )
+                            {
+                                ++v9cSingletonBadComponents;
+
+                                Info
+                                    << "CFMITCH V9C VIRTUAL MERGE:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces="
+                                    << component.size()
+                                    << " oldBadFaces="
+                                    << oldBadFaces
+                                    << " eligible=no"
+                                    << " reason=singleton"
+                                    << endl;
+
+                                continue;
+                            }
+
+                            // ------------------------------------------
+                            // Reference plane and coplanarity.
+                            // ------------------------------------------
+
+                            point refFc(vector::zero);
+                            vector refFa(vector::zero);
+
+                            if
+                            (
+                                !v9cFaceGeometry
+                                (
+                                    v9cFaces[component[0]],
+                                    refFc,
+                                    refFa
+                                )
+                            )
+                            {
+                                ++v9cRejectedNormal;
+                                continue;
+                            }
+
+                            const scalar magRefFa =
+                                mag(refFa);
+
+                            if( magRefFa <= VSMALL )
+                            {
+                                ++v9cRejectedNormal;
+                                continue;
+                            }
+
+                            const vector refN =
+                                refFa/magRefFa;
+
+                            const face& refFace =
+                                v9cFaces[component[0]];
+
+                            const point refP =
+                                v9cPoints[refFace[0]];
+
+                            scalar clusterScale = 0;
+                            scalar maxPlaneError = 0;
+                            scalar minNormalCos = GREAT;
+
+                            bool normalOK = true;
+                            bool v11bNormalGeometryOK = true;
+                            bool v11bNormalThresholdFailed = false;
+
+                            forAll(component, ci)
+                            {
+                                point fc(vector::zero);
+                                vector fa(vector::zero);
+
+                                if
+                                (
+                                    !v9cFaceGeometry
+                                    (
+                                        v9cFaces
+                                        [
+                                            component[ci]
+                                        ],
+                                        fc,
+                                        fa
+                                    )
+                                )
+                                {
+                                    normalOK = false;
+                                    v11bNormalGeometryOK = false;
+                                    break;
+                                }
+
+                                const scalar ma =
+                                    mag(fa);
+
+                                if( ma <= VSMALL )
+                                {
+                                    normalOK = false;
+                                    v11bNormalGeometryOK = false;
+                                    break;
+                                }
+
+                                const scalar normalCos =
+                                    (fa & refFa)
+                                   /(ma*magRefFa+VSMALL);
+
+                                minNormalCos =
+                                    Foam::min
+                                    (
+                                        minNormalCos,
+                                        normalCos
+                                    );
+
+                                if
+                                (
+                                    normalCos
+                                  < scalar(1.0)
+                                  - scalar(1e-6)
+                                )
+                                {
+                                    normalOK = false;
+                                    v11bNormalThresholdFailed = true;
+                                    if( !v11bProbeNormalRejected && !v11cCommitProvenNormalRejected )
+                                        break;
+                                }
+
+                                const face& f =
+                                    v9cFaces[component[ci]];
+
+                                forAll(f, fp)
+                                {
+                                    const point& p =
+                                        v9cPoints[f[fp]];
+
+                                    clusterScale =
+                                        Foam::max
+                                        (
+                                            clusterScale,
+                                            mag(p-refP)
+                                        );
+
+                                    maxPlaneError =
+                                        Foam::max
+                                        (
+                                            maxPlaneError,
+                                            Foam::mag
+                                            (
+                                                refN
+                                              & (p-refP)
+                                            )
+                                        );
+                                }
+                            }
+
+                            const bool v11bProbeComponent =
+                                (v11bProbeNormalRejected || v11cCommitProvenNormalRejected)
+                             && v11bNormalGeometryOK
+                             && v11bNormalThresholdFailed
+                             && !normalOK;
+
+                            if
+                            (
+                                !normalOK
+                             && !v11bProbeComponent
+                            )
+                            {
+                                ++v9cRejectedNormal;
+
+                                Info
+                                    << "CFMITCH V9C VIRTUAL MERGE:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces="
+                                    << component.size()
+                                    << " oldBadFaces="
+                                    << oldBadFaces
+                                    << " minNormalCos="
+                                    << minNormalCos
+                                    << " eligible=no"
+                                    << " reason=normal"
+                                    << endl;
+
+                                continue;
+                            }
+
+                            if( v11bProbeComponent )
+                            {
+                                ++v9cRejectedNormal;
+
+                                Info
+                                    << "CFMITCH V11B NORMAL_GATE_BYPASS:"
+                                    << " patch=" << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces=" << component.size()
+                                    << " oldBadFaces=" << oldBadFaces
+                                    << " minNormalCos=" << minNormalCos
+                                    << " probeOnly=yes"
+                                    << endl;
+                            }
+
+                            // Semantic periodic patches are planar.
+                            // 1e-4 of component span remains extremely
+                            // conservative (~10-50 nm for these Rotor faces)
+                            // while avoiding V9A's picometre-scale gate.
+                            const scalar planeTol =
+                                Foam::max
+                                (
+                                    scalar(1e-10),
+                                    scalar(1e-4)
+                                   *Foam::max
+                                    (
+                                        clusterScale,
+                                        scalar(1e-12)
+                                    )
+                                );
+
+                            if
+                            (
+                                maxPlaneError
+                              > planeTol
+                              && !v11bProbeComponent
+                            )
+                            {
+                                ++v9cRejectedPlane;
+
+                                Info
+                                    << "CFMITCH V9C VIRTUAL MERGE:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces="
+                                    << component.size()
+                                    << " oldBadFaces="
+                                    << oldBadFaces
+                                    << " planeError="
+                                    << maxPlaneError
+                                    << " planeTol="
+                                    << planeTol
+                                    << " minNormalCos="
+                                    << minNormalCos
+                                    << " eligible=no"
+                                    << " reason=plane"
+                                    << endl;
+
+                                continue;
+                            }
+
+                            // ------------------------------------------
+                            // Component edge incidence.
+                            // ------------------------------------------
+
+                            typedef
+                                std::pair<label,label>
+                                V9CEdge;
+
+                            std::map<V9CEdge,label>
+                                edgeCount;
+
+                            bool manifoldOK = true;
+
+                            forAll(component, ci)
+                            {
+                                const face& f =
+                                    v9cFaces
+                                    [
+                                        component[ci]
+                                    ];
+
+                                forAll(f, fp)
+                                {
+                                    label a =
+                                        f[fp];
+
+                                    label b =
+                                        f.nextLabel(fp);
+
+                                    if( a == b )
+                                    {
+                                        manifoldOK = false;
+                                        break;
+                                    }
+
+                                    if( b < a )
+                                        std::swap(a,b);
+
+                                    const V9CEdge e(a,b);
+
+                                    std::map
+                                    <
+                                        V9CEdge,
+                                        label
+                                    >::iterator eIter =
+                                        edgeCount.find(e);
+
+                                    if
+                                    (
+                                        eIter
+                                     == edgeCount.end()
+                                    )
+                                    {
+                                        edgeCount.insert
+                                        (
+                                            std::make_pair
+                                            (
+                                                e,
+                                                label(1)
+                                            )
+                                        );
+                                    }
+                                    else
+                                    {
+                                        ++(eIter->second);
+
+                                        if
+                                        (
+                                            eIter->second > 2
+                                        )
+                                        {
+                                            manifoldOK =
+                                                false;
+
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if( !manifoldOK )
+                                    break;
+                            }
+
+                            if( !manifoldOK )
+                            {
+                                ++v9cRejectedManifold;
+
+                                Info
+                                    << "CFMITCH V9C VIRTUAL MERGE:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces="
+                                    << component.size()
+                                    << " oldBadFaces="
+                                    << oldBadFaces
+                                    << " eligible=no"
+                                    << " reason=nonManifold"
+                                    << endl;
+
+                                continue;
+                            }
+
+                            // ------------------------------------------
+                            // Boundary edges occur exactly once.
+                            // A single-disk component must have degree 2
+                            // at every perimeter point and form one loop.
+                            // ------------------------------------------
+
+                            std::map
+                            <
+                                label,
+                                DynamicList<label>
+                            > perimeterNeighbours;
+
+                            label nPerimeterEdges = 0;
+
+                            V9CEdge firstPerimeterEdge
+                            (
+                                -1,
+                                -1
+                            );
+
+                            for
+                            (
+                                std::map
+                                <
+                                    V9CEdge,
+                                    label
+                                >::const_iterator eIter =
+                                    edgeCount.begin();
+                                eIter != edgeCount.end();
+                                ++eIter
+                            )
+                            {
+                                if( eIter->second != 1 )
+                                    continue;
+
+                                const label a =
+                                    eIter->first.first;
+
+                                const label b =
+                                    eIter->first.second;
+
+                                if( nPerimeterEdges == 0 )
+                                {
+                                    firstPerimeterEdge =
+                                        eIter->first;
+                                }
+
+                                perimeterNeighbours[a]
+                                    .append(b);
+
+                                perimeterNeighbours[b]
+                                    .append(a);
+
+                                ++nPerimeterEdges;
+                            }
+
+                            bool perimeterOK =
+                                nPerimeterEdges >= 3;
+
+                            if( perimeterOK )
+                            {
+                                for
+                                (
+                                    std::map
+                                    <
+                                        label,
+                                        DynamicList<label>
+                                    >::const_iterator pIter =
+                                        perimeterNeighbours
+                                       .begin();
+                                    pIter
+                                     != perimeterNeighbours
+                                       .end();
+                                    ++pIter
+                                )
+                                {
+                                    if
+                                    (
+                                        pIter->second.size()
+                                     != 2
+                                    )
+                                    {
+                                        perimeterOK = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            DynamicList<label> perimeter;
+
+                            if( perimeterOK )
+                            {
+                                labelHashSet visited;
+
+                                const label startPoint =
+                                    firstPerimeterEdge.first;
+
+                                label previousPoint = -1;
+                                label currentPoint =
+                                    startPoint;
+
+                                for
+                                (
+                                    label step=0;
+                                    step<nPerimeterEdges;
+                                    ++step
+                                )
+                                {
+                                    if
+                                    (
+                                        visited.found
+                                        (
+                                            currentPoint
+                                        )
+                                    )
+                                    {
+                                        perimeterOK =
+                                            false;
+
+                                        break;
+                                    }
+
+                                    visited.insert
+                                    (
+                                        currentPoint
+                                    );
+
+                                    perimeter.append
+                                    (
+                                        currentPoint
+                                    );
+
+                                    std::map
+                                    <
+                                        label,
+                                        DynamicList<label>
+                                    >::const_iterator pIter =
+                                        perimeterNeighbours
+                                       .find(currentPoint);
+
+                                    if
+                                    (
+                                        pIter
+                                     == perimeterNeighbours
+                                       .end()
+                                     || pIter->second.size()
+                                        != 2
+                                    )
+                                    {
+                                        perimeterOK =
+                                            false;
+
+                                        break;
+                                    }
+
+                                    const DynamicList<label>&
+                                        nbr =
+                                            pIter->second;
+
+                                    label nextPoint =
+                                        nbr[0];
+
+                                    if
+                                    (
+                                        nextPoint
+                                     == previousPoint
+                                    )
+                                    {
+                                        nextPoint =
+                                            nbr[1];
+                                    }
+
+                                    previousPoint =
+                                        currentPoint;
+
+                                    currentPoint =
+                                        nextPoint;
+                                }
+
+                                if
+                                (
+                                    currentPoint
+                                 != startPoint
+                                 || perimeter.size()
+                                    != nPerimeterEdges
+                                 || visited.size()
+                                    != nPerimeterEdges
+                                )
+                                {
+                                    perimeterOK = false;
+                                }
+                            }
+
+                            if( !perimeterOK )
+                            {
+                                ++v9cRejectedPerimeter;
+
+                                Info
+                                    << "CFMITCH V9C VIRTUAL MERGE:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces="
+                                    << component.size()
+                                    << " oldBadFaces="
+                                    << oldBadFaces
+                                    << " perimeterEdges="
+                                    << nPerimeterEdges
+                                    << " eligible=no"
+                                    << " reason=perimeter"
+                                    << endl;
+
+                                continue;
+                            }
+
+                            // ------------------------------------------
+                            // Build the hypothetical merged polygon.
+                            // ------------------------------------------
+
+                            face merged
+                            (
+                                perimeter.size()
+                            );
+
+                            forAll(perimeter, pi)
+                            {
+                                merged[pi] =
+                                    perimeter[pi];
+                            }
+
+                            point mergedFc(vector::zero);
+                            vector mergedFa(vector::zero);
+
+                            if
+                            (
+                                !v9cFaceGeometry
+                                (
+                                    merged,
+                                    mergedFc,
+                                    mergedFa
+                                )
+                            )
+                            {
+                                ++v9cRejectedPerimeter;
+                                continue;
+                            }
+
+                            // Orient like the existing boundary faces.
+                            if
+                            (
+                                (mergedFa & refFa)
+                              < scalar(0)
+                            )
+                            {
+                                face reversed
+                                (
+                                    merged.size()
+                                );
+
+                                forAll(merged, mi)
+                                {
+                                    reversed[mi] =
+                                        merged
+                                        [
+                                            merged.size()
+                                          - 1
+                                          - mi
+                                        ];
+                                }
+
+                                merged = reversed;
+
+                                if
+                                (
+                                    !v9cFaceGeometry
+                                    (
+                                        merged,
+                                        mergedFc,
+                                        mergedFa
+                                    )
+                                )
+                                {
+                                    ++v9cRejectedPerimeter;
+                                    continue;
+                                }
+                            }
+
+                            if
+                            (
+                                (mergedFa & refFa)
+                              <= scalar(0)
+                            )
+                            {
+                                ++v9cRejectedPerimeter;
+                                continue;
+                            }
+
+                            // ------------------------------------------
+                            // Exact current owner centre.
+                            // ------------------------------------------
+
+                            point oldOwnCc(vector::zero);
+                            scalar oldSignedVol = 0;
+
+                            if
+                            (
+                                !v9cCellCentre
+                                (
+                                    ownCell,
+                                    nullptr,
+                                    nullptr,
+                                    nullptr,
+                                    oldOwnCc,
+                                    oldSignedVol
+                                )
+                            )
+                            {
+                                ++v9cRejectedCellCentre;
+                                continue;
+                            }
+
+                            // Current exact max skew of every fragment in
+                            // this component.
+                            scalar oldMaxSkew = 0;
+
+                            forAll(component, ci)
+                            {
+                                point fc(vector::zero);
+                                vector fa(vector::zero);
+
+                                if
+                                (
+                                    !v9cFaceGeometry
+                                    (
+                                        v9cFaces
+                                        [
+                                            component[ci]
+                                        ],
+                                        fc,
+                                        fa
+                                    )
+                                )
+                                {
+                                    continue;
+                                }
+
+                                oldMaxSkew =
+                                    Foam::max
+                                    (
+                                        oldMaxSkew,
+                                        v9cBoundarySkew
+                                        (
+                                            v9cFaces
+                                            [
+                                                component[ci]
+                                            ],
+                                            fc,
+                                            fa,
+                                            oldOwnCc
+                                        )
+                                    );
+                            }
+
+                            // ------------------------------------------
+                            // Virtual topology:
+                            //
+                            // remove every fragment in the component,
+                            // insert exactly one merged boundary polygon,
+                            // and reconstruct this cell's Foundation centre.
+                            // ------------------------------------------
+
+                            labelHashSet removedFaces;
+
+                            forAll(component, ci)
+                            {
+                                removedFaces.insert
+                                (
+                                    component[ci]
+                                );
+                            }
+
+                            point virtualOwnCc(vector::zero);
+                            scalar virtualSignedVol = 0;
+
+                            if
+                            (
+                                !v9cCellCentre
+                                (
+                                    ownCell,
+                                    &removedFaces,
+                                    &mergedFc,
+                                    &mergedFa,
+                                    virtualOwnCc,
+                                    virtualSignedVol
+                                )
+                            )
+                            {
+                                ++v9cRejectedCellCentre;
+                                continue;
+                            }
+
+                            const scalar centreShift =
+                                mag
+                                (
+                                    virtualOwnCc
+                                  - oldOwnCc
+                                );
+
+                            v9cLargestCentreShift =
+                                Foam::max
+                                (
+                                    v9cLargestCentreShift,
+                                    centreShift
+                                );
+
+                            const scalar virtualSkew =
+                                v9cBoundarySkew
+                                (
+                                    merged,
+                                    mergedFc,
+                                    mergedFa,
+                                    virtualOwnCc
+                                );
+
+                            ++v9cValidVirtualComponents;
+
+                            const bool volumeSignOK =
+                                oldSignedVol > scalar(0)
+                             && virtualSignedVol
+                                > scalar(0);
+
+                            const bool virtualSkewOK =
+                                virtualSkew
+                              < scalar(4.0);
+
+                            const bool improves =
+                                virtualSkew
+                              < oldMaxSkew;
+
+                            const bool v11bWouldPassVirtualProof =
+                                volumeSignOK
+                             && virtualSkewOK
+                             && improves;
+
+                            // CFMITCH V11B HARD SAFETY INTERLOCK:
+                            // probe components can NEVER enter V9D staging.
+                            const bool v11cEscalatedEligible =
+                                v11bProbeComponent
+                             && v11cCommitProvenNormalRejected
+                             && v11bWouldPassVirtualProof;
+
+                            // CFMITCH V11C:
+                            // The normal/plane tests remain conservative pre-screens.
+                            // A failed pre-screen may be overridden only by the complete
+                            // exact virtual topology proof already used by V9C/V9D.
+                            const bool eligible =
+                                (
+                                    !v11bProbeComponent
+                                 && v11bWouldPassVirtualProof
+                                )
+                             || v11cEscalatedEligible;
+
+                            if( v11cEscalatedEligible )
+                            {
+                                Info
+                                    << "CFMITCH V11C ESCALATED MERGE:"
+                                    << " patch=" << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " componentFaces=" << component.size()
+                                    << " oldBadFaces=" << oldBadFaces
+                                    << " oldMaxSkew=" << oldMaxSkew
+                                    << " virtualMergedSkew=" << virtualSkew
+                                    << " oldVol=" << oldSignedVol
+                                    << " virtualVol=" << virtualSignedVol
+                                    << " relativeVolumeChange="
+                                    << Foam::mag(virtualSignedVol-oldSignedVol)
+                                      /(Foam::mag(oldSignedVol)+VSMALL)
+                                    << " centreShift=" << centreShift
+                                    << " planeError=" << maxPlaneError
+                                    << " planeTol=" << planeTol
+                                    << " minNormalCos=" << minNormalCos
+                                    << " proof=passed"
+                                    << " staging=yes"
+                                    << endl;
+                            }
+
+                            if( v11bProbeComponent )
+                            {
+                                Info
+                                    << "CFMITCH V11B NORMAL_REJECT_PROBE:"
+                                    << " patch=" << bp.patchName()
+                                    << " owner=" << ownCell
+                                    << " ownerFaces=" << v9cCells[ownCell].size()
+                                    << " componentFaces=" << component.size()
+                                    << " perimeterPoints=" << merged.size()
+                                    << " oldBadFaces=" << oldBadFaces
+                                    << " oldMaxSkew=" << oldMaxSkew
+                                    << " virtualMergedSkew=" << virtualSkew
+                                    << " oldVol=" << oldSignedVol
+                                    << " virtualVol=" << virtualSignedVol
+                                    << " centreShift=" << centreShift
+                                    << " clusterScale=" << clusterScale
+                                    << " planeError=" << maxPlaneError
+                                    << " planeTol=" << planeTol
+                                    << " planeErrorRatio="
+                                    << maxPlaneError/(planeTol + VSMALL)
+                                    << " minNormalCos=" << minNormalCos
+                                    << " planeWouldPass="
+                                    << (maxPlaneError <= planeTol ? "yes" : "no")
+                                    << " volumeSignOK="
+                                    << (volumeSignOK ? "yes" : "no")
+                                    << " virtualSkewOK="
+                                    << (virtualSkewOK ? "yes" : "no")
+                                    << " improves="
+                                    << (improves ? "yes" : "no")
+                                    << " wouldPassVirtualProof="
+                                    << (v11bWouldPassVirtualProof ? "yes" : "no")
+                                    << " committed="
+                                    << (v11cEscalatedEligible ? "yes" : "no")
+                                    << endl;
+                            }
+
+                            if( eligible )
+                            {
+                                ++v9cEligibleComponents;
+
+                                v9cEligibleOldBadFaces +=
+                                    oldBadFaces;
+
+                                v9cWorstEligibleMergedSkew =
+                                    Foam::max
+                                    (
+                                        v9cWorstEligibleMergedSkew,
+                                        virtualSkew
+                                    );
+
+                                // ----------------------------------------
+                                // V9D physical staging.
+                                //
+                                // Components are disjoint because each
+                                // boundary face has exactly one owner and
+                                // the V9C traversal partitions each
+                                // same-owner/same-patch group.
+                                // ----------------------------------------
+
+                                if( component.size() < 2 )
+                                {
+                                    FatalErrorIn
+                                    (
+                                        "CFMITCH V9D staging"
+                                    )
+                                        << "Eligible component unexpectedly "
+                                        << "contains fewer than two faces"
+                                        << abort(FatalError);
+                                }
+
+                                const label keeperFace =
+                                    component[0];
+
+                                if
+                                (
+                                    keeperFace < 0
+                                 || keeperFace >= label(v9dRemoveFace.size())
+                                )
+                                {
+                                    FatalErrorIn
+                                    (
+                                        "CFMITCH V9D staging"
+                                    )
+                                        << "Keeper face out of range: "
+                                        << keeperFace
+                                        << abort(FatalError);
+                                }
+
+                                if
+                                (
+                                    v9dReplacementFaces.find(keeperFace)
+                                 != v9dReplacementFaces.end()
+                                 || v9dRemoveFace[keeperFace]
+                                )
+                                {
+                                    FatalErrorIn
+                                    (
+                                        "CFMITCH V9D staging"
+                                    )
+                                        << "Overlapping keeper face "
+                                        << keeperFace
+                                        << abort(FatalError);
+                                }
+
+                                v9dReplacementFaces.insert
+                                (
+                                    std::make_pair
+                                    (
+                                        keeperFace,
+                                        merged
+                                    )
+                                );
+
+                                for
+                                (
+                                    label ci=1;
+                                    ci<label(component.size());
+                                    ++ci
+                                )
+                                {
+                                    const label removeFaceI =
+                                        component[ci];
+
+                                    if
+                                    (
+                                        removeFaceI < 0
+                                     || removeFaceI
+                                        >= label(v9dRemoveFace.size())
+                                    )
+                                    {
+                                        FatalErrorIn
+                                        (
+                                            "CFMITCH V9D staging"
+                                        )
+                                            << "Removal face out of range: "
+                                            << removeFaceI
+                                            << abort(FatalError);
+                                    }
+
+                                    if
+                                    (
+                                        removeFaceI == keeperFace
+                                     || v9dRemoveFace[removeFaceI]
+                                     || v9dReplacementFaces.find(removeFaceI)
+                                        != v9dReplacementFaces.end()
+                                    )
+                                    {
+                                        FatalErrorIn
+                                        (
+                                            "CFMITCH V9D staging"
+                                        )
+                                            << "Overlapping V9D face "
+                                            << removeFaceI
+                                            << abort(FatalError);
+                                    }
+
+                                    v9dRemoveFace[removeFaceI] =
+                                        true;
+
+                                    ++v9dFacesToRemove;
+                                }
+
+                                ++v9dStoredComponents;
+
+                                Info
+                                    << "CFMITCH V9D STAGE:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner="
+                                    << ownCell
+                                    << " keeperFace="
+                                    << keeperFace
+                                    << " componentFaces="
+                                    << component.size()
+                                    << " removeFaces="
+                                    << component.size()-1
+                                    << " perimeterPoints="
+                                    << merged.size()
+                                    << " oldBadFaces="
+                                    << oldBadFaces
+                                    << " oldMaxSkew="
+                                    << oldMaxSkew
+                                    << " virtualMergedSkew="
+                                    << virtualSkew
+                                    << endl;
+                            }
+                            else if
+                            (
+                                !v11bProbeComponent
+                             && (!virtualSkewOK || !improves)
+                            )
+                            {
+                                ++v9cRejectedVirtualSkew;
+                            }
+
+                            Info
+                                << "CFMITCH V9C VIRTUAL MERGE:"
+                                << " patch="
+                                << bp.patchName()
+                                << " owner="
+                                << ownCell
+                                << " ownerFaces="
+                                << v9cCells[ownCell].size()
+                                << " componentFaces="
+                                << component.size()
+                                << " perimeterPoints="
+                                << merged.size()
+                                << " oldBadFaces="
+                                << oldBadFaces
+                                << " oldMaxSkew="
+                                << oldMaxSkew
+                                << " virtualMergedSkew="
+                                << virtualSkew
+                                << " oldVol="
+                                << oldSignedVol
+                                << " virtualVol="
+                                << virtualSignedVol
+                                << " centreShift="
+                                << centreShift
+                                << " planeError="
+                                << maxPlaneError
+                                << " planeTol="
+                                << planeTol
+                                << " minNormalCos="
+                                << minNormalCos
+                                << " eligible="
+                                << (eligible ? "yes" : "no")
+                                << " reason="
+                                << (
+                                       eligible
+                                     ? "proven"
+                                     : (
+                                           !volumeSignOK
+                                         ? "volume"
+                                         : (
+                                               !virtualSkewOK
+                                             ? "mergedSkew"
+                                             : "noImprovement"
+                                           )
+                                       )
+                                   )
+                                << endl;
+
+                            if
+                            (
+                                oldMaxSkew
+                              > scalar(7.0)
+                             || virtualSkew
+                              > scalar(4.0)
+                            )
+                            {
+                                Info
+                                    << "CFMITCH V9C PERIMETER:"
+                                    << " patch="
+                                    << bp.patchName()
+                                    << " owner="
+                                    << ownCell
+                                    << " points=";
+
+                                forAll(merged, mi)
+                                {
+                                    Info
+                                        << (
+                                               mi == 0
+                                             ? "("
+                                             : " "
+                                           )
+                                        << merged[mi];
+                                }
+
+                                Info << ")" << endl;
+                            }
+                        }
+                    }
+                }
+
+                const label v9cPredictedTotalGt4 =
+                    Foam::max
+                    (
+                        label(0),
+                        v9cOFBefore.highSkewFaces
+                      - v9cEligibleOldBadFaces
+                    );
+
+                Info
+                    << "CFMITCH V9C SUMMARY:"
+                    << " ownerGroups="
+                    << v9cOwnerGroups
+                    << " badOwnerGroups="
+                    << v9cBadOwnerGroups
+                    << " components="
+                    << v9cComponents
+                    << " badComponents="
+                    << v9cBadComponents
+                    << " periodicBadFacesSeen="
+                    << v9cPeriodicBadFacesSeen
+                    << " singletonBadComponents="
+                    << v9cSingletonBadComponents
+                    << " rejectedNormal="
+                    << v9cRejectedNormal
+                    << " rejectedPlane="
+                    << v9cRejectedPlane
+                    << " rejectedManifold="
+                    << v9cRejectedManifold
+                    << " rejectedPerimeter="
+                    << v9cRejectedPerimeter
+                    << " rejectedCellCentre="
+                    << v9cRejectedCellCentre
+                    << " rejectedVirtualSkew="
+                    << v9cRejectedVirtualSkew
+                    << " validVirtualComponents="
+                    << v9cValidVirtualComponents
+                    << " eligibleComponents="
+                    << v9cEligibleComponents
+                    << " eligibleOldBadFaces="
+                    << v9cEligibleOldBadFaces
+                    << " predictedTotalGt4="
+                    << v9cPredictedTotalGt4
+                    << " worstEligibleMergedSkew="
+                    << v9cWorstEligibleMergedSkew
+                    << " largestCentreShift="
+                    << v9cLargestCentreShift
+                    << " topologyChanged=no"
+                    << endl;
+
+                Info
+                    << "CFMITCH V9C COMPLETE:"
+                    << " virtual proof complete"
+                    << endl;
+
+                // ========================================================
+                // CFMITCH V9D PHYSICAL COMMIT
+                // ========================================================
+
+                if
+                (
+                    v9dStoredComponents
+                 != v9cEligibleComponents
+                 || label(v9dReplacementFaces.size())
+                    != v9cEligibleComponents
+                )
+                {
+                    FatalErrorIn
+                    (
+                        "CFMITCH V9D physical commit"
+                    )
+                        << "Staging mismatch:"
+                        << " eligibleComponents="
+                        << v9cEligibleComponents
+                        << " storedComponents="
+                        << v9dStoredComponents
+                        << " replacementFaces="
+                        << v9dReplacementFaces.size()
+                        << abort(FatalError);
+                }
+
+                Info
+                    << "CFMITCH V9D PLAN:"
+                    << " components="
+                    << v9dStoredComponents
+                    << " replacementFaces="
+                    << v9dReplacementFaces.size()
+                    << " facesToRemove="
+                    << v9dFacesToRemove
+                    << " exactGt4Before="
+                    << v9cOFBefore.highSkewFaces
+                    << " predictedGt4After="
+                    << v9cPredictedTotalGt4
+                    << " coordinatesMoved=no"
+                    << endl;
+
+                if( v9dStoredComponents > 0 )
+                {
+                    polyMeshGenModifier v9dModifier(mesh_);
+
+                    faceListPMG& v9dFacesAccess =
+                        v9dModifier.facesAccess();
+
+                    for
+                    (
+                        std::map<label,face>::const_iterator
+                            repIter =
+                                v9dReplacementFaces.begin();
+                        repIter != v9dReplacementFaces.end();
+                        ++repIter
+                    )
+                    {
+                        const label keeperFace =
+                            repIter->first;
+
+                        if
+                        (
+                            keeperFace < 0
+                         || keeperFace
+                            >= label(v9dFacesAccess.size())
+                        )
+                        {
+                            FatalErrorIn
+                            (
+                                "CFMITCH V9D physical commit"
+                            )
+                                << "Keeper face out of range during commit: "
+                                << keeperFace
+                                << abort(FatalError);
+                        }
+
+                        v9dFacesAccess[keeperFace] =
+                            repIter->second;
+                    }
+
+                    Info
+                        << "CFMITCH V9D COMMIT:"
+                        << " rewrittenFaces="
+                        << v9dReplacementFaces.size()
+                        << " removingSiblingFaces="
+                        << v9dFacesToRemove
+                        << endl;
+
+                    // Native polyMeshGenModifier machinery updates:
+                    //   * boundary patch start/size
+                    //   * cell face addressing
+                    //   * face subsets
+                    //   * topology-derived addressing
+                    v9dModifier.removeFaces
+                    (
+                        v9dRemoveFace
+                    );
+
+                    // Interior fan-centre points which were referenced only
+                    // by the removed fragments are now intentionally orphaned.
+                    // Compact them; retained XYZ coordinates are unchanged.
+                    v9dModifier.removeUnusedVertices();
+
+                    v9dModifier.clearTopologyAddressing();
+
+                    mesh_.clearAddressingData();
+
+                    // ----------------------------------------------------
+                    // Hard native topology/geometry checks.
+                    // ----------------------------------------------------
+
+                    const bool v9dUnusedPoints =
+                        polyMeshGenChecks::checkPoints
+                        (
+                            mesh_,
+                            false
+                        );
+
+                    labelHashSet v9dNegVol;
+                    labelHashSet v9dBadPyr;
+                    labelHashSet v9dOpenCells;
+
+                    polyMeshGenChecks::checkCellVolumes
+                    (
+                        mesh_,
+                        false,
+                        &v9dNegVol
+                    );
+
+                    polyMeshGenChecks::checkFacePyramids
+                    (
+                        mesh_,
+                        false,
+                        -SMALL,
+                        &v9dBadPyr
+                    );
+
+                    polyMeshGenChecks::checkClosedCells
+                    (
+                        mesh_,
+                        false,
+                        0.5,
+                        &v9dOpenCells
+                    );
+
+                    // ----------------------------------------------------
+                    // Exact Foundation/OpenFOAM post-commit evaluator.
+                    // ----------------------------------------------------
+
+                    CFMitchOFHardQuality v9dOFAfter;
+
+                    evaluateOpenFOAMHardQuality
+                    (
+                        mesh_,
+                        v9dOFAfter,
+                        false,
+                        nullptr,
+                        true
+                    );
+
+                    printOpenFOAMCandidateQuality
+                    (
+                        "V9D_POST_COMMIT",
+                        v9dOFAfter
+                    );
+
+                    const scalar v9dSkewTol =
+                        scalar(1e-12)
+                       *Foam::max
+                        (
+                            scalar(1),
+                            Foam::mag
+                            (
+                                v9cOFBefore.maxSkew
+                            )
+                        );
+
+                    const bool v9dHardClean =
+                        v9dNegVol.size() == 0
+                     && v9dBadPyr.size() == 0
+                     && v9dOpenCells.size() == 0
+                     && !v9dUnusedPoints
+                     && v9dOFAfter.signedNegVolCells == 0
+                     && v9dOFAfter.pyramidErrors == 0
+                     && v9dOFAfter.errorNonOrthFaces.size() == 0
+                     && v9dOFAfter.zeroFaceCells == 0
+                     && v9dOFAfter.centreFallbackCells == 0;
+
+                    const bool v9dSkewImproved =
+                        v9dOFAfter.highSkewFaces
+                          < v9cOFBefore.highSkewFaces
+                     && v9dOFAfter.maxSkew
+                          <= v9cOFBefore.maxSkew
+                           + v9dSkewTol;
+
+                    Info
+                        << "CFMITCH V9D RESULT:"
+                        << " hardClean="
+                        << (v9dHardClean ? "yes" : "no")
+                        << " negVol="
+                        << v9dNegVol.size()
+                        << " badPyramids="
+                        << v9dBadPyr.size()
+                        << " openCells="
+                        << v9dOpenCells.size()
+                        << " unusedPoints="
+                        << (v9dUnusedPoints ? "bad" : "ok")
+                        << " nonOrthErrors="
+                        << v9dOFAfter.errorNonOrthFaces.size()
+                        << " skewGt4="
+                        << v9cOFBefore.highSkewFaces
+                        << "->"
+                        << v9dOFAfter.highSkewFaces
+                        << " predicted="
+                        << v9cPredictedTotalGt4
+                        << " maxSkew="
+                        << v9cOFBefore.maxSkew
+                        << "->"
+                        << v9dOFAfter.maxSkew
+                        << " faces="
+                        << v9cFaceCountBefore
+                        << "->"
+                        << mesh_.faces().size()
+                        << " pointsAfter="
+                        << mesh_.points().size()
+                        << " coordinatesMoved=no"
+                        << endl;
+
+                    if
+                    (
+                        !v9dHardClean
+                     || !v9dSkewImproved
+                    )
+                    {
+                        FatalErrorIn
+                        (
+                            "CFMITCH V9D physical commit"
+                        )
+                            << "V9D rejected after topology commit."
+                            << " hardClean="
+                            << v9dHardClean
+                            << " skewImproved="
+                            << v9dSkewImproved
+                            << " skewGt4="
+                            << v9cOFBefore.highSkewFaces
+                            << "->"
+                            << v9dOFAfter.highSkewFaces
+                            << " maxSkew="
+                            << v9cOFBefore.maxSkew
+                            << "->"
+                            << v9dOFAfter.maxSkew
+                            << abort(FatalError);
+                    }
+
+                    if
+                    (
+                        !v46AuditFinalAddressing
+                        (
+                            "V9D_POST_MERGE"
+                        )
+                    )
+                    {
+                        FatalErrorIn
+                        (
+                            "CFMITCH V9D physical commit"
+                        )
+                            << "Invalid addressing after V9D merge"
+                            << abort(FatalError);
+                    }
+
+                    Info
+                        << "CFMITCH V9D ACCEPTED:"
+                        << " components="
+                        << v9dStoredComponents
+                        << " removedFaces="
+                        << v9dFacesToRemove
+                        << " skewGt4="
+                        << v9cOFBefore.highSkewFaces
+                        << "->"
+                        << v9dOFAfter.highSkewFaces
+                        << " maxSkew="
+                        << v9cOFBefore.maxSkew
+                        << "->"
+                        << v9dOFAfter.maxSkew
+                        << endl;
+                }
+                else
+                {
+                    Info
+                        << "CFMITCH V9D:"
+                        << " no proven components to commit"
+                        << endl;
+                }
+            }
+        }
+
 
         polyMeshGenModifier(mesh_).clearTopologyAddressing();
 
@@ -20465,261 +28071,6 @@ void cartesianMeshGenerator::generateMesh()
     }
 }
 
-// v7.1 Phase 2b (SOL): structural/spatial junction contact-line stitch.
-// Proven in isolation (Phase 2a) on vertex 3748's blade_3|shroud
-// interface. This version identifies the SAME junction structurally
-// (patches + missing interface + tight geometric proximity) rather than
-// by hardcoded point ID, since point numbering is not guaranteed stable.
-// FAIL-CLOSED: returns nullptr (no repair applied) unless EXACTLY one
-// qualifying candidate is found. Intentionally narrow -- this is still
-// the single-junction proof case, not general production repair.
-static triSurf* phase2bJunctionStitch
-(
-    const triSurf& rawSurf,
-    const dictionary& meshDict
-)
-{
-    PatchRoleMap roles(meshDict);
-    if( !roles.active() )
-    {
-        Info << "[JunctionStitch3748] PatchRoleMap inactive -- skipping" << endl;
-        return nullptr;
-    }
-
-    const wordList& patchNames = rawSurf.patchNames();
-    label bladeId = -1, periodicId = -1, wallId = -1;
-    forAll(patchNames, pI)
-    {
-        const word& n = patchNames[pI];
-        if( n == word("blade_3") ) bladeId = pI;
-        else if( n == word("periodic_1") ) periodicId = pI;
-        else if( n == word("shroud") ) wallId = pI;
-    }
-    if( bladeId < 0 || periodicId < 0 || wallId < 0 )
-    {
-        Info << "[JunctionStitch3748] required patches not found"
-             << " (blade_3/periodic_1/shroud) -- skipping" << endl;
-        return nullptr;
-    }
-
-    const pointField& pts = rawSurf.points();
-    const VRWGraph& ptFacets = rawSurf.pointFacets();
-    const VRWGraph& ptEdges = rawSurf.pointEdges();
-    const VRWGraph& edgeFacetsG = rawSurf.edgeFacets();
-    const LongList<labelledTri>& facets = rawSurf.facets();
-
-    // Known approximate location of the proof junction (from Phase 2a),
-    // used only as a coarse spatial pre-filter -- NOT as an identity
-    // check. The real qualification is entirely structural (patches +
-    // missing interface + open-edge geometry), matching SOL's
-    // instruction not to key off literal point/vertex IDs.
-    const point approxLoc(0.242172, 0.042408, 0.0295046);
-    const scalar coarseRadius = 0.01; // 10mm, generous pre-filter only
-
-    label candidateVertex = -1;
-    label candidateOpenA = -1, candidateOpenB = -1;
-    point candidatePosA(vector::zero), candidatePosB(vector::zero);
-    scalar candidateGap = -1;
-    label nCandidatesFound = 0;
-
-    forAll(pts, spI)
-    {
-        if( magSqr(pts[spI] - approxLoc) > sqr(coarseRadius) ) continue;
-
-        // Raw incident patch check (ALL_3 for our three required roles).
-        labelHashSet incident;
-        forAllRow(ptFacets, spI, fI)
-        {
-            const label triI = ptFacets(spI, fI);
-            if( triI >= 0 && triI < facets.size() )
-                incident.insert(facets[triI].region());
-        }
-        if( !incident.found(bladeId) || !incident.found(periodicId)
-         || !incident.found(wallId) ) continue;
-
-        // Walk incident edges: find validity of each of the 3 interfaces,
-        // and collect open (nFacets==1) edges by owning patch.
-        bool validBladePeriodic = false, validBladeWall = false, validPeriodicWall = false;
-        DynList<label> openBladeEdges, openWallEdges;
-
-        forAllRow(ptEdges, spI, ord)
-        {
-            const label eI = ptEdges(spI, ord);
-            const label nF = edgeFacetsG.sizeOfRow(eI);
-            if( nF == 1 )
-            {
-                const label owner = facets[edgeFacetsG(eI, 0)].region();
-                if( owner == bladeId ) openBladeEdges.append(eI);
-                else if( owner == wallId ) openWallEdges.append(eI);
-            }
-            else if( nF == 2 )
-            {
-                const label r0 = facets[edgeFacetsG(eI, 0)].region();
-                const label r1 = facets[edgeFacetsG(eI, 1)].region();
-                if( r0 != r1 )
-                {
-                    const bool hasBlade = (r0 == bladeId) || (r1 == bladeId);
-                    const bool hasPeriodic = (r0 == periodicId) || (r1 == periodicId);
-                    const bool hasWall = (r0 == wallId) || (r1 == wallId);
-                    if( hasBlade && hasPeriodic ) validBladePeriodic = true;
-                    if( hasBlade && hasWall ) validBladeWall = true;
-                    if( hasPeriodic && hasWall ) validPeriodicWall = true;
-                }
-            }
-        }
-
-        // Require EXACTLY the blade_3|shroud interface missing, the
-        // other two present, and exactly one open edge on each side.
-        if( validBladeWall ) continue;
-        if( !validBladePeriodic || !validPeriodicWall ) continue;
-        if( openBladeEdges.size() != 1 || openWallEdges.size() != 1 ) continue;
-
-        // Geometric proximity check (SOL's tight prototype tolerances).
-        auto otherEndpoint = [&](const label eI) -> label
-        {
-            const edge& e = rawSurf.edges()[eI];
-            return (e.start() == spI) ? e.end() : e.start();
-        };
-        const label ptA = otherEndpoint(openBladeEdges[0]);
-        const label ptB = otherEndpoint(openWallEdges[0]);
-        if( ptA < 0 || ptA >= pts.size() || ptB < 0 || ptB >= pts.size() ) continue;
-
-        const point& posA = pts[ptA];
-        const point& posB = pts[ptB];
-        const scalar gap = Foam::sqrt(magSqr(posA - posB));
-        const point& triplePos = pts[spI];
-        const vector dirA = posA - triplePos;
-        const vector dirB = posB - triplePos;
-        const scalar lenA = Foam::sqrt(magSqr(dirA));
-        const scalar lenB = Foam::sqrt(magSqr(dirB));
-        if( lenA < VSMALL || lenB < VSMALL ) continue;
-
-        const scalar cosAngle = (dirA & dirB) / (lenA * lenB);
-        const scalar clamped = Foam::max(scalar(-1), Foam::min(scalar(1), cosAngle));
-        const scalar angleDeg =
-            Foam::acos(clamped) * 180.0 / Foam::constant::mathematical::pi;
-        const scalar lengthRatio = lenA / lenB;
-
-        // Tight prototype tolerances -- matches blade_3's known signature
-        // (gap ~10um, angle ~0.004deg, ratio ~0.997), NOT the looser
-        // CLASS_B thresholds used for the exploratory sweep.
-        const bool qualifies =
-            gap < 0.0005 && angleDeg < 0.5
-         && lengthRatio > 0.9 && lengthRatio < 1.111;
-
-        if( !qualifies ) continue;
-
-        ++nCandidatesFound;
-        candidateVertex = spI;
-        candidateOpenA = ptA;
-        candidateOpenB = ptB;
-        candidatePosA = posA;
-        candidatePosB = posB;
-        candidateGap = gap;
-
-        Info << "[JunctionStitch3748] candidate found"
-             << " vertexPos=" << triplePos
-             << " interface=blade_3|shroud"
-             << " gap=" << gap
-             << " angle=" << angleDeg
-             << " lengthRatio=" << lengthRatio
-             << endl;
-    }
-
-    if( nCandidatesFound != 1 )
-    {
-        Info << "[JunctionStitch3748] ABORT: found " << nCandidatesFound
-             << " qualifying candidates, required exactly 1 -- repair NOT applied"
-             << endl;
-        return nullptr;
-    }
-
-    // Perform the stitch -- same validated mechanism as Phase 2a.
-    pointField newPoints = pts;
-    LongList<labelledTri> newFacets = facets;
-    const geometricSurfacePatchList& origPatches = rawSurf.patches();
-    const edgeLongList& origFeatureEdges = rawSurf.featureEdges();
-
-    const point midpoint = 0.5 * (candidatePosA + candidatePosB);
-    const label midpointId = newPoints.size();
-    newPoints.append(midpoint);
-
-    label nRemapped = 0;
-    forAll(newFacets, triI)
-    {
-        labelledTri& tri = newFacets[triI];
-        forAll(tri, vi)
-        {
-            if( tri[vi] == candidateOpenA || tri[vi] == candidateOpenB )
-            {
-                tri[vi] = midpointId;
-                ++nRemapped;
-            }
-        }
-    }
-
-    label nDegenerate = 0, nZeroArea = 0;
-    forAll(newFacets, triI)
-    {
-        const labelledTri& tri = newFacets[triI];
-        if( tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] )
-        { ++nDegenerate; continue; }
-        const point& p0 = newPoints[tri[0]];
-        const point& p1 = newPoints[tri[1]];
-        const point& p2 = newPoints[tri[2]];
-        if( Foam::mag((p1-p0)^(p2-p0)) < VSMALL ) ++nZeroArea;
-    }
-
-    if( nDegenerate > 0 || nZeroArea > 0 )
-    {
-        Info << "[JunctionStitch3748] ABORT: would create " << nDegenerate
-             << " degenerate, " << nZeroArea
-             << " zero-area triangles -- repair NOT applied" << endl;
-        return nullptr;
-    }
-
-    triSurf* repaired =
-        new triSurf(newFacets, origPatches, origFeatureEdges, newPoints);
-
-    Info << "[JunctionStitch3748] APPLIED: vertex=" << candidateVertex
-         << " remapped=" << nRemapped << " facet refs"
-         << " newPointCount=" << repaired->points().size()
-         << " (was " << pts.size() << ")"
-         << endl;
-
-    // Checkpoint 1: verify immediately after stitch.
-    {
-        const VRWGraph& vPtEdges = repaired->pointEdges();
-        const VRWGraph& vEdgeFacets = repaired->edgeFacets();
-        const LongList<labelledTri>& vFacets = repaired->facets();
-        label qualifying = 0;
-        bool sharedFound = false;
-        label sharedFacetCount = -1;
-        forAllRow(vPtEdges, candidateVertex, ord)
-        {
-            const label eI = vPtEdges(candidateVertex, ord);
-            const label nF = vEdgeFacets.sizeOfRow(eI);
-            if( nF != 2 ) continue;
-            const label r0 = vFacets[vEdgeFacets(eI, 0)].region();
-            const label r1 = vFacets[vEdgeFacets(eI, 1)].region();
-            if( r0 != r1 )
-            {
-                ++qualifying;
-                if( (r0 == bladeId && r1 == wallId) || (r0 == wallId && r1 == bladeId) )
-                { sharedFound = true; sharedFacetCount = nF; }
-            }
-        }
-        Info << "[JunctionStitchCheckpoint] stage=afterStitch"
-             << " sharedEdgeFound=" << (sharedFound ? 1 : 0)
-             << " sharedEdgeFacetCount=" << sharedFacetCount
-             << " qualifyingEdges=" << qualifying
-             << " eligible=" << ((qualifying > 2) ? 1 : 0)
-             << endl;
-    }
-
-    return repaired;
-}
-
 // v7.1 Phase 2c (SOL): generalized multi-junction stitch. Same proven
 // mechanism as Phase 2b, but role-based (blade/periodic/hub-or-shroud
 // via PatchRoleMap, not hardcoded patch names) and repeated until no
@@ -21133,7 +28484,7 @@ static triSurf* phase2cMultiJunctionStitch
         }
 
         label foundVertex = -1;
-        label foundBladeId = -1, foundPeriodicId = -1, foundWallId = -1;
+        label foundBladeId = -1, foundWallId = -1;
         label foundOpenA = -1, foundOpenB = -1;
         point foundPosA(vector::zero), foundPosB(vector::zero);
         scalar foundGap = -1, foundAngle = -1, foundRatio = -1;
@@ -21253,7 +28604,7 @@ static triSurf* phase2cMultiJunctionStitch
             // Take the FIRST qualifying candidate this scan -- one
             // repair per full-surface scan, then rescan fresh.
             foundVertex = spI;
-            foundBladeId = thisBlade; foundPeriodicId = thisPeriodic; foundWallId = thisWall;
+            foundBladeId = thisBlade; foundWallId = thisWall;
             foundOpenA = ptA; foundOpenB = ptB;
             foundPosA = posA; foundPosB = posB;
             foundGap = gap; foundAngle = angleDeg; foundRatio = lengthRatio;
@@ -21401,8 +28752,8 @@ cartesianMeshGenerator::cartesianMeshGenerator(const Time& time)
     octreePtr_(NULL),
     mesh_(time),
     controller_(mesh_),
-    finalUntangleRejected_(false),
-    nPointsBeforeBL_(0)
+    nPointsBeforeBL_(0),
+    finalUntangleRejected_(false)
 {
     checkMeshDict cmd(meshDict_);
 

@@ -131,10 +131,156 @@ point boundaryLayers::createNewVertex
     vector normal(vector::zero);
     scalar dist(VGREAT);
     const point& p = points[bPoints[bpI]];
+
+    // ============================================================
+    // CFMITCH BIRTH TARGET TRACE V1B
+    //
+    // Diagnostic only. No geometry is modified.
+    //
+    // Target original Rotor37 seam points:
+    //   pointI 337809
+    //   pointI 337818
+    // ============================================================
+
+    const label cfmBirthPointI = bPoints[bpI];
+
+    const bool cfmBirthTarget =
+    (
+        cfmBirthPointI == 337809
+     || cfmBirthPointI == 337818
+    );
+
+    if( cfmBirthTarget )
+    {
+        Info
+            << "CFMITCH BIRTHTARGET_BEGIN"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " p=" << p
+            << " patchVertex=" << label(patchVertex[bpI])
+            << " neutral="
+            << (blNeutralEdgePoints_.found(bpI) ? 1 : 0)
+            << " blblCorner="
+            << (blblCornerPoints_.found(bpI) ? 1 : 0)
+            << " blblJunction="
+            << (blblJunctionPoints_.found(bpI) ? 1 : 0)
+            << " pointNormal=" << pNormals[bpI]
+            << endl;
+
+        Info
+            << "CFMITCH BIRTHTARGET_PATCHES"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " nPatches=" << pPatches.sizeOfRow(bpI);
+
+        forAllRow(pPatches, bpI, ppI)
+        {
+            const label patchI = pPatches(bpI, ppI);
+
+            const bool treated =
+            (
+                patchI >= 0
+             && patchI < label(treatPatches.size())
+             && treatPatches[patchI]
+            );
+
+            Info
+                << " [patchI=" << patchI
+                << " treated=" << (treated ? 1 : 0)
+                << "]";
+        }
+
+        Info << endl;
+
+        vector cfmTreatedSum(vector::zero);
+        vector cfmUntreatedSum(vector::zero);
+
+        forAllRow(pFaces, bpI, pfI)
+        {
+            const label bfI = pFaces(bpI, pfI);
+
+            if( bfI < 0 || bfI >= label(bFaces.size()) )
+                continue;
+
+            const face& f = bFaces[bfI];
+            const label patchI = boundaryFacePatches[bfI];
+
+            vector fn(vector::zero);
+
+            if( f.size() >= 3 )
+            {
+                const point& fp0 = points[f[0]];
+
+                for(label pi=1; pi<f.size()-1; ++pi)
+                {
+                    fn +=
+                        (points[f[pi]] - fp0)
+                      ^ (points[f[pi+1]] - fp0);
+                }
+            }
+
+            const scalar fnMag = mag(fn);
+
+            vector fnUnit(vector::zero);
+
+            if( fnMag > VSMALL )
+                fnUnit = fn/fnMag;
+
+            const bool treated =
+            (
+                patchI >= 0
+             && patchI < label(treatPatches.size())
+             && treatPatches[patchI]
+            );
+
+            if( treated )
+                cfmTreatedSum += fn;
+            else
+                cfmUntreatedSum += fn;
+
+            Info
+                << "CFMITCH BIRTHTARGET_FACE"
+                << " bpI=" << bpI
+                << " pointI=" << cfmBirthPointI
+                << " bfI=" << bfI
+                << " patchI=" << patchI
+                << " treated=" << (treated ? 1 : 0)
+                << " nPts=" << f.size()
+                << " areaVec=" << fn
+                << " areaMag=" << fnMag
+                << " unitN=" << fnUnit
+                << endl;
+        }
+
+        const scalar cfmTreatedMag = mag(cfmTreatedSum);
+        const scalar cfmUntreatedMag = mag(cfmUntreatedSum);
+
+        vector cfmTreatedUnit(vector::zero);
+        vector cfmUntreatedUnit(vector::zero);
+
+        if( cfmTreatedMag > VSMALL )
+            cfmTreatedUnit = cfmTreatedSum/cfmTreatedMag;
+
+        if( cfmUntreatedMag > VSMALL )
+            cfmUntreatedUnit = cfmUntreatedSum/cfmUntreatedMag;
+
+        Info
+            << "CFMITCH BIRTHTARGET_SUM"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " treatedSum=" << cfmTreatedSum
+            << " treatedUnit=" << cfmTreatedUnit
+            << " untreatedSum=" << cfmUntreatedSum
+            << " untreatedUnit=" << cfmUntreatedUnit
+            << " treatedDotUntreated="
+            << (cfmTreatedUnit & cfmUntreatedUnit)
+            << " pointNormal=" << pNormals[bpI]
+            << endl;
+    }
+
     // BIRTHDIAG trackers (function scope)
     label  bd_branch = -1;   // 0=edge size1, 2=corner size2, 3=multipatch, 9=interior
     scalar bd_edgeDotNormal = -2.0;
-    scalar bd_rawDist = -1.0;
     // BLNOBLPATHDIAG: classify which createNewVertex path the
     // BL/no-BL termination points actually take. Diagnostic only.
     if( blNoBlEdgePoints_.found(bpI) )
@@ -870,7 +1016,23 @@ point boundaryLayers::createNewVertex
                         help::distanceOfPointFromTheEdge(ep1, ep2, p);
 
                     if( dst < dist )
-                        dist = 0.9 * dst;
+                    {
+                        if( cfmBirthTarget )
+                        {
+                            Info
+                                << "CFMITCH BIRTHTARGET_EDGE_LIMIT"
+                                << " bpI=" << bpI
+                                << " pointI=" << cfmBirthPointI
+                                << " faceLabel=" << faceLabel
+                                << " oldDist=" << dist
+                                << " dst=" << dst
+                                << " newDist=" << scalar(0.9)*dst
+                                << " normal=" << normal
+                                << endl;
+                        }
+
+                        dist = scalar(0.9)*dst;
+                    }
                 }
                 else
                 {
@@ -1032,7 +1194,22 @@ point boundaryLayers::createNewVertex
             );
 
             if( d < dist )
+            {
+                if( cfmBirthTarget )
+                {
+                    Info
+                        << "CFMITCH BIRTHTARGET_GENERIC_LIMIT"
+                        << " bpI=" << bpI
+                        << " pointI=" << cfmBirthPointI
+                        << " oldDist=" << dist
+                        << " d=" << d
+                        << " newDist=" << d
+                        << " normal=" << normal
+                        << endl;
+                }
+
                 dist = d;
+            }
         }
     }
 
@@ -1042,12 +1219,28 @@ point boundaryLayers::createNewVertex
     Info << "Distance is " << dist << endl;
     # endif
 
+    if( cfmBirthTarget )
+    {
+        Info
+            << "CFMITCH BIRTHTARGET_PRE_SCALE"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " normal=" << normal
+            << " normalMag=" << mag(normal)
+            << " dist=" << dist
+            << " layerScale="
+            << (
+                   layerScale_.size() > bpI
+                 ? layerScale_[bpI]
+                 : scalar(1)
+               )
+            << endl;
+    }
+
     // Apply layerScale_ ramp at BL/no-BL transition zones
     const scalar rawDist = dist;
-    bd_rawDist = rawDist;
     if( terminateLayersAtConcaveEdges_ && layerScale_.size() > bpI )
     {
-        const scalar oldDist = dist;
         dist *= layerScale_[bpI];
     }
     if( dist > SMALL )
@@ -1067,7 +1260,34 @@ point boundaryLayers::createNewVertex
     else
         dist = 0.0;
 
+    if( cfmBirthTarget )
+    {
+        Info
+            << "CFMITCH BIRTHTARGET_POST_SCALE"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " rawDist=" << rawDist
+            << " finalDist=" << dist
+            << " normal=" << normal
+            << " predictedPMinusNewP=" << (dist*normal)
+            << " predictedDispMag=" << mag(dist*normal)
+            << endl;
+    }
+
     point newP = p - dist * normal;
+
+    if( cfmBirthTarget )
+    {
+        Info
+            << "CFMITCH BIRTHTARGET_INITIAL_NEWP"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " p=" << p
+            << " newP=" << newP
+            << " pMinusNewP=" << (p-newP)
+            << " dispMag=" << mag(p-newP)
+            << endl;
+    }
     if( help::isnan(newP) || help::isinf(newP) )
         return p;
     // BL/neutral crossing clamp: prevent extrusion across periodic/symmetry planes.
@@ -1320,6 +1540,21 @@ point boundaryLayers::createNewVertex
                  << endl;
         }
     }
+    if( cfmBirthTarget )
+    {
+        Info
+            << "CFMITCH BIRTHTARGET_FINAL"
+            << " bpI=" << bpI
+            << " pointI=" << cfmBirthPointI
+            << " p=" << p
+            << " newP=" << newP
+            << " pMinusNewP=" << (p-newP)
+            << " dispMag=" << mag(p-newP)
+            << " normal=" << normal
+            << " distVariable=" << dist
+            << endl;
+    }
+
     return newP;
 }
 
@@ -1343,7 +1578,6 @@ void boundaryLayers::suppressFailedSingularityExtrusions
     const faceList::subList& bFaces = mse.boundaryFaces();
     const pointFieldPMG& points = mesh_.points();
 
-    const vectorField& pNormals = mse.pointNormals();
     const VRWGraph& pFaces = mse.pointFaces();
     const VRWGraph& pointPoints = mse.pointPoints();
     const labelList& boundaryFacePatches = mse.boundaryFacePatches();
@@ -1575,6 +1809,2903 @@ void boundaryLayers::suppressFailedSingularityExtrusions
          << endl;
 }
 
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+void boundaryLayers::constrainNeutralSeamCandidatesBeforeSwap()
+{
+    // ============================================================
+    // CFMITCH CONNECTED NEUTRAL SEAM CONSTRAINT V1
+    //
+    // Problem being fixed:
+    //
+    // createNewVertex() currently chooses a BL/neutral extrusion
+    // independently at each vertex from its local treated-face fan.
+    //
+    // Rotor37 demonstrated adjacent clean blade/periodic seam points
+    // whose as-born macro hairs differed by ~45 degrees.
+    //
+    // V1 changes authority:
+    //
+    //   createNewVertex()
+    //       -> local candidate / clearance provider
+    //
+    //   this connected pass
+    //       -> seam direction authority
+    //
+    // For a clean wall + neutral seam:
+    //
+    //   tau = connected seam tangent
+    //   n   = connected/smoothed neutral-manifold normal
+    //   d   = n ^ tau
+    //
+    // Therefore d:
+    //
+    //   1. lies in the neutral tangent plane
+    //   2. is perpendicular to the seam curve
+    //   3. is computed as a connected field, not independent hairs
+    //
+    // V1 deliberately preserves the candidate MACRO hair length.
+    //
+    // refineBoundaryLayers remains authoritative for:
+    //   - h1
+    //   - layer count
+    //   - growth ratio
+    //
+    // No patch-name logic.
+    //
+    // Only clean rank-2 BL_PATCH + NEUTRAL_PATCH seams participate.
+    // BL/BL, BL/no-BL, termination and higher-order junctions stay
+    // on their existing dedicated paths.
+    //
+    // Serial / OMP implementation first.
+    // ============================================================
+
+    if( blNeutralEdgePoints_.empty() )
+        return;
+
+    if( Pstream::parRun() )
+    {
+        Info
+            << "CFMITCH SEAMSOLVE V1: "
+            << "decomposed MPI skipped; serial/OMP only"
+            << endl;
+
+        return;
+    }
+
+    const meshSurfaceEngine& mse = surfaceEngine();
+
+    const labelList& bPoints =
+        mse.boundaryPoints();
+
+    const faceList::subList& bFaces =
+        mse.boundaryFaces();
+
+    const labelList& bFacePatches =
+        mse.boundaryFacePatches();
+
+    const VRWGraph& pFaces =
+        mse.pointFaces();
+
+    const VRWGraph& pointPoints =
+        mse.pointPoints();
+
+    const meshSurfacePartitioner& mPart =
+        surfacePartitioner();
+
+    const VRWGraph& pPatches =
+        mPart.pointPatches();
+
+    pointFieldPMG& points =
+        mesh_.points();
+
+    const label nBP = bPoints.size();
+
+    boolList active(nBP, false);
+
+    labelList wallPatch(nBP, -1);
+    labelList neutralPatch(nBP, -1);
+    labelList topLabel(nBP, -1);
+
+    vectorField rawNeutralNormal
+    (
+        nBP,
+        vector::zero
+    );
+
+    vectorField neutralNormal
+    (
+        nBP,
+        vector::zero
+    );
+
+    vectorField originalDisp
+    (
+        nBP,
+        vector::zero
+    );
+
+    vectorField proposedDisp
+    (
+        nBP,
+        vector::zero
+    );
+
+    scalarField originalLength
+    (
+        nBP,
+        scalar(0)
+    );
+
+    // ------------------------------------------------------------
+    // CFMITCH CONNECTED NEUTRAL SEAM CONSTRAINT V1B
+    //
+    // Connected vector-field state.
+    // ------------------------------------------------------------
+
+    vectorField seamTangent
+    (
+        nBP,
+        vector::zero
+    );
+
+    vectorField preferredDir
+    (
+        nBP,
+        vector::zero
+    );
+
+    vectorField solvedDir
+    (
+        nBP,
+        vector::zero
+    );
+
+    boolList tangentValid
+    (
+        nBP,
+        false
+    );
+
+    boolList directionValid
+    (
+        nBP,
+        false
+    );
+
+    label nInitiallyEligible = 0;
+    label nNoTop = 0;
+    label nBadRole = 0;
+    label nSpecialSkipped = 0;
+    label nBadNormal = 0;
+
+
+    // ============================================================
+    // CLASSIFY CLEAN WALL + NEUTRAL SEAM POINTS
+    // ============================================================
+
+    forAllConstIter
+    (
+        labelHashSet,
+        blNeutralEdgePoints_,
+        iter
+    )
+    {
+        const label bpI = iter.key();
+
+        if
+        (
+            bpI < 0
+         || bpI >= nBP
+        )
+            continue;
+
+        if
+        (
+            blblCornerPoints_.found(bpI)
+         || blblJunctionPoints_.found(bpI)
+         || blNoBlEdgePoints_.found(bpI)
+        )
+        {
+            ++nSpecialSkipped;
+            continue;
+        }
+
+        label nWall = 0;
+        label nNeutral = 0;
+        label nTermination = 0;
+
+        label wPatch = -1;
+        label nPatch = -1;
+
+        forAllRow(pPatches, bpI, ppI)
+        {
+            const label patchI =
+                pPatches(bpI, ppI);
+
+            if
+            (
+                patchI < 0
+             || patchI >= label(patchRole_.size())
+            )
+                continue;
+
+            const label role =
+                patchRole_[patchI];
+
+            if( role == 0 )
+            {
+                ++nWall;
+                wPatch = patchI;
+            }
+            else if( role == 1 )
+            {
+                ++nTermination;
+            }
+            else if( role == 2 )
+            {
+                ++nNeutral;
+                nPatch = patchI;
+            }
+        }
+
+        if
+        (
+            nWall != 1
+         || nNeutral != 1
+         || nTermination != 0
+        )
+        {
+            ++nBadRole;
+            continue;
+        }
+
+        const label pointI =
+            bPoints[bpI];
+
+        if
+        (
+            pointI < 0
+         || pointI >= label(newLabelForVertex_.size())
+        )
+        {
+            ++nNoTop;
+            continue;
+        }
+
+        const label topI =
+            newLabelForVertex_[pointI];
+
+        if
+        (
+            topI < 0
+         || topI >= label(points.size())
+        )
+        {
+            ++nNoTop;
+            continue;
+        }
+
+        const vector E0 =
+            points[topI]
+          - points[pointI];
+
+        const scalar L0 =
+            mag(E0);
+
+        if( L0 < VSMALL )
+        {
+            ++nNoTop;
+            continue;
+        }
+
+
+        // --------------------------------------------------------
+        // Neutral manifold normal from neutral-side incident faces.
+        // --------------------------------------------------------
+
+        vector nSum(vector::zero);
+
+        forAllRow(pFaces, bpI, pfI)
+        {
+            const label bfI =
+                pFaces(bpI, pfI);
+
+            if
+            (
+                bfI < 0
+             || bfI >= label(bFaces.size())
+             || bfI >= label(bFacePatches.size())
+            )
+                continue;
+
+            if
+            (
+                bFacePatches[bfI] != nPatch
+            )
+                continue;
+
+            const face& f =
+                bFaces[bfI];
+
+            if( f.size() < 3 )
+                continue;
+
+            vector fn(vector::zero);
+
+            const point& fp0 =
+                points[f[0]];
+
+            for
+            (
+                label pi=1;
+                pi<f.size()-1;
+                ++pi
+            )
+            {
+                fn +=
+                    (points[f[pi]] - fp0)
+                  ^ (points[f[pi+1]] - fp0);
+            }
+
+            nSum += fn;
+        }
+
+        const scalar nMag =
+            mag(nSum);
+
+        if( nMag < VSMALL )
+        {
+            ++nBadNormal;
+            continue;
+        }
+
+        active[bpI] = true;
+
+        wallPatch[bpI] =
+            wPatch;
+
+        neutralPatch[bpI] =
+            nPatch;
+
+        topLabel[bpI] =
+            topI;
+
+        rawNeutralNormal[bpI] =
+            nSum/nMag;
+
+        neutralNormal[bpI] =
+            rawNeutralNormal[bpI];
+
+        originalDisp[bpI] =
+            E0;
+
+        originalLength[bpI] =
+            L0;
+
+        ++nInitiallyEligible;
+    }
+
+
+    // ============================================================
+    // GRAPH VALIDATION
+    //
+    // Clean seam topology:
+    //
+    // degree 1 -> open endpoint
+    // degree 2 -> ordinary interior / closed loop
+    //
+    // degree >2 is a junction and belongs elsewhere.
+    // ============================================================
+
+    label nGraphPruned = 0;
+
+    for
+    (
+        label prunePass=0;
+        prunePass<4;
+        ++prunePass
+    )
+    {
+        boolList keep(active);
+
+        bool changed = false;
+
+        forAll(active, bpI)
+        {
+            if( !active[bpI] )
+                continue;
+
+            label degree = 0;
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !active[bpJ]
+                )
+                    continue;
+
+                if
+                (
+                    wallPatch[bpJ]
+                        != wallPatch[bpI]
+                 || neutralPatch[bpJ]
+                        != neutralPatch[bpI]
+                )
+                    continue;
+
+                ++degree;
+            }
+
+            if
+            (
+                degree < 1
+             || degree > 2
+            )
+            {
+                keep[bpI] = false;
+                changed = true;
+                ++nGraphPruned;
+            }
+        }
+
+        active = keep;
+
+        if( !changed )
+            break;
+    }
+
+
+    // ============================================================
+    // CONNECTED NEUTRAL NORMAL FIELD
+    //
+    // Local face normals are noisy at clipped seams.
+    //
+    // Smooth ONLY along a seam having the same wall/neutral pair.
+    // Sign-align neighbors before averaging.
+    // ============================================================
+
+    const label normalSmoothPasses = 4;
+
+    for
+    (
+        label pass=0;
+        pass<normalSmoothPasses;
+        ++pass
+    )
+    {
+        vectorField nextNormal
+        (
+            neutralNormal
+        );
+
+        forAll(active, bpI)
+        {
+            if( !active[bpI] )
+                continue;
+
+            vector acc =
+                scalar(2.0)
+               *neutralNormal[bpI];
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !active[bpJ]
+                )
+                    continue;
+
+                if
+                (
+                    wallPatch[bpJ]
+                        != wallPatch[bpI]
+                 || neutralPatch[bpJ]
+                        != neutralPatch[bpI]
+                )
+                    continue;
+
+                vector nJ =
+                    neutralNormal[bpJ];
+
+                if
+                (
+                    (neutralNormal[bpI] & nJ)
+                    < scalar(0)
+                )
+                {
+                    nJ = -nJ;
+                }
+
+                acc += nJ;
+            }
+
+            const scalar aMag =
+                mag(acc);
+
+            if( aMag > VSMALL )
+            {
+                nextNormal[bpI] =
+                    acc/aMag;
+            }
+        }
+
+        neutralNormal = nextNormal;
+    }
+
+
+    // ============================================================
+    // CFMITCH NEUTRAL MANIFOLD STENCIL V6
+    //
+    // Build the neutral constraint plane from a small interior
+    // stencil on the same neutral patch rather than only from the
+    // clipped contact-line face fan.
+    //
+    // depth 0 = seam point
+    // depth 1 = immediate neutral-surface neighbours
+    // depth 2 = one additional neutral-surface ring
+    //
+    // The resulting area-weighted surface normal becomes the
+    // authoritative neutral constraint normal used by V5's
+    // projected-native displacement architecture.
+    // ============================================================
+
+    const label neutralStencilDepth = 2;
+
+    vectorField neutralBeforeStencil
+    (
+        neutralNormal
+    );
+
+    label nStencilSolved = 0;
+    label nStencilFallback = 0;
+    label nStencilFacesTotal = 0;
+
+    label minStencilFaces = 1000000000;
+    label maxStencilFaces = 0;
+
+
+    forAll(active, bpI)
+    {
+        if( !active[bpI] )
+            continue;
+
+        const label nPatch =
+            neutralPatch[bpI];
+
+        if( nPatch < 0 )
+        {
+            ++nStencilFallback;
+            continue;
+        }
+
+
+        // --------------------------------------------------------
+        // Build point stencil constrained to the same neutral patch.
+        // --------------------------------------------------------
+
+        labelHashSet visitedPoints;
+        labelLongList frontier;
+
+        visitedPoints.insert(bpI);
+        frontier.append(bpI);
+
+
+        for
+        (
+            label depth=0;
+            depth<neutralStencilDepth;
+            ++depth
+        )
+        {
+            labelLongList nextFrontier;
+
+            forAll(frontier, fI)
+            {
+                const label bpK =
+                    frontier[fI];
+
+                forAllRow(pointPoints, bpK, ppI)
+                {
+                    const label bpJ =
+                        pointPoints(bpK, ppI);
+
+                    if
+                    (
+                        bpJ < 0
+                     || bpJ >= nBP
+                     || visitedPoints.found(bpJ)
+                    )
+                        continue;
+
+
+                    bool onNeutralPatch = false;
+
+                    forAllRow(pFaces, bpJ, pfI)
+                    {
+                        const label bfI =
+                            pFaces(bpJ, pfI);
+
+                        if
+                        (
+                            bfI < 0
+                         || bfI >= label(bFacePatches.size())
+                        )
+                            continue;
+
+                        if
+                        (
+                            bFacePatches[bfI] == nPatch
+                        )
+                        {
+                            onNeutralPatch = true;
+                            break;
+                        }
+                    }
+
+
+                    if( !onNeutralPatch )
+                        continue;
+
+                    visitedPoints.insert(bpJ);
+                    nextFrontier.append(bpJ);
+                }
+            }
+
+
+            frontier = nextFrontier;
+
+            if( frontier.size() == 0 )
+                break;
+        }
+
+
+        // --------------------------------------------------------
+        // Collect unique neutral-patch faces touched by stencil.
+        // --------------------------------------------------------
+
+        labelHashSet stencilFaces;
+
+        forAllConstIter
+        (
+            labelHashSet,
+            visitedPoints,
+            pIter
+        )
+        {
+            const label bpK =
+                pIter.key();
+
+            forAllRow(pFaces, bpK, pfI)
+            {
+                const label bfI =
+                    pFaces(bpK, pfI);
+
+                if
+                (
+                    bfI < 0
+                 || bfI >= label(bFaces.size())
+                 || bfI >= label(bFacePatches.size())
+                )
+                    continue;
+
+                if
+                (
+                    bFacePatches[bfI] != nPatch
+                )
+                    continue;
+
+                stencilFaces.insert(bfI);
+            }
+        }
+
+
+        // --------------------------------------------------------
+        // Area-weighted normal over the stencil.
+        // --------------------------------------------------------
+
+        vector nSum(vector::zero);
+
+        forAllConstIter
+        (
+            labelHashSet,
+            stencilFaces,
+            fIter
+        )
+        {
+            const label bfI =
+                fIter.key();
+
+            const face& f =
+                bFaces[bfI];
+
+            if( f.size() < 3 )
+                continue;
+
+            vector fn(vector::zero);
+
+            const point& fp0 =
+                points[f[0]];
+
+            for
+            (
+                label pi=1;
+                pi<f.size()-1;
+                ++pi
+            )
+            {
+                fn +=
+                    (points[f[pi]] - fp0)
+                  ^ (points[f[pi+1]] - fp0);
+            }
+
+            if( mag(fn) < VSMALL )
+                continue;
+
+
+            // Sign-align against original neutral-side normal.
+            if
+            (
+                (fn & rawNeutralNormal[bpI])
+                < scalar(0)
+            )
+            {
+                fn = -fn;
+            }
+
+            nSum += fn;
+        }
+
+
+        const label nFaces =
+            stencilFaces.size();
+
+        nStencilFacesTotal +=
+            nFaces;
+
+        minStencilFaces =
+            Foam::min
+            (
+                minStencilFaces,
+                nFaces
+            );
+
+        maxStencilFaces =
+            Foam::max
+            (
+                maxStencilFaces,
+                nFaces
+            );
+
+
+        const scalar nMag =
+            mag(nSum);
+
+        if( nMag < VSMALL )
+        {
+            ++nStencilFallback;
+            continue;
+        }
+
+
+        neutralNormal[bpI] =
+            nSum/nMag;
+
+        ++nStencilSolved;
+    }
+
+
+    // ------------------------------------------------------------
+    // Light connected regularisation ALONG each same-patch seam.
+    // Strong self-weight preserves real neutral-surface curvature.
+    // ------------------------------------------------------------
+
+    const label manifoldSmoothPasses = 6;
+
+    for
+    (
+        label pass=0;
+        pass<manifoldSmoothPasses;
+        ++pass
+    )
+    {
+        vectorField nextNormal
+        (
+            neutralNormal
+        );
+
+
+        forAll(active, bpI)
+        {
+            if( !active[bpI] )
+                continue;
+
+            vector acc =
+                scalar(4.0)
+               *neutralNormal[bpI];
+
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !active[bpJ]
+                )
+                    continue;
+
+                if
+                (
+                    wallPatch[bpJ]
+                        != wallPatch[bpI]
+                 || neutralPatch[bpJ]
+                        != neutralPatch[bpI]
+                )
+                    continue;
+
+
+                vector nJ =
+                    neutralNormal[bpJ];
+
+                if
+                (
+                    (nJ & neutralNormal[bpI])
+                    < scalar(0)
+                )
+                {
+                    nJ = -nJ;
+                }
+
+                acc += nJ;
+            }
+
+
+            const scalar aMag =
+                mag(acc);
+
+            if( aMag > VSMALL )
+            {
+                nextNormal[bpI] =
+                    acc/aMag;
+            }
+        }
+
+
+        neutralNormal =
+            nextNormal;
+    }
+
+
+    // ------------------------------------------------------------
+    // Constraint-plane coherence audit.
+    // ------------------------------------------------------------
+
+    scalar maxNormalUnitDiffBefore =
+        scalar(0);
+
+    scalar maxNormalUnitDiffAfter =
+        scalar(0);
+
+    scalar minNormalDotBefore =
+        scalar(1);
+
+    scalar minNormalDotAfter =
+        scalar(1);
+
+    label nNormalEdges = 0;
+
+
+    forAll(active, bpI)
+    {
+        if( !active[bpI] )
+            continue;
+
+
+        vector oldNI =
+            neutralBeforeStencil[bpI];
+
+        vector newNI =
+            neutralNormal[bpI];
+
+        if
+        (
+            mag(oldNI) < VSMALL
+         || mag(newNI) < VSMALL
+        )
+            continue;
+
+        oldNI /= mag(oldNI);
+        newNI /= mag(newNI);
+
+
+        forAllRow(pointPoints, bpI, ppI)
+        {
+            const label bpJ =
+                pointPoints(bpI, ppI);
+
+            if
+            (
+                bpJ <= bpI
+             || bpJ < 0
+             || bpJ >= nBP
+             || !active[bpJ]
+            )
+                continue;
+
+            if
+            (
+                wallPatch[bpJ]
+                    != wallPatch[bpI]
+             || neutralPatch[bpJ]
+                    != neutralPatch[bpI]
+            )
+                continue;
+
+
+            vector oldNJ =
+                neutralBeforeStencil[bpJ];
+
+            vector newNJ =
+                neutralNormal[bpJ];
+
+            if
+            (
+                mag(oldNJ) < VSMALL
+             || mag(newNJ) < VSMALL
+            )
+                continue;
+
+            oldNJ /= mag(oldNJ);
+            newNJ /= mag(newNJ);
+
+
+            // Constraint planes are orientation-insensitive.
+            if( (oldNI & oldNJ) < scalar(0) )
+                oldNJ = -oldNJ;
+
+            if( (newNI & newNJ) < scalar(0) )
+                newNJ = -newNJ;
+
+
+            const scalar oldDot =
+                oldNI & oldNJ;
+
+            const scalar newDot =
+                newNI & newNJ;
+
+
+            maxNormalUnitDiffBefore =
+                Foam::max
+                (
+                    maxNormalUnitDiffBefore,
+                    mag(oldNI-oldNJ)
+                );
+
+            maxNormalUnitDiffAfter =
+                Foam::max
+                (
+                    maxNormalUnitDiffAfter,
+                    mag(newNI-newNJ)
+                );
+
+
+            minNormalDotBefore =
+                Foam::min
+                (
+                    minNormalDotBefore,
+                    oldDot
+                );
+
+            minNormalDotAfter =
+                Foam::min
+                (
+                    minNormalDotAfter,
+                    newDot
+                );
+
+            ++nNormalEdges;
+        }
+    }
+
+
+    const scalar avgStencilFaces =
+    (
+        nStencilSolved > 0
+      ? scalar(nStencilFacesTotal)
+       /scalar(nStencilSolved)
+      : scalar(0)
+    );
+
+
+    if( minStencilFaces == 1000000000 )
+        minStencilFaces = 0;
+
+
+    Info
+        << "CFMITCH NEUTRAL MANIFOLD V6:"
+        << " depth=" << neutralStencilDepth
+        << " solved=" << nStencilSolved
+        << " fallback=" << nStencilFallback
+        << " minFaces=" << minStencilFaces
+        << " maxFaces=" << maxStencilFaces
+        << " avgFaces=" << avgStencilFaces
+        << " smoothPasses=" << manifoldSmoothPasses
+        << " normalEdges=" << nNormalEdges
+        << " maxNormalDiffBefore="
+        << maxNormalUnitDiffBefore
+        << " maxNormalDiffAfter="
+        << maxNormalUnitDiffAfter
+        << " minNormalDotBefore="
+        << minNormalDotBefore
+        << " minNormalDotAfter="
+        << minNormalDotAfter
+        << endl;
+
+
+    // ============================================================
+    // CONSTRUCT CONNECTED SEAM VECTOR FIELD -- V1B
+    //
+    // V1 failure:
+    //
+    //     d = n ^ tau
+    //     if (d & oldHair) < 0 => flip d
+    //
+    // was done independently per vertex.
+    //
+    // Because d is an unoriented axis until the seam component is
+    // oriented, that local sign choice produced adjacent ~180-degree
+    // reversals.
+    //
+    // V1B:
+    //
+    //   A. build raw seam tangent axes
+    //   B. orient tangent axes component-by-component
+    //   C. smooth the connected tangent field
+    //   D. construct preferred cross-seam directions
+    //   E. orient growth directions component-by-component
+    //   F. projected graph smoothing inside neutral tangent planes
+    //
+    // Hard invariant:
+    //
+    //     neutralNormal & solvedDir == 0
+    //
+    // approximately to floating-point precision.
+    // ============================================================
+
+    label nBadTangent = 0;
+    label nBadDirection = 0;
+
+
+    // ------------------------------------------------------------
+    // A. RAW SEAM TANGENT AXES
+    // ------------------------------------------------------------
+
+    forAll(active, bpI)
+    {
+        if( !active[bpI] )
+            continue;
+
+        label nb0 = -1;
+        label nb1 = -1;
+        label degree = 0;
+
+        forAllRow(pointPoints, bpI, ppI)
+        {
+            const label bpJ =
+                pointPoints(bpI, ppI);
+
+            if
+            (
+                bpJ < 0
+             || bpJ >= nBP
+             || !active[bpJ]
+            )
+                continue;
+
+            if
+            (
+                wallPatch[bpJ]
+                    != wallPatch[bpI]
+             || neutralPatch[bpJ]
+                    != neutralPatch[bpI]
+            )
+                continue;
+
+            if( degree == 0 )
+                nb0 = bpJ;
+            else if( degree == 1 )
+                nb1 = bpJ;
+
+            ++degree;
+        }
+
+        if
+        (
+            degree < 1
+         || degree > 2
+        )
+        {
+            ++nBadTangent;
+            continue;
+        }
+
+        const point& root =
+            points[bPoints[bpI]];
+
+        vector tau(vector::zero);
+
+        if( degree == 1 )
+        {
+            tau =
+                points[bPoints[nb0]]
+              - root;
+        }
+        else
+        {
+            vector v0 =
+                points[bPoints[nb0]]
+              - root;
+
+            vector v1 =
+                points[bPoints[nb1]]
+              - root;
+
+            const scalar m0 = mag(v0);
+            const scalar m1 = mag(v1);
+
+            if
+            (
+                m0 < VSMALL
+             || m1 < VSMALL
+            )
+            {
+                ++nBadTangent;
+                continue;
+            }
+
+            v0 /= m0;
+            v1 /= m1;
+
+            // Neighbours lie on opposite sides of a regular chain
+            // vertex.  Their difference is the centred tangent axis.
+            tau = v0 - v1;
+
+            if( mag(tau) < VSMALL )
+                tau = v0;
+        }
+
+        vector n =
+            neutralNormal[bpI];
+
+        const scalar nMag =
+            mag(n);
+
+        if( nMag < VSMALL )
+        {
+            ++nBadTangent;
+            continue;
+        }
+
+        n /= nMag;
+
+        // Tangent must lie in the neutral tangent plane.
+        tau -= (tau & n)*n;
+
+        const scalar tauMag =
+            mag(tau);
+
+        if( tauMag < VSMALL )
+        {
+            ++nBadTangent;
+            continue;
+        }
+
+        seamTangent[bpI] =
+            tau/tauMag;
+
+        tangentValid[bpI] = true;
+    }
+
+
+    // ------------------------------------------------------------
+    // B. ORIENT TANGENT AXES PER CONNECTED COMPONENT
+    //
+    // Tangent sign is geometrically arbitrary.  Pick a seed and
+    // propagate orientation through the graph so neighbours point
+    // consistently along the same component.
+    // ------------------------------------------------------------
+
+    boolList tangentOriented
+    (
+        nBP,
+        false
+    );
+
+    label nTangentComponents = 0;
+
+    for(label seed=0; seed<nBP; ++seed)
+    {
+        if
+        (
+            !active[seed]
+         || !tangentValid[seed]
+         || tangentOriented[seed]
+        )
+            continue;
+
+        ++nTangentComponents;
+
+        labelLongList queue;
+        queue.append(seed);
+
+        tangentOriented[seed] = true;
+
+        for(label qI=0; qI<label(queue.size()); ++qI)
+        {
+            const label bpI =
+                queue[qI];
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !active[bpJ]
+                 || !tangentValid[bpJ]
+                )
+                    continue;
+
+                if
+                (
+                    wallPatch[bpJ]
+                        != wallPatch[bpI]
+                 || neutralPatch[bpJ]
+                        != neutralPatch[bpI]
+                )
+                    continue;
+
+                if( tangentOriented[bpJ] )
+                    continue;
+
+                if
+                (
+                    (seamTangent[bpJ]
+                    & seamTangent[bpI])
+                    < scalar(0)
+                )
+                {
+                    seamTangent[bpJ] =
+                        -seamTangent[bpJ];
+                }
+
+                tangentOriented[bpJ] = true;
+                queue.append(bpJ);
+            }
+        }
+    }
+
+
+    // ------------------------------------------------------------
+    // C. SMOOTH CONNECTED TANGENT FIELD
+    //
+    // Reproject after every Jacobi pass so neutral tangency remains
+    // a hard constraint.
+    // ------------------------------------------------------------
+
+    const label tangentSmoothPasses = 8;
+
+    for
+    (
+        label pass=0;
+        pass<tangentSmoothPasses;
+        ++pass
+    )
+    {
+        vectorField nextTangent
+        (
+            seamTangent
+        );
+
+        forAll(active, bpI)
+        {
+            if
+            (
+                !active[bpI]
+             || !tangentValid[bpI]
+            )
+                continue;
+
+            vector acc =
+                scalar(2.0)
+               *seamTangent[bpI];
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !active[bpJ]
+                 || !tangentValid[bpJ]
+                )
+                    continue;
+
+                if
+                (
+                    wallPatch[bpJ]
+                        != wallPatch[bpI]
+                 || neutralPatch[bpJ]
+                        != neutralPatch[bpI]
+                )
+                    continue;
+
+                vector tJ =
+                    seamTangent[bpJ];
+
+                if
+                (
+                    (tJ & seamTangent[bpI])
+                    < scalar(0)
+                )
+                {
+                    tJ = -tJ;
+                }
+
+                acc += tJ;
+            }
+
+            vector n =
+                neutralNormal[bpI];
+
+            const scalar nMag = mag(n);
+
+            if( nMag < VSMALL )
+                continue;
+
+            n /= nMag;
+
+            acc -= (acc & n)*n;
+
+            const scalar aMag =
+                mag(acc);
+
+            if( aMag < VSMALL )
+                continue;
+
+            vector candidate =
+                acc/aMag;
+
+            if
+            (
+                (candidate & seamTangent[bpI])
+                < scalar(0)
+            )
+            {
+                candidate = -candidate;
+            }
+
+            nextTangent[bpI] =
+                candidate;
+        }
+
+        seamTangent =
+            nextTangent;
+    }
+
+
+    // ------------------------------------------------------------
+    // D. PREFERRED CROSS-SEAM DIRECTION
+    //
+    // n ^ tau is tangent to the neutral manifold and transverse to
+    // the connected seam.
+    // ------------------------------------------------------------
+
+    forAll(active, bpI)
+    {
+        if
+        (
+            !active[bpI]
+         || !tangentValid[bpI]
+        )
+            continue;
+
+        vector n =
+            neutralNormal[bpI];
+
+        const scalar nMag =
+            mag(n);
+
+        if( nMag < VSMALL )
+        {
+            ++nBadDirection;
+            continue;
+        }
+
+        n /= nMag;
+
+        vector d =
+            n ^ seamTangent[bpI];
+
+        const scalar dMag =
+            mag(d);
+
+        if( dMag < VSMALL )
+        {
+            ++nBadDirection;
+            continue;
+        }
+
+        preferredDir[bpI] =
+            d/dMag;
+
+        directionValid[bpI] = true;
+    }
+
+
+    // ============================================================
+    // CFMITCH PROJECTED-NATIVE SEAM COLLAR V5
+    //
+    // The previous architectures treated
+    //
+    //     nNeutral ^ seamTangent
+    //
+    // as an unoriented geometric axis and then attempted to solve
+    // its +/- sign.
+    //
+    // Rotor37 demonstrated that neither:
+    //
+    //     independent sign selection
+    //
+    // nor:
+    //
+    //     one sign per connected component
+    //
+    // is generally sufficient.
+    //
+    // V5 removes the sign problem entirely.
+    //
+    // The original createNewVertex displacement is a PHYSICAL,
+    // oriented vector.  At a clean BL/neutral seam we project that
+    // vector into the neutral tangent plane:
+    //
+    //     p = oldU - (oldU & nNeutral) nNeutral
+    //
+    // This satisfies the hard neutral-manifold constraint while
+    // preserving the physical extrusion side.
+    //
+    // The projected field is then smoothed as an ORIENTED connected
+    // vector field along the seam.
+    //
+    // n^tau is retained only as a weak/fallback geometric reference
+    // when the native projection is nearly singular.
+    // ============================================================
+
+
+    vectorField projectedNative
+    (
+        nBP,
+        vector::zero
+    );
+
+    scalarField nativeProjectionStrength
+    (
+        nBP,
+        scalar(0)
+    );
+
+    boolList nativeProjectionValid
+    (
+        nBP,
+        false
+    );
+
+    label nProjectedNative = 0;
+    label nWeakProjectedNative = 0;
+    label nFallbackAxis = 0;
+
+    scalar minProjectionStrength =
+        GREAT;
+
+    scalar sumProjectionStrength =
+        scalar(0);
+
+
+    // ------------------------------------------------------------
+    // A. PHYSICAL NATIVE PROJECTION
+    // ------------------------------------------------------------
+
+    forAll(active, bpI)
+    {
+        if
+        (
+            !active[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        vector n =
+            neutralNormal[bpI];
+
+        const scalar nMag =
+            mag(n);
+
+        if( nMag < VSMALL )
+        {
+            directionValid[bpI] = false;
+            continue;
+        }
+
+        n /= nMag;
+
+
+        vector oldU =
+            originalDisp[bpI];
+
+        const scalar oldMag =
+            mag(oldU);
+
+        if( oldMag < VSMALL )
+        {
+            directionValid[bpI] = false;
+            continue;
+        }
+
+        oldU /= oldMag;
+
+
+        vector p =
+            oldU
+          - (oldU & n)*n;
+
+        const scalar pMag =
+            mag(p);
+
+        nativeProjectionStrength[bpI] =
+            pMag;
+
+        minProjectionStrength =
+            Foam::min
+            (
+                minProjectionStrength,
+                pMag
+            );
+
+        sumProjectionStrength +=
+            pMag;
+
+        ++nProjectedNative;
+
+
+        if( pMag > scalar(0.05) )
+        {
+            p /= pMag;
+
+            projectedNative[bpI] =
+                p;
+
+            preferredDir[bpI] =
+                p;
+
+            solvedDir[bpI] =
+                p;
+
+            nativeProjectionValid[bpI] =
+                true;
+        }
+        else
+        {
+            ++nWeakProjectedNative;
+
+
+            // ----------------------------------------------------
+            // Weakly constrained physical projection.
+            //
+            // Keep the geometric n^tau direction as a temporary
+            // fallback, but orient it to the original physical hair.
+            //
+            // Connected smoothing below is allowed to replace this
+            // with neighbour information.
+            // ----------------------------------------------------
+
+            vector axis =
+                preferredDir[bpI];
+
+            const scalar axisMag =
+                mag(axis);
+
+            if( axisMag < VSMALL )
+            {
+                directionValid[bpI] = false;
+                continue;
+            }
+
+            axis /= axisMag;
+
+            if( (axis & oldU) < scalar(0) )
+                axis = -axis;
+
+            projectedNative[bpI] =
+                axis;
+
+            preferredDir[bpI] =
+                axis;
+
+            solvedDir[bpI] =
+                axis;
+
+            ++nFallbackAxis;
+        }
+    }
+
+
+    // ------------------------------------------------------------
+    // B. CONNECTED ORIENTED SEAM SMOOTHING
+    //
+    // There are deliberately NO vector sign flips.
+    //
+    // A negative neighbour contribution is real geometric
+    // disagreement and participates in the average as such.
+    //
+    // Reliable native projections receive stronger self-weight.
+    // Weak projections are driven primarily by their neighbours.
+    // ------------------------------------------------------------
+
+    const label seamPhysicalSmoothPasses =
+        12;
+
+    for
+    (
+        label pass=0;
+        pass<seamPhysicalSmoothPasses;
+        ++pass
+    )
+    {
+        vectorField nextDir
+        (
+            solvedDir
+        );
+
+        forAll(active, bpI)
+        {
+            if
+            (
+                !active[bpI]
+             || !directionValid[bpI]
+            )
+                continue;
+
+
+            scalar selfWeight =
+                nativeProjectionValid[bpI]
+              ? scalar(2.0)
+              : scalar(0.25);
+
+
+            vector acc =
+                selfWeight
+               *projectedNative[bpI];
+
+            scalar totalWeight =
+                selfWeight;
+
+            label nNbr = 0;
+
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !active[bpJ]
+                 || !directionValid[bpJ]
+                )
+                    continue;
+
+                if
+                (
+                    wallPatch[bpJ]
+                        != wallPatch[bpI]
+                 || neutralPatch[bpJ]
+                        != neutralPatch[bpI]
+                )
+                    continue;
+
+
+                // ORIENTED vector: never flip dJ.
+                acc +=
+                    solvedDir[bpJ];
+
+                totalWeight +=
+                    scalar(1.0);
+
+                ++nNbr;
+            }
+
+
+            if
+            (
+                nNbr == 0
+             || totalWeight < VSMALL
+            )
+                continue;
+
+
+            acc /=
+                totalWeight;
+
+
+            // ----------------------------------------------------
+            // Hard neutral-manifold tangency.
+            // ----------------------------------------------------
+
+            vector n =
+                neutralNormal[bpI];
+
+            const scalar nMag =
+                mag(n);
+
+            if( nMag < VSMALL )
+                continue;
+
+            n /= nMag;
+
+            acc -=
+                (acc & n)*n;
+
+
+            const scalar aMag =
+                mag(acc);
+
+            if( aMag < scalar(1e-8) )
+            {
+                // Near cancellation means local orientation is
+                // genuinely unresolved by this iteration.
+                //
+                // Retain previous value rather than invent a sign.
+                continue;
+            }
+
+
+            vector candidate =
+                acc/aMag;
+
+
+            // ----------------------------------------------------
+            // Physical hemisphere guard.
+            //
+            // For a reliable projected-native direction, never
+            // reverse to the opposite extrusion side.
+            //
+            // Weak points are allowed to inherit their orientation
+            // from the connected field.
+            // ----------------------------------------------------
+
+            if( nativeProjectionValid[bpI] )
+            {
+                if
+                (
+                    (candidate
+                    & projectedNative[bpI])
+                    <= scalar(0)
+                )
+                {
+                    candidate =
+                        projectedNative[bpI];
+                }
+            }
+
+
+            nextDir[bpI] =
+                candidate;
+        }
+
+
+        solvedDir =
+            nextDir;
+    }
+
+
+    // ------------------------------------------------------------
+    // C. FINAL EXACT TANGENCY PROJECTION
+    // ------------------------------------------------------------
+
+    scalar maxProjectedNativeLeak =
+        scalar(0);
+
+    forAll(active, bpI)
+    {
+        if
+        (
+            !active[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        vector n =
+            neutralNormal[bpI];
+
+        const scalar nMag =
+            mag(n);
+
+        if( nMag < VSMALL )
+            continue;
+
+        n /= nMag;
+
+
+        vector d =
+            solvedDir[bpI];
+
+        d -=
+            (d & n)*n;
+
+        const scalar dMag =
+            mag(d);
+
+        if( dMag < VSMALL )
+            continue;
+
+        d /= dMag;
+
+
+        solvedDir[bpI] =
+            d;
+
+        preferredDir[bpI] =
+            d;
+
+
+        maxProjectedNativeLeak =
+            Foam::max
+            (
+                maxProjectedNativeLeak,
+                Foam::mag(d & n)
+            );
+    }
+
+
+    const scalar avgProjectionStrength =
+    (
+        nProjectedNative > 0
+      ? sumProjectionStrength
+       /scalar(nProjectedNative)
+      : scalar(0)
+    );
+
+
+    Info
+        << "CFMITCH SEAMCOLLAR V6 PROJECTION:"
+        << " projected=" << nProjectedNative
+        << " weak=" << nWeakProjectedNative
+        << " fallbackAxis=" << nFallbackAxis
+        << " smoothPasses="
+        << seamPhysicalSmoothPasses
+        << " minStrength="
+        << minProjectionStrength
+        << " avgStrength="
+        << avgProjectionStrength
+        << " maxNeutralLeak="
+        << maxProjectedNativeLeak
+        << endl;
+
+
+    // ============================================================
+    // CFMITCH CONNECTED SEAM COLLAR V2
+    //
+    // V1B successfully made the BL/neutral seam itself coherent and
+    // exactly tangent to the neutral manifold, but left the adjacent
+    // wall-only BL field frozen.
+    //
+    // Rotor37 V1B result:
+    //
+    //   seam0/seam1 improved ~45 deg -> ~16 deg
+    //
+    // but:
+    //
+    //   seam1/interior remained ~45 deg
+    //
+    // and POST_BL_CREATE negative volumes increased 39 -> 130.
+    //
+    // V2 treats the constrained seam as the boundary condition of a
+    // small 2-D wall collar.
+    //
+    // ring 0 : BL/neutral seam, hard neutral tangency
+    // ring 1 : first ordinary wall collar
+    // ring 2 : second ordinary wall collar
+    // ring 3 : third ordinary wall collar
+    //
+    // Ring 1 is allowed to respond strongly to the seam.
+    // Rings 2/3 increasingly prefer their original wall extrusion.
+    //
+    // Macro hair LENGTH is still preserved exactly in V2.
+    // Height/clearance compatibility is a later architecture layer.
+    // ============================================================
+
+
+    // ------------------------------------------------------------
+    // F1. BUILD WALL COLLAR
+    // ------------------------------------------------------------
+
+    const label maxCollarRing = 3;
+
+    labelList collarRing
+    (
+        nBP,
+        -1
+    );
+
+    boolList solvePoint
+    (
+        nBP,
+        false
+    );
+
+    label nRing0 = 0;
+    label nRing1 = 0;
+    label nRing2 = 0;
+    label nRing3 = 0;
+
+    // Existing valid seam field becomes ring 0.
+    forAll(active, bpI)
+    {
+        if
+        (
+            !active[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        collarRing[bpI] = 0;
+        solvePoint[bpI] = true;
+
+        ++nRing0;
+    }
+
+
+    // ------------------------------------------------------------
+    // Expand only through ordinary wall-only points belonging to
+    // the SAME BL patch.
+    //
+    // Do not cross:
+    //   - another neutral constraint
+    //   - termination boundary
+    //   - BL/BL edge
+    //   - BL/no-BL edge
+    //   - corner/junction
+    // ------------------------------------------------------------
+
+    for
+    (
+        label ring=1;
+        ring<=maxCollarRing;
+        ++ring
+    )
+    {
+        forAll(collarRing, bpI)
+        {
+            if( collarRing[bpI] != ring-1 )
+                continue;
+
+            const label sourceWallPatch =
+                wallPatch[bpI];
+
+            if( sourceWallPatch < 0 )
+                continue;
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || collarRing[bpJ] >= 0
+                )
+                    continue;
+
+                if
+                (
+                    blblCornerPoints_.found(bpJ)
+                 || blblJunctionPoints_.found(bpJ)
+                 || blNoBlEdgePoints_.found(bpJ)
+                 || blNeutralEdgePoints_.found(bpJ)
+                )
+                    continue;
+
+
+                // -----------------------------------------------
+                // Require an ordinary wall-only incidence class.
+                // -----------------------------------------------
+
+                label nWallRoles = 0;
+                label nNonWallRoles = 0;
+                bool hasSourceWall = false;
+
+                forAllRow(pPatches, bpJ, ppi)
+                {
+                    const label patchI =
+                        pPatches(bpJ, ppi);
+
+                    if
+                    (
+                        patchI < 0
+                     || patchI >= label(patchRole_.size())
+                    )
+                        continue;
+
+                    const label role =
+                        patchRole_[patchI];
+
+                    if( role == 0 )
+                    {
+                        ++nWallRoles;
+
+                        if( patchI == sourceWallPatch )
+                            hasSourceWall = true;
+                    }
+                    else
+                    {
+                        ++nNonWallRoles;
+                    }
+                }
+
+                if
+                (
+                    !hasSourceWall
+                 || nWallRoles != 1
+                 || nNonWallRoles != 0
+                )
+                    continue;
+
+
+                const label pointI =
+                    bPoints[bpJ];
+
+                if
+                (
+                    pointI < 0
+                 || pointI >= label(newLabelForVertex_.size())
+                )
+                    continue;
+
+                const label topI =
+                    newLabelForVertex_[pointI];
+
+                if
+                (
+                    topI < 0
+                 || topI >= label(points.size())
+                )
+                    continue;
+
+                const vector E0 =
+                    points[topI]
+                  - points[pointI];
+
+                const scalar L0 =
+                    mag(E0);
+
+                if( L0 < VSMALL )
+                    continue;
+
+
+                collarRing[bpJ] =
+                    ring;
+
+                solvePoint[bpJ] =
+                    true;
+
+                wallPatch[bpJ] =
+                    sourceWallPatch;
+
+                // No neutral equality constraint on wall-only collar.
+                neutralPatch[bpJ] =
+                    -1;
+
+                topLabel[bpJ] =
+                    topI;
+
+                originalDisp[bpJ] =
+                    E0;
+
+                originalLength[bpJ] =
+                    L0;
+
+                preferredDir[bpJ] =
+                    E0/L0;
+
+                solvedDir[bpJ] =
+                    preferredDir[bpJ];
+
+                directionValid[bpJ] =
+                    true;
+
+                if( ring == 1 )
+                    ++nRing1;
+                else if( ring == 2 )
+                    ++nRing2;
+                else if( ring == 3 )
+                    ++nRing3;
+            }
+        }
+    }
+
+
+    // ------------------------------------------------------------
+    // F2. INITIALISE SEAM FIELD FROM V1B
+    // ------------------------------------------------------------
+
+    forAll(active, bpI)
+    {
+        if
+        (
+            !active[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        solvedDir[bpI] =
+            preferredDir[bpI];
+    }
+
+
+    // ------------------------------------------------------------
+    // F3. V3 ORIENTATION INITIALISATION
+    //
+    // preferredDir is now an ORIENTED vector field.
+    //
+    // There is deliberately NO component-level sign propagation
+    // here.  A negative dot product between two neighbouring
+    // vectors is diagnostic information, not permission to turn
+    // one vector around.
+    // ------------------------------------------------------------
+
+    // V5 uses an intrinsically oriented projected-native field.
+    // No binary component-sign solve exists anymore.
+    label nV2Components = 0;
+    label nV2SignFlips = 0;
+
+    forAll(solvePoint, bpI)
+    {
+        if
+        (
+            !solvePoint[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        solvedDir[bpI] =
+            preferredDir[bpI];
+    }
+
+
+    // ------------------------------------------------------------
+    // F4. COUPLED 2-D COLLAR FIELD SOLVE
+    //
+    // Objective, conceptually:
+    //
+    //   sum_edges |d_i-d_j|^2
+    //     +
+    //   w(ring) |d_i-dPreferred_i|^2
+    //
+    // with hard seam constraint:
+    //
+    //   nNeutral_i . d_i = 0
+    //
+    // Ring weights:
+    //
+    //   0 -> 1.0    constrained seam
+    //   1 -> 1.0    strong collar response
+    //   2 -> 2.0
+    //   3 -> 4.0    transition back to native wall field
+    // ------------------------------------------------------------
+
+    const label collarSmoothPasses = 20;
+
+    for
+    (
+        label pass=0;
+        pass<collarSmoothPasses;
+        ++pass
+    )
+    {
+        vectorField nextDir
+        (
+            solvedDir
+        );
+
+        forAll(solvePoint, bpI)
+        {
+            if
+            (
+                !solvePoint[bpI]
+             || !directionValid[bpI]
+            )
+                continue;
+
+            const label ring =
+                collarRing[bpI];
+
+            scalar prefWeight =
+                scalar(1.0);
+
+            if( ring == 2 )
+                prefWeight = scalar(2.0);
+            else if( ring >= 3 )
+                prefWeight = scalar(4.0);
+
+
+            // V3: preferredDir is an oriented physical vector.
+            // Never turn it into an unoriented axis here.
+            vector pref =
+                preferredDir[bpI];
+
+            vector acc =
+                prefWeight*pref;
+
+            scalar totalWeight =
+                prefWeight;
+
+            forAllRow(pointPoints, bpI, ppI)
+            {
+                const label bpJ =
+                    pointPoints(bpI, ppI);
+
+                if
+                (
+                    bpJ < 0
+                 || bpJ >= nBP
+                 || !solvePoint[bpJ]
+                 || !directionValid[bpJ]
+                )
+                    continue;
+
+                // Collar solve remains on the same physical wall patch.
+                if
+                (
+                    wallPatch[bpJ]
+                    != wallPatch[bpI]
+                )
+                    continue;
+
+                // V3: displacement is an ORIENTED vector.
+                //
+                // Do not flip a neighbour to make the local average
+                // numerically convenient.  Opposing vectors must
+                // cancel / expose a discontinuity rather than being
+                // silently identified as the same axis.
+                const vector dJ =
+                    solvedDir[bpJ];
+
+                const scalar nbrWeight =
+                    scalar(1.0);
+
+                acc +=
+                    nbrWeight*dJ;
+
+                totalWeight +=
+                    nbrWeight;
+            }
+
+            if( totalWeight < VSMALL )
+                continue;
+
+            acc /= totalWeight;
+
+
+            // -----------------------------------------------
+            // Ring 0: HARD neutral-manifold tangency.
+            // -----------------------------------------------
+
+            if( ring == 0 )
+            {
+                vector n =
+                    neutralNormal[bpI];
+
+                const scalar nMag =
+                    mag(n);
+
+                if( nMag < VSMALL )
+                    continue;
+
+                n /= nMag;
+
+                acc -=
+                    (acc & n)*n;
+            }
+
+
+            const scalar aMag =
+                mag(acc);
+
+            if( aMag < VSMALL )
+                continue;
+
+            vector candidate =
+                acc/aMag;
+
+
+            // -----------------------------------------------
+            // V3 HARD PHYSICAL-HEMISPHERE INVARIANT
+            //
+            // preferredDir is the oriented authoritative reference:
+            //
+            //   seam   -> connected constrained axis, sign selected
+            //             by projected native extrusion
+            //
+            //   collar -> original wall extrusion
+            //
+            // The smoothed vector may rotate within that hemisphere
+            // but may never cross 90 degrees and reverse physical
+            // extrusion side.
+            // -----------------------------------------------
+
+            vector physicalRef =
+                preferredDir[bpI];
+
+            const scalar refMag =
+                mag(physicalRef);
+
+            if( refMag < VSMALL )
+                continue;
+
+            physicalRef /=
+                refMag;
+
+            if
+            (
+                (candidate & physicalRef)
+                <= scalar(0)
+            )
+            {
+                candidate =
+                    physicalRef;
+            }
+
+            nextDir[bpI] =
+                candidate;
+        }
+
+        solvedDir =
+            nextDir;
+    }
+
+
+    // ------------------------------------------------------------
+    // F5. V2 FIELD QUALITY AUDIT
+    // ------------------------------------------------------------
+
+    scalar maxNeutralLeak =
+        scalar(0);
+
+    scalar maxAllUnitDiffBefore =
+        scalar(0);
+
+    scalar maxAllUnitDiffAfter =
+        scalar(0);
+
+    scalar maxSeamCollarDiffAfter =
+        scalar(0);
+
+    // CFMITCH SEAMCOLLAR V2 WORST EDGE AUDIT
+    label worstAllI = -1;
+    label worstAllJ = -1;
+
+    label worstSeamCollarI = -1;
+    label worstSeamCollarJ = -1;
+
+    label nAllComparedEdges = 0;
+    label nSeamCollarEdges = 0;
+
+    forAll(solvePoint, bpI)
+    {
+        if
+        (
+            !solvePoint[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        if( collarRing[bpI] == 0 )
+        {
+            vector n =
+                neutralNormal[bpI];
+
+            const scalar nMag =
+                mag(n);
+
+            if( nMag > VSMALL )
+            {
+                n /= nMag;
+
+                maxNeutralLeak =
+                    Foam::max
+                    (
+                        maxNeutralLeak,
+                        Foam::mag
+                        (
+                            solvedDir[bpI] & n
+                        )
+                    );
+            }
+        }
+
+
+        const vector oldU0 =
+            originalDisp[bpI]
+           /(mag(originalDisp[bpI]) + VSMALL);
+
+        const vector newU0 =
+            solvedDir[bpI]
+           /(mag(solvedDir[bpI]) + VSMALL);
+
+        forAllRow(pointPoints, bpI, ppI)
+        {
+            const label bpJ =
+                pointPoints(bpI, ppI);
+
+            if
+            (
+                bpJ <= bpI
+             || bpJ < 0
+             || bpJ >= nBP
+             || !solvePoint[bpJ]
+             || !directionValid[bpJ]
+            )
+                continue;
+
+            if
+            (
+                wallPatch[bpJ]
+                != wallPatch[bpI]
+            )
+                continue;
+
+            const vector oldU1 =
+                originalDisp[bpJ]
+               /(mag(originalDisp[bpJ]) + VSMALL);
+
+            const vector newU1 =
+                solvedDir[bpJ]
+               /(mag(solvedDir[bpJ]) + VSMALL);
+
+            const scalar before =
+                mag(oldU0-oldU1);
+
+            const scalar after =
+                mag(newU0-newU1);
+
+            maxAllUnitDiffBefore =
+                Foam::max
+                (
+                    maxAllUnitDiffBefore,
+                    before
+                );
+
+            if( after > maxAllUnitDiffAfter )
+            {
+                maxAllUnitDiffAfter = after;
+                worstAllI = bpI;
+                worstAllJ = bpJ;
+            }
+
+            if
+            (
+                (
+                    collarRing[bpI] == 0
+                 && collarRing[bpJ] == 1
+                )
+             ||
+                (
+                    collarRing[bpI] == 1
+                 && collarRing[bpJ] == 0
+                )
+            )
+            {
+                if( after > maxSeamCollarDiffAfter )
+                {
+                    maxSeamCollarDiffAfter = after;
+                    worstSeamCollarI = bpI;
+                    worstSeamCollarJ = bpJ;
+                }
+
+                ++nSeamCollarEdges;
+            }
+
+            ++nAllComparedEdges;
+        }
+    }
+
+
+    // ------------------------------------------------------------
+    // F6. PRESERVE MACRO LENGTH, CHANGE DIRECTION ONLY
+    // ------------------------------------------------------------
+
+    label nSolved = 0;
+
+    forAll(solvePoint, bpI)
+    {
+        if
+        (
+            !solvePoint[bpI]
+         || !directionValid[bpI]
+        )
+            continue;
+
+        vector d =
+            solvedDir[bpI];
+
+        const scalar dMag =
+            mag(d);
+
+        if( dMag < VSMALL )
+            continue;
+
+        d /= dMag;
+
+        proposedDisp[bpI] =
+            originalLength[bpI]*d;
+
+        ++nSolved;
+    }
+
+
+    if
+    (
+        worstAllI >= 0
+     && worstAllJ >= 0
+    )
+    {
+        const label pI = bPoints[worstAllI];
+        const label pJ = bPoints[worstAllJ];
+
+        const vector oldI =
+            originalDisp[worstAllI]
+           /(mag(originalDisp[worstAllI]) + VSMALL);
+
+        const vector oldJ =
+            originalDisp[worstAllJ]
+           /(mag(originalDisp[worstAllJ]) + VSMALL);
+
+        const vector newI =
+            solvedDir[worstAllI]
+           /(mag(solvedDir[worstAllI]) + VSMALL);
+
+        const vector newJ =
+            solvedDir[worstAllJ]
+           /(mag(solvedDir[worstAllJ]) + VSMALL);
+
+        Info
+            << "CFMITCH SEAMCOLLAR_V6_WORST_ALL"
+            << " bpI=" << worstAllI
+            << " pointI=" << pI
+            << " ringI=" << collarRing[worstAllI]
+            << " wallPatchI=" << wallPatch[worstAllI]
+            << " neutralPatchI=" << neutralPatch[worstAllI]
+            << " rootI=" << points[pI]
+            << " oldI=" << oldI
+            << " prefI=" << preferredDir[worstAllI]
+            << " newI=" << newI
+
+            << " bpJ=" << worstAllJ
+            << " pointJ=" << pJ
+            << " ringJ=" << collarRing[worstAllJ]
+            << " wallPatchJ=" << wallPatch[worstAllJ]
+            << " neutralPatchJ=" << neutralPatch[worstAllJ]
+            << " rootJ=" << points[pJ]
+            << " oldJ=" << oldJ
+            << " prefJ=" << preferredDir[worstAllJ]
+            << " newJ=" << newJ
+
+            << " oldDot=" << (oldI & oldJ)
+            << " newDot=" << (newI & newJ)
+            << " oldUnitDiff=" << mag(oldI-oldJ)
+            << " newUnitDiff=" << mag(newI-newJ)
+            << " rootDistance="
+            << mag(points[pI]-points[pJ])
+            << endl;
+    }
+
+    if
+    (
+        worstSeamCollarI >= 0
+     && worstSeamCollarJ >= 0
+    )
+    {
+        const label pI =
+            bPoints[worstSeamCollarI];
+
+        const label pJ =
+            bPoints[worstSeamCollarJ];
+
+        const vector oldI =
+            originalDisp[worstSeamCollarI]
+           /(mag(originalDisp[worstSeamCollarI]) + VSMALL);
+
+        const vector oldJ =
+            originalDisp[worstSeamCollarJ]
+           /(mag(originalDisp[worstSeamCollarJ]) + VSMALL);
+
+        const vector newI =
+            solvedDir[worstSeamCollarI]
+           /(mag(solvedDir[worstSeamCollarI]) + VSMALL);
+
+        const vector newJ =
+            solvedDir[worstSeamCollarJ]
+           /(mag(solvedDir[worstSeamCollarJ]) + VSMALL);
+
+        Info
+            << "CFMITCH SEAMCOLLAR_V6_WORST_SEAMCOLLAR"
+            << " bpI=" << worstSeamCollarI
+            << " pointI=" << pI
+            << " ringI=" << collarRing[worstSeamCollarI]
+            << " wallPatchI=" << wallPatch[worstSeamCollarI]
+            << " neutralPatchI="
+            << neutralPatch[worstSeamCollarI]
+            << " rootI=" << points[pI]
+            << " oldI=" << oldI
+            << " prefI="
+            << preferredDir[worstSeamCollarI]
+            << " newI=" << newI
+
+            << " bpJ=" << worstSeamCollarJ
+            << " pointJ=" << pJ
+            << " ringJ=" << collarRing[worstSeamCollarJ]
+            << " wallPatchJ=" << wallPatch[worstSeamCollarJ]
+            << " neutralPatchJ="
+            << neutralPatch[worstSeamCollarJ]
+            << " rootJ=" << points[pJ]
+            << " oldJ=" << oldJ
+            << " prefJ="
+            << preferredDir[worstSeamCollarJ]
+            << " newJ=" << newJ
+
+            << " oldDot=" << (oldI & oldJ)
+            << " newDot=" << (newI & newJ)
+            << " oldUnitDiff=" << mag(oldI-oldJ)
+            << " newUnitDiff=" << mag(newI-newJ)
+            << " rootDistance="
+            << mag(points[pI]-points[pJ])
+            << endl;
+    }
+
+    Info
+        << "CFMITCH SEAMCOLLAR V6:"
+        << " ring0=" << nRing0
+        << " ring1=" << nRing1
+        << " ring2=" << nRing2
+        << " ring3=" << nRing3
+        << " components=" << nV2Components
+        << " signFlips=" << nV2SignFlips
+        << " smoothPasses=" << collarSmoothPasses
+        << " comparedEdges=" << nAllComparedEdges
+        << " seamCollarEdges=" << nSeamCollarEdges
+        << " maxNeutralLeak=" << maxNeutralLeak
+        << " maxAllUnitDiffBefore=" << maxAllUnitDiffBefore
+        << " maxAllUnitDiffAfter=" << maxAllUnitDiffAfter
+        << " maxSeamCollarDiffAfter=" << maxSeamCollarDiffAfter
+        << endl;
+
+
+    // ============================================================
+    // FIELD COHERENCE AUDIT
+    // ============================================================
+
+    scalar maxUnitDiffBefore =
+        scalar(0);
+
+    scalar maxUnitDiffAfter =
+        scalar(0);
+
+    label nComparedEdges = 0;
+
+    forAll(active, bpI)
+    {
+        if
+        (
+            !active[bpI]
+         || mag(proposedDisp[bpI]) < VSMALL
+        )
+            continue;
+
+        const vector oldU0 =
+            originalDisp[bpI]
+           /(mag(originalDisp[bpI]) + VSMALL);
+
+        const vector newU0 =
+            proposedDisp[bpI]
+           /(mag(proposedDisp[bpI]) + VSMALL);
+
+        forAllRow(pointPoints, bpI, ppI)
+        {
+            const label bpJ =
+                pointPoints(bpI, ppI);
+
+            if
+            (
+                bpJ <= bpI
+             || bpJ < 0
+             || bpJ >= nBP
+             || !active[bpJ]
+             || mag(proposedDisp[bpJ]) < VSMALL
+            )
+                continue;
+
+            if
+            (
+                wallPatch[bpJ]
+                    != wallPatch[bpI]
+             || neutralPatch[bpJ]
+                    != neutralPatch[bpI]
+            )
+                continue;
+
+            const vector oldU1 =
+                originalDisp[bpJ]
+               /(mag(originalDisp[bpJ]) + VSMALL);
+
+            const vector newU1 =
+                proposedDisp[bpJ]
+               /(mag(proposedDisp[bpJ]) + VSMALL);
+
+            maxUnitDiffBefore =
+                Foam::max
+                (
+                    maxUnitDiffBefore,
+                    mag(oldU0-oldU1)
+                );
+
+            maxUnitDiffAfter =
+                Foam::max
+                (
+                    maxUnitDiffAfter,
+                    mag(newU0-newU1)
+                );
+
+            ++nComparedEdges;
+        }
+    }
+
+
+    // ============================================================
+    // COMMIT CANDIDATE TOP COORDINATES
+    //
+    // Root/original boundary points are untouched here.
+    // ============================================================
+
+    label nCommitted = 0;
+
+    forAll(solvePoint, bpI)
+    {
+        if
+        (
+            !solvePoint[bpI]
+         || mag(proposedDisp[bpI]) < VSMALL
+        )
+            continue;
+
+        const label topI =
+            topLabel[bpI];
+
+        if
+        (
+            topI < 0
+         || topI >= label(points.size())
+        )
+            continue;
+
+        const label pointI =
+            bPoints[bpI];
+
+        const point root =
+            points[pointI];
+
+        const vector oldE =
+            originalDisp[bpI];
+
+        const vector newE =
+            proposedDisp[bpI];
+
+        points[topI] =
+            root + newE;
+
+
+        // Existing Rotor37 forensic pair.
+        // Diagnostic only; no logic depends on these labels.
+        if
+        (
+            pointI == 337809
+         || pointI == 337818
+         || pointI == 337820
+        )
+        {
+            Info
+                << "CFMITCH SEAMSOLVE_TARGET"
+                << " bpI=" << bpI
+                << " pointI=" << pointI
+                << " ring=" << collarRing[bpI]
+                << " wallPatch=" << wallPatch[bpI]
+                << " neutralPatch="
+                << neutralPatch[bpI]
+                << " oldE=" << oldE
+                << " oldL=" << mag(oldE)
+                << " rawNeutralN="
+                << rawNeutralNormal[bpI]
+                << " smoothNeutralN="
+                << neutralNormal[bpI]
+                << " newE=" << newE
+                << " newL=" << mag(newE)
+                << " oldNewUnitDiff="
+                << mag
+                   (
+                       oldE
+                      /(mag(oldE)+VSMALL)
+                     -
+                       newE
+                      /(mag(newE)+VSMALL)
+                   )
+                << endl;
+        }
+
+        ++nCommitted;
+    }
+
+
+    Info
+        << "CFMITCH SEAMSOLVE V6:"
+        << " neutralSeeds="
+        << blNeutralEdgePoints_.size()
+        << " initiallyEligible="
+        << nInitiallyEligible
+        << " solved=" << nSolved
+        << " committed=" << nCommitted
+        << " graphPruned=" << nGraphPruned
+        << " badRole=" << nBadRole
+        << " specialSkipped=" << nSpecialSkipped
+        << " noTop=" << nNoTop
+        << " badNormal=" << nBadNormal
+        << " badTangent=" << nBadTangent
+        << " badDirection=" << nBadDirection
+        << " comparedEdges=" << nComparedEdges
+        << " maxUnitDiffBefore="
+        << maxUnitDiffBefore
+        << " maxUnitDiffAfter="
+        << maxUnitDiffAfter
+        << endl;
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
 void boundaryLayers::createNewVertices(const boolList& treatPatches)
 {
     Info << "Creating vertices for layer cells" << endl;
@@ -1686,6 +4817,12 @@ void boundaryLayers::createNewVertices(const boolList& treatPatches)
             treatPatches
         );
     }
+
+    // CFMitch connected neutral-seam constraint.
+    //
+    // Candidate tops exist, but original boundary geometry remains
+    // untouched and authoritative.
+    constrainNeutralSeamCandidatesBeforeSwap();
 
     //- swap coordinates of new and old points
     forAll(bPoints, bpI)
@@ -2160,6 +5297,12 @@ void boundaryLayers::createNewVertices(const labelList& patchLabels)
              << endl;
     }
 
+    // CFMitch connected neutral-seam constraint.
+    //
+    // Candidate tops exist, but original boundary geometry remains
+    // untouched and authoritative.
+    constrainNeutralSeamCandidatesBeforeSwap();
+
     //- swap coordinates of new and old points
     // Serial: OMP parallelism here causes coordinate corruption at BL/BL
     // junctions -- primary source of 67-114 bad pyramid faces per run.
@@ -2612,7 +5755,6 @@ void boundaryLayers::createNewPartitionVerticesParallel
         const labelList& boundaryFacePatches = mse.boundaryFacePatches();
         const faceList::subList& bFaces = mse.boundaryFaces();
         const pointFieldPMG& pts = mesh_.points();
-        const labelList& bPoints = mse.boundaryPoints();
 
         forAllConstIter(labelHashSet, blNoBlEdgePoints_, iter)
         {
