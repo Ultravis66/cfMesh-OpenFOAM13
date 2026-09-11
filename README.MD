@@ -60,7 +60,19 @@ Rotor37 exercises blade/hub/shroud junctions, periodic boundaries, sharp trailin
 ---
 
 ## Propeller regression
+<p align="center">
+  <img src="NASA_Rotor_37_1.png" alt="NASA Rotor37 mesh overview" width="48%">
+  <img src="NASA_Rotor_37_2.png" alt="NASA Rotor37 blade and endwall mesh" width="48%">
+</p>
 
+<p align="center">
+  <img src="NASA_Rotor_37_3.png" alt="NASA Rotor37 boundary-layer detail" width="48%">
+  <img src="NASA_Rotor_37_4.png" alt="NASA Rotor37 periodic-sector detail" width="48%">
+</p>
+
+<p align="center">
+  <em>NASA Rotor37 regression mesh showing the blade passages, endwalls, periodic-sector boundaries, and near-wall boundary-layer structure.</em>
+</p>
 The second major regression is a complex marine-propeller geometry with a very thin wall-normal boundary layer.
 
 | Metric | Result |
@@ -86,7 +98,15 @@ The second major regression is a complex marine-propeller geometry with a very t
 The very thin first layer is intentional for wall-resolved marine CFD.
 
 ### Advanced geometry diagnostics
+<p align="center">
+  <img src="Propeller_1.png" alt="Propeller mesh overview" width="32%">
+  <img src="Propeller_2.png" alt="Propeller boundary-layer mesh" width="32%">
+  <img src="Propeller_3.png" alt="Propeller mesh detail" width="32%">
+</p>
 
+<p align="center">
+  <em>Marine-propeller regression mesh showing the overall mesh and detailed near-wall boundary-layer structure.</em>
+</p>
 The propeller still reports several failures under:
 
 ~~~bash
